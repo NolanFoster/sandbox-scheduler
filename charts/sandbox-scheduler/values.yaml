@@ -2,9 +2,16 @@
 
 image:
   repository: ghcr.io/nolanfoster/sandbox-scheduler
-  # Defaults to the chart's appVersion.
+  # Defaults to the chart's appVersion. Prefer an immutable reference — a
+  # sha-<commit> tag or a digest — over a moving one like `main`.
   tag: ""
-  pullPolicy: IfNotPresent
+  # Always, not IfNotPresent. With a moving tag the node reuses whatever layer
+  # it already cached and silently runs an old binary: that is how a build with
+  # authentication in it was deployed, reported healthy, and served
+  # unauthenticated requests. Pin an immutable tag and this costs a registry
+  # HEAD per start; leave the tag moving and it is the only thing making a
+  # rollout mean anything.
+  pullPolicy: Always
 
 imagePullSecrets: []
 nameOverride: ""
@@ -48,6 +55,14 @@ placementApi:
 metrics:
   enabled: true
   port: 8080
+  # Requires the Prometheus Operator's ServiceMonitor CRD, so it stays off by
+  # default — enabling it on a cluster without that CRD fails the install.
+  #
+  # Turn it on before running a soak. The placement metrics answer questions
+  # that cannot be reconstructed afterwards: spill rate is
+  #   1 - rate(sandbox_scheduler_placements_total{cheapest="true"}[1h])
+  #     / rate(sandbox_scheduler_placements_total[1h])
+  # and nothing else records what the alternatives cost at decision time.
   serviceMonitor:
     enabled: false
     interval: 30s
