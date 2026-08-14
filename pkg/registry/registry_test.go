@@ -104,10 +104,14 @@ func TestRefreshPopulatesCapacity(t *testing.T) {
 	src := &fakeSource{id: "civo"}
 	src.set(registry.Report{
 		WarmCapacity: 3,
-		CostPerHour:  1.5,
 		Attributes:   map[string]string{"runtime": "gvisor"},
 	}, nil)
 	r.AddSource(src)
+	// Attributes and cost that policy matches on are declared, not reported.
+	r.SetConfig("civo", registry.ProviderConfig{
+		Attributes:  map[string]string{"runtime": "gvisor"},
+		CostPerHour: 1.5,
+	})
 
 	r.Refresh(context.Background())
 
@@ -238,7 +242,7 @@ func TestFetchTimeoutIsEnforced(t *testing.T) {
 func TestPushReportBypassesPolling(t *testing.T) {
 	clk := newClock()
 	r := registry.New(registry.Options{Now: clk.now})
-	r.Report("hosted", registry.Report{WarmCapacity: 7, CostPerHour: 9})
+	r.Report("hosted", registry.Report{WarmCapacity: 7})
 
 	snap := r.Snapshot()
 	if len(snap) != 1 || snap[0].Provider != "hosted" {
@@ -246,6 +250,43 @@ func TestPushReportBypassesPolling(t *testing.T) {
 	}
 	if !snap[0].Reachable || snap[0].WarmCapacity != 7 {
 		t.Fatalf("unexpected candidate: %+v", snap[0])
+	}
+}
+
+func TestSelfReportedAttributesNeverReachPolicy(t *testing.T) {
+	// The property that keeps a provider from asserting its own isolation. A
+	// provider claiming runtime=gvisor about itself must not satisfy a filter
+	// that exists to keep untrusted workloads off weak providers.
+	r := registry.New(registry.Options{})
+	r.Report("civo", registry.Report{
+		WarmCapacity: 1,
+		Attributes:   map[string]string{"runtime": "gvisor", "gpu": "true"},
+	})
+	r.SetConfig("civo", registry.ProviderConfig{
+		Attributes: map[string]string{"runtime": "runc"},
+	})
+
+	c := r.Snapshot()[0]
+	if c.Attr("runtime") != "runc" {
+		t.Fatalf("candidate runtime %q; the declared value must win", c.Attr("runtime"))
+	}
+	if c.Attr("gpu") != "" {
+		t.Fatal("a self-reported attribute must not appear on the candidate at all")
+	}
+	// ...but it is still visible to humans.
+	if r.Statuses()[0].Report.Attributes["gpu"] != "true" {
+		t.Fatal("self-reported attributes should still surface in status")
+	}
+}
+
+func TestDeclaredCostIsNotSelfReportable(t *testing.T) {
+	// A provider that could report its own price could report zero and win
+	// every placement.
+	r := registry.New(registry.Options{})
+	r.Report("civo", registry.Report{WarmCapacity: 1})
+	r.SetConfig("civo", registry.ProviderConfig{CostPerHour: 4})
+	if got := r.Snapshot()[0].CostPerHour; got != 4 {
+		t.Fatalf("cost %v, want the declared 4", got)
 	}
 }
 
@@ -285,9 +326,9 @@ func TestSnapshotIsACopy(t *testing.T) {
 	// A scorer mutating its candidate must not corrupt registry state for the
 	// next decision.
 	r := registry.New(registry.Options{})
-	r.Report("civo", registry.Report{
-		WarmCapacity: 3,
-		Attributes:   map[string]string{"region": "nyc1"},
+	r.Report("civo", registry.Report{WarmCapacity: 3})
+	r.SetConfig("civo", registry.ProviderConfig{
+		Attributes: map[string]string{"region": "nyc1"},
 	})
 
 	first := r.Snapshot()

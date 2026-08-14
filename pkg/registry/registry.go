@@ -32,13 +32,33 @@ import (
 	"github.com/NolanFoster/sandbox-scheduler/pkg/framework"
 )
 
-// Report is what a provider says about itself at a point in time.
+// Report is what a provider says about *itself* at a point in time.
+//
+// Deliberately narrow: capacity, and facts that are informational only. Nothing
+// a provider reports here is used for placement decisions, because a provider
+// must not be able to influence its own selection. See ProviderConfig.
 type Report struct {
 	// WarmCapacity is the number of pre-warmed sandboxes ready to claim.
+	// The one self-reported value placement does trust — a provider
+	// overstating it only hurts itself, by attracting claims it cannot serve.
 	WarmCapacity int
 
-	// Attributes are provider facts filters and scorers match on:
-	// runtime=gvisor, gpu=true, region=nyc1.
+	// Attributes are facts the provider reports about itself. Surfaced in
+	// status for humans; never matched on by filters. A provider able to
+	// assert runtime=gvisor about itself could claim an isolation property it
+	// does not have, and the filter that keeps untrusted workloads off weak
+	// providers would wave them through.
+	Attributes map[string]string
+}
+
+// ProviderConfig is what the operator declares about a provider.
+//
+// This is the authoritative half. Attributes and cost come from here — from a
+// SandboxProvider spec, written by someone with permission to write it — and
+// never from the provider itself. Cost especially: a provider that could report
+// its own price could report zero and win every placement.
+type ProviderConfig struct {
+	// Attributes are matched by filters and scorers: runtime=gvisor, gpu=true.
 	Attributes map[string]string
 
 	// CostPerHour is the relative price of a sandbox-hour. Units are the
@@ -62,6 +82,7 @@ type Source interface {
 
 // entry is the registry's per-provider state.
 type entry struct {
+	config    ProviderConfig
 	report    Report
 	updatedAt time.Time
 	// everReported distinguishes "we have never heard from this provider" from
@@ -138,6 +159,22 @@ func (r *Registry) AddSource(s Source) {
 		// absent.
 		r.entries[id] = &entry{}
 	}
+}
+
+// SetConfig records what the operator declared about a provider.
+//
+// Separate from Report on purpose: this is the trusted half. Called by the
+// controller from a SandboxProvider spec, and read by Snapshot for everything
+// policy matches on.
+func (r *Registry) SetConfig(providerID string, cfg ProviderConfig) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.entries[providerID]
+	if !ok {
+		e = &entry{}
+		r.entries[providerID] = e
+	}
+	e.config = cfg
 }
 
 // RemoveSource stops polling a provider and drops its capacity.
@@ -248,15 +285,17 @@ func (r *Registry) Snapshot() []framework.Candidate {
 	out := make([]framework.Candidate, 0, len(r.entries))
 	for id, e := range r.entries {
 		c := framework.Candidate{
-			Provider:     id,
+			Provider: id,
+			// Observed: the provider's own count of what is warm.
 			WarmCapacity: e.report.WarmCapacity,
-			CostPerHour:  e.report.CostPerHour,
+			// Declared: never the provider's own claim. See ProviderConfig.
+			CostPerHour: e.config.CostPerHour,
 			// Fresh only if we have heard from it at all, and recently.
 			Reachable: e.everReported && now.Sub(e.updatedAt) <= r.staleAfter,
 		}
-		if len(e.report.Attributes) > 0 {
-			c.Attributes = make(map[string]string, len(e.report.Attributes))
-			for k, v := range e.report.Attributes {
+		if len(e.config.Attributes) > 0 {
+			c.Attributes = make(map[string]string, len(e.config.Attributes))
+			for k, v := range e.config.Attributes {
 				c.Attributes[k] = v
 			}
 		}
@@ -274,6 +313,7 @@ type Status struct {
 	Stale     bool
 	Age       time.Duration
 	Report    Report
+	Config    ProviderConfig
 	LastError error
 }
 
@@ -295,6 +335,7 @@ func (r *Registry) Statuses() []Status {
 			Stale:     e.everReported && age > r.staleAfter,
 			Age:       age,
 			Report:    e.report,
+			Config:    e.config,
 			LastError: e.lastErr,
 		})
 	}
