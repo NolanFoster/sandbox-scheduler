@@ -292,3 +292,80 @@ func TestPolicyListReturnsACopy(t *testing.T) {
 		t.Fatal("mutating the returned slice changed the source")
 	}
 }
+
+// --- authentication --------------------------------------------------------
+
+func newAuthedService(t *testing.T, token string) http.Handler {
+	t.Helper()
+	reg := registry.New(registry.Options{})
+	reg.Report("civo", registry.Report{WarmCapacity: 1})
+	pl := &scheduler.PolicyList{}
+	svc := &scheduler.Service{Registry: reg, Policies: pl, Token: token}
+	return svc.Handler()
+}
+
+func do(h http.Handler, method, path, auth string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(method, path, strings.NewReader("{}"))
+	if auth != "" {
+		r.Header.Set("Authorization", auth)
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	return w
+}
+
+func TestProtectedRoutesRequireTheToken(t *testing.T) {
+	// GET /providers discloses provider names, endpoints and live capacity —
+	// reconnaissance for anyone deciding where to aim.
+	h := newAuthedService(t, "s3cret")
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/schedule"},
+		{http.MethodGet, "/providers"},
+	} {
+		if got := do(h, tc.method, tc.path, "").Code; got != http.StatusUnauthorized {
+			t.Fatalf("%s %s without a token returned %d, want 401", tc.method, tc.path, got)
+		}
+		if got := do(h, tc.method, tc.path, "Bearer wrong").Code; got != http.StatusUnauthorized {
+			t.Fatalf("%s %s with a wrong token returned %d, want 401", tc.method, tc.path, got)
+		}
+		if got := do(h, tc.method, tc.path, "Bearer s3cret").Code; got == http.StatusUnauthorized {
+			t.Fatalf("%s %s with the right token was rejected", tc.method, tc.path)
+		}
+	}
+}
+
+func TestHealthzStaysPublic(t *testing.T) {
+	// kubelet probes carry no credential, and it discloses nothing.
+	h := newAuthedService(t, "s3cret")
+	if got := do(h, http.MethodGet, "/healthz", "").Code; got != http.StatusOK {
+		t.Fatalf("healthz returned %d without a token, want 200", got)
+	}
+}
+
+func TestNoTokenConfiguredLeavesTheApiOpen(t *testing.T) {
+	// The cluster-internal default. Documented as only defensible when nothing
+	// outside the cluster can reach it.
+	h := newAuthedService(t, "")
+	if got := do(h, http.MethodGet, "/providers", "").Code; got != http.StatusOK {
+		t.Fatalf("unauthenticated service returned %d, want 200", got)
+	}
+}
+
+func TestAuthSchemeIsCaseInsensitiveButTokenIsNot(t *testing.T) {
+	h := newAuthedService(t, "s3cret")
+	if got := do(h, http.MethodGet, "/providers", "bearer s3cret").Code; got == http.StatusUnauthorized {
+		t.Fatal("the scheme is case-insensitive per RFC 7235")
+	}
+	if got := do(h, http.MethodGet, "/providers", "Bearer S3CRET").Code; got != http.StatusUnauthorized {
+		t.Fatalf("token comparison must be case-sensitive, got %d", got)
+	}
+}
+
+func TestMalformedAuthorizationHeadersAreRejected(t *testing.T) {
+	h := newAuthedService(t, "s3cret")
+	for _, header := range []string{"s3cret", "Bearer", "Bearer ", "Basic s3cret", "Bearers3cret"} {
+		if got := do(h, http.MethodGet, "/providers", header).Code; got != http.StatusUnauthorized {
+			t.Fatalf("header %q returned %d, want 401", header, got)
+		}
+	}
+}

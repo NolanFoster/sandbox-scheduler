@@ -32,6 +32,19 @@ service:
   type: ClusterIP
   port: 8082
 
+# Bearer token for the placement API. Leave empty only while the API is
+# reachable solely from inside the cluster: GET /providers discloses provider
+# endpoints and live capacity, which is reconnaissance for anyone choosing a
+# target. Anything fronting this with an ingress or tunnel must set it.
+#
+# existingSecret takes precedence; the chart never writes a token it was given
+# inline into a Secret it manages, because that value would then live in the
+# Helm release history in plain text.
+placementApi:
+  token: ""
+  existingSecret: ""
+  existingSecretKey: token
+
 metrics:
   enabled: true
   port: 8080

@@ -127,10 +127,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Token comes from the environment rather than a flag: a flag lands in the
+	// process table and in `kubectl describe pod` output for anyone with read
+	// access to the namespace.
+	apiToken := os.Getenv("PLACEMENT_API_TOKEN")
+	if apiToken == "" {
+		log.Info("placement API is UNAUTHENTICATED; set PLACEMENT_API_TOKEN before " +
+			"exposing it outside the cluster — GET /providers discloses provider " +
+			"endpoints and live capacity")
+	}
+
 	svc := &scheduler.Service{
 		Registry:  reg,
 		Policies:  &cachedPolicies{client: mgr.GetClient()},
 		Endpoints: endpointLookup(mgr.GetClient()),
+		Token:     apiToken,
 	}
 	if err := mgr.Add(&httpServer{addr: schedulerAddr, handler: svc.Handler(), log: ctrl.Log.WithName("placement-api")}); err != nil {
 		log.Error(err, "unable to add the placement API server")

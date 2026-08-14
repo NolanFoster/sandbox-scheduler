@@ -39,6 +39,13 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- if or .Values.placementApi.token .Values.placementApi.existingSecret }}
+            - name: PLACEMENT_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.placementApi.existingSecret | default (printf "%s-api-token" (include "sandbox-scheduler.fullname" .)) }}
+                  key: {{ .Values.placementApi.existingSecretKey }}
+            {{- end }}
           ports:
             - name: placement
               containerPort: {{ .Values.service.port }}

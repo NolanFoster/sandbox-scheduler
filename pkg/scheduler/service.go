@@ -13,9 +13,11 @@
 package scheduler
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -95,6 +97,16 @@ type Service struct {
 	Policies PolicySource
 	// Endpoints is optional; when set, decisions carry the provider's address.
 	Endpoints EndpointLookup
+
+	// Token, when set, is required as a bearer credential on every route
+	// except /healthz.
+	//
+	// Empty means unauthenticated, which is only defensible for a Service
+	// reachable solely from inside the cluster. GET /providers discloses the
+	// fleet: provider names, gateway endpoints and live capacity. That is
+	// reconnaissance for anyone deciding where to aim, so anything exposing
+	// this beyond the cluster must set a token.
+	Token string
 }
 
 // Handler returns the HTTP handler.
@@ -102,11 +114,40 @@ func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /schedule", s.handleSchedule)
 	mux.HandleFunc("GET /providers", s.handleProviders)
+	return s.authenticated(mux)
+}
+
+// authenticated enforces the bearer token, leaving /healthz public.
+//
+// /healthz has to stay open for kubelet probes, which carry no credential. It
+// discloses nothing: a fixed string, no fleet state.
+func (s *Service) authenticated(next http.Handler) http.Handler {
+	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.Token != "" && !s.authorized(r) {
+			writeJSON(w, http.StatusUnauthorized, ErrorResponse{
+				Error: "missing or invalid bearer token",
+			})
+			return
+		}
+		next.ServeHTTP(w, r)
+	}))
 	return mux
+}
+
+func (s *Service) authorized(r *http.Request) bool {
+	header := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return false
+	}
+	// Constant time: a token check that returns faster on an early mismatch
+	// leaks the token a byte at a time to anyone patient enough to measure.
+	return subtle.ConstantTimeCompare([]byte(header[len(prefix):]), []byte(s.Token)) == 1
 }
 
 func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
