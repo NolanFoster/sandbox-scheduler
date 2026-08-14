@@ -108,12 +108,59 @@ Affinity being a preference rather than a constraint is the same trade in the
 other direction: a session should return to its data when that is sensible, and
 move rather than wait when it is not.
 
+## API
+
+Two cluster-scoped CRDs under `placement.agents.x-k8s.io/v1alpha1`, matching the
+group convention upstream already uses for its extensions:
+
+```yaml
+apiVersion: placement.agents.x-k8s.io/v1alpha1
+kind: SandboxProvider
+metadata:
+  name: civo
+spec:
+  adapter: agent-sandbox
+  endpoint: https://civo-gateway.example.com
+  credentialsRef: { name: civo-gateway-token }
+  costPerHour: "1"
+  attributes:
+    runtime: gvisor
+    region: nyc1
+---
+apiVersion: placement.agents.x-k8s.io/v1alpha1
+kind: SandboxPlacementPolicy
+metadata:
+  name: default
+spec:
+  filters: [RequiredAttributes]
+  scorers:
+    - { name: WarmCapacity, weight: 5 }
+    - { name: Cost,         weight: 3 }
+    - { name: Reachability, weight: 3 }
+    - { name: Affinity,     weight: 1 }
+```
+
+Two API decisions worth knowing about:
+
+**Attributes are operator-declared, not self-reported.** `runtime: gvisor` is an
+assertion that untrusted code is kernel-isolated on this provider. A provider
+able to assert that about itself could claim an isolation property it does not
+have, and the filter that exists to keep untrusted workloads off weak providers
+would wave them through. What a provider says about itself lands in
+`status.observedAttributes`, for humans.
+
+**Invalid policies are rejected, never partially applied.** An unknown filter
+name, a duplicated scorer, or `requires` set without the `RequiredAttributes`
+filter to enforce it all fail validation with an explanation. Silently dropping
+an unknown filter would place workloads under weaker constraints than the
+operator wrote down, and nothing would look wrong.
+
 ## Roadmap
 
 - [x] Scheduling framework: filter, score, bind, with explanations
 - [x] Built-in filters and scorers
 - [x] Capacity registry: refresh off the decision path, scheduler reads memory
-- [ ] `SandboxProvider` / `SandboxPlacementPolicy` CRDs
+- [x] `SandboxProvider` / `SandboxPlacementPolicy` CRDs
 - [ ] Controller: watch CRDs, maintain the registry, serve decisions
 - [ ] Provider adapters: Kubernetes (agent-sandbox), then non-Kubernetes
 - [ ] KEP proposing this to the agent-sandbox SIG as an extension

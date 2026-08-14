@@ -1,0 +1,239 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.1
+  name: sandboxproviders.placement.agents.x-k8s.io
+spec:
+  group: placement.agents.x-k8s.io
+  names:
+    kind: SandboxProvider
+    listKind: SandboxProviderList
+    plural: sandboxproviders
+    shortNames:
+    - sbp
+    singular: sandboxprovider
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.adapter
+      name: Adapter
+      type: string
+    - jsonPath: .status.warmCapacity
+      name: Warm
+      type: integer
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          SandboxProvider is a destination sandboxes can be placed on.
+
+          Cluster-scoped: a provider is infrastructure shared across namespaces, and
+          namespacing it would mean re-declaring the same cluster for every team.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              SandboxProviderSpec describes a place sandboxes can run.
+
+              A provider is not necessarily a Kubernetes cluster. That is the whole point:
+              the obvious next destinations for agent sandboxes are hosted APIs that have
+              no cluster at all, and a placement layer that can only see clusters would
+              exclude them by construction.
+            properties:
+              adapter:
+                description: |-
+                  Adapter names the integration used to talk to this provider, e.g.
+                  "agent-sandbox" for a Kubernetes cluster running the upstream controller.
+                  Unknown adapters are reported in status rather than rejected, so a newer
+                  provider type does not break an older scheduler.
+                minLength: 1
+                type: string
+              attributes:
+                additionalProperties:
+                  type: string
+                description: |-
+                  Attributes are operator-declared facts about this provider that filters
+                  and scorers match on: runtime=gvisor, gpu=true, region=nyc1.
+
+                  Declared by the operator and NOT self-reported by the provider, which is
+                  deliberate and security-relevant. `runtime=gvisor` is an assertion that
+                  untrusted code is kernel-isolated here; a provider that could assert that
+                  about itself could claim an isolation property it does not have, and the
+                  filter that exists to keep untrusted workloads off weak providers would
+                  wave them through. What a provider reports about itself lands in
+                  status.observedAttributes, for humans.
+                type: object
+              costPerHour:
+                anyOf:
+                - type: integer
+                - type: string
+                description: |-
+                  CostPerHour is the relative price of a sandbox-hour here.
+
+                  Units are the operator's own and need not be a currency — only the
+                  ordering between providers is used. This is what lets a per-second hosted
+                  API and a self-hosted cluster's amortised node cost be compared without
+                  inventing a shared unit for them.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+              credentialsRef:
+                description: |-
+                  CredentialsRef points at a Secret in the scheduler's namespace holding
+                  whatever the adapter needs to authenticate.
+
+                  By reference, never inline: a credential in a CR spec is readable by
+                  anyone with get on the CRD, ends up in `kubectl get -o yaml` output, and
+                  is copied into every backup of etcd that anyone takes.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              disabled:
+                description: |-
+                  Disabled stops this provider being considered without deleting it.
+
+                  Distinct from deletion on purpose: draining a provider for maintenance
+                  should not lose its configuration, and should be one field flip to undo.
+                type: boolean
+              endpoint:
+                description: |-
+                  Endpoint is the adapter-specific address of the provider: a gateway URL,
+                  an API base, a kube-apiserver.
+                type: string
+              refreshInterval:
+                description: |-
+                  RefreshInterval is how often capacity is polled. Defaults to 10s.
+
+                  Polling is off the placement path, so this trades freshness against load
+                  on the provider, never placement latency.
+                type: string
+            required:
+            - adapter
+            type: object
+          status:
+            description: SandboxProviderStatus is the scheduler's view of a provider.
+            properties:
+              conditions:
+                description: |-
+                  Conditions follow the standard Kubernetes convention. "Ready" means the
+                  last capacity report succeeded and is not stale.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              lastError:
+                description: |-
+                  LastError is the most recent failure. Retained across successful reports
+                  only until the next success, so a flapping provider is visible rather
+                  than looking healthy between failures.
+                type: string
+              lastReportTime:
+                description: |-
+                  LastReportTime is when capacity was last successfully read. Absent means
+                  the provider has never been reached — which is a different situation from
+                  a provider that has gone quiet, and worth being able to tell apart.
+                format: date-time
+                type: string
+              observedAttributes:
+                additionalProperties:
+                  type: string
+                description: |-
+                  ObservedAttributes are facts the provider reported about itself.
+
+                  Informational only. Policy matches on spec.attributes; see the note
+                  there for why self-reported facts are not trusted for placement.
+                type: object
+              warmCapacity:
+                description: WarmCapacity is the pre-warmed sandboxes available at
+                  the last report.
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
