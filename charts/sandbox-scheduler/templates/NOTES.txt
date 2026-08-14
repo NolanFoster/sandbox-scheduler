@@ -1,0 +1,36 @@
+sandbox-scheduler is installed as {{ include "sandbox-scheduler.fullname" . }}.
+
+Nothing is placed yet: the scheduler has no providers. Declare one per cluster
+or hosted provider you want to place onto.
+
+  apiVersion: placement.agents.x-k8s.io/v1alpha1
+  kind: SandboxProvider
+  metadata:
+    name: civo
+  spec:
+    adapter: agent-sandbox
+    endpoint: https://your-gateway.example.com
+    credentialsRef:
+      name: civo-gateway-token     # a Secret in {{ .Release.Namespace }}, key: token
+    costPerHour: "1"
+    attributes:
+      runtime: gvisor
+
+Check what the scheduler believes:
+
+  kubectl get sandboxproviders
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "sandbox-scheduler.fullname" . }} {{ .Values.service.port }}
+  curl localhost:{{ .Values.service.port }}/providers
+
+Ask for a placement:
+
+  curl -sX POST localhost:{{ .Values.service.port }}/schedule -d '{"name":"demo"}'
+
+Without a SandboxPlacementPolicy the default applies: cheapest provider with
+warm capacity, spilling when it has none.
+{{- if and (gt (int .Values.replicaCount) 1) (not .Values.leaderElection) }}
+
+WARNING: replicaCount is {{ .Values.replicaCount }} but leaderElection is off, so every
+replica runs the controllers and they will contend on status writes. Set
+leaderElection=true. The placement API is served by every replica either way.
+{{- end }}

@@ -154,12 +154,18 @@ filter to enforce it all fail validation with an explanation. Silently dropping
 an unknown filter would place workloads under weaker constraints than the
 operator wrote down, and nothing would look wrong.
 
-## Running it
+## Installing
+
+```bash
+helm install sandbox-scheduler charts/sandbox-scheduler \
+  --namespace sandbox-scheduler --create-namespace
+```
+
+Or run it locally against whatever cluster `kubectl` points at:
 
 ```bash
 kubectl apply -f config/crd/
-kubectl create namespace sandbox-scheduler
-make run          # against whatever cluster kubectl points at
+make run
 ```
 
 Declare a provider, and the scheduler discovers its capacity:
@@ -201,8 +207,8 @@ correct and one that can be operated.
 - [x] `SandboxProvider` / `SandboxPlacementPolicy` CRDs
 - [x] `agent-sandbox` adapter, verified against a live cluster
 - [x] Controller and placement API, running against two real clusters
+- [x] Container image and Helm chart
 - [ ] Further adapters, including non-Kubernetes providers
-- [ ] Container image and Helm chart
 - [ ] KEP proposing this to the agent-sandbox SIG as an extension
 
 The intended home is upstream. `SandboxClaim`, `SandboxTemplate` and

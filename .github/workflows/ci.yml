@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # -race because the registry is read on every placement while refreshes
+      # write concurrently; a lock bug there would be invisible without it.
+      - name: Test
+        run: go test -race ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Formatting
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      # Generated code drifting from its source is invisible until something
+      # deserializes wrongly at runtime, so fail the build on it.
+      - name: Generated files are current
+        run: |
+          make generate manifests
+          git diff --exit-code -- api/ config/ || {
+            echo "::error::generated files are stale; run 'make generate manifests'"
+            exit 1
+          }
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Lint chart
+        run: helm lint charts/sandbox-scheduler
+      # Render with defaults and with every optional feature on, since the
+      # second path is the one nobody exercises until it breaks in someone
+      # else's cluster.
+      - name: Render chart
+        run: |
+          helm template sandbox-scheduler charts/sandbox-scheduler > /dev/null
+          helm template sandbox-scheduler charts/sandbox-scheduler \
+            --set metrics.serviceMonitor.enabled=true \
+            --set replicaCount=3 \
+            --set leaderElection=true > /dev/null

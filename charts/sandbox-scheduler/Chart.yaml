@@ -1,0 +1,12 @@
+apiVersion: v2
+name: sandbox-scheduler
+description: Placement for agent sandboxes across multiple clusters and providers
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords: [kubernetes, scheduler, ai-agents, sandbox, multi-cluster]
+home: https://github.com/NolanFoster/sandbox-scheduler
+sources: [https://github.com/NolanFoster/sandbox-scheduler]
+maintainers:
+  - name: NolanFoster
+    url: https://github.com/NolanFoster

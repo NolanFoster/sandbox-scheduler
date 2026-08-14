@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sandbox-scheduler.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "sandbox-scheduler.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector: {{- include "sandbox-scheduler.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: placement
+      port: {{ .Values.service.port }}
+      targetPort: placement
+    {{- if .Values.metrics.enabled }}
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+    {{- end }}

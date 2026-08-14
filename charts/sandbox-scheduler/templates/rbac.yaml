@@ -1,0 +1,68 @@
+# Generated from kubebuilder markers; keep in step with config/rbac/role.yaml.
+#
+# Secrets are read cluster-wide by the ClusterRole but the scheduler only ever
+# reads its own namespace (--secret-namespace). The narrower grant would be a
+# namespaced Role; this stays a ClusterRole because SandboxProvider is
+# cluster-scoped and the controller must watch it everywhere.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "sandbox-scheduler.fullname" . }}
+  labels: {{- include "sandbox-scheduler.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch]
+  - apiGroups: [placement.agents.x-k8s.io]
+    resources: [sandboxplacementpolicies, sandboxproviders]
+    verbs: [get, list, watch]
+  - apiGroups: [placement.agents.x-k8s.io]
+    resources: [sandboxplacementpolicies/status, sandboxproviders/status]
+    verbs: [get, patch, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "sandbox-scheduler.fullname" . }}
+  labels: {{- include "sandbox-scheduler.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "sandbox-scheduler.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "sandbox-scheduler.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.leaderElection }}
+---
+# Leader election coordinates the controllers only. Namespaced, because the
+# lease lives beside the deployment rather than cluster-wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "sandbox-scheduler.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "sandbox-scheduler.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "sandbox-scheduler.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "sandbox-scheduler.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "sandbox-scheduler.fullname" . }}-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "sandbox-scheduler.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

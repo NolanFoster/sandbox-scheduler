@@ -1,0 +1,75 @@
+# Default values for sandbox-scheduler.
+
+image:
+  repository: ghcr.io/nolanfoster/sandbox-scheduler
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# More than one replica is safe and useful: the placement API is a read over
+# each replica's own cache, so every replica can serve it. Only the controllers
+# are leader-elected.
+replicaCount: 2
+
+# Leave off for a single replica. With more than one, enable it so the
+# controllers do not fight over status writes.
+leaderElection: false
+
+scheduler:
+  # How often provider capacity is polled. Off the placement path entirely, so
+  # this trades freshness against load on providers, never placement latency.
+  refreshInterval: 10s
+  # How long a capacity report stays trusted. Past this the provider is treated
+  # as unreachable, but keeps its last known capacity so policy can still
+  # choose to use it rather than fail.
+  staleAfter: 30s
+
+service:
+  type: ClusterIP
+  port: 8082
+
+metrics:
+  enabled: true
+  port: 8080
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+# The scheduler holds credentials for every provider in the fleet, so it runs
+# with everything dropped by default.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+
+# Install the CRDs with the chart. Set false when they are managed separately —
+# Helm does not upgrade CRDs installed this way, so a cluster with several
+# releases should manage them out of band.
+installCRDs: true
