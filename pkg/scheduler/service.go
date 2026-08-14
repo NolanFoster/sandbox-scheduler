@@ -21,6 +21,7 @@ import (
 
 	"github.com/NolanFoster/sandbox-scheduler/api/v1alpha1"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/framework"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/metrics"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/registry"
 )
 
@@ -109,6 +110,11 @@ func (s *Service) Handler() http.Handler {
 }
 
 func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
+	// Timed around the decision only. HTTP overhead is the caller's transport
+	// problem; what this defends is the claim that placement itself reads local
+	// memory and stays out of the API server.
+	start := time.Now()
+
 	var req Request
 	if r.ContentLength != 0 {
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
@@ -121,6 +127,7 @@ func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
 	if len(candidates) == 0 {
 		// Distinct from "nothing satisfied the request": there is nothing
 		// configured at all, which is an operator problem, not a policy one.
+		metrics.RecordFailure("no_providers", nil, "", 0)
 		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
 			Error: "no providers are configured; create a SandboxProvider",
 		})
@@ -129,6 +136,7 @@ func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
 
 	policy, err := v1alpha1.SelectPolicy(s.Policies.Policies(), req.Labels)
 	if err != nil {
+		metrics.RecordFailure("policy_selection_error", nil, "", 0)
 		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 		return
 	}
@@ -142,6 +150,7 @@ func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// The policy controller marks these invalid on the object; this is the
 		// belt to that braces, for a policy edited between reconciles.
+		metrics.RecordFailure("invalid_policy", nil, policy.Name, 0)
 		writeJSON(w, http.StatusUnprocessableEntity, ErrorResponse{
 			Error: "policy " + policy.Name + " is not usable: " + err.Error(),
 		})
@@ -153,15 +162,19 @@ func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var noCand *framework.ErrNoCandidates
 		if errors.As(err, &noCand) {
+			metrics.RecordFailure("no_candidates", noCand.Results, policy.Name, time.Since(start))
 			writeJSON(w, http.StatusConflict, ErrorResponse{
 				Error:       err.Error(),
 				Explanation: explainResults(noCand.Results),
 			})
 			return
 		}
+		metrics.RecordFailure("error", nil, policy.Name, time.Since(start))
 		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 		return
 	}
+
+	metrics.RecordDecision(policy.Name, decision, candidates, time.Since(start))
 
 	resp := Response{
 		Provider:    decision.Provider,

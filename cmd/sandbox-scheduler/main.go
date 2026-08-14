@@ -32,6 +32,7 @@ import (
 	"github.com/NolanFoster/sandbox-scheduler/api/v1alpha1"
 	"github.com/NolanFoster/sandbox-scheduler/internal/controller"
 	_ "github.com/NolanFoster/sandbox-scheduler/pkg/adapter/agentsandbox"
+	schedmetrics "github.com/NolanFoster/sandbox-scheduler/pkg/metrics"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/registry"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/scheduler"
 )
@@ -94,6 +95,13 @@ func main() {
 	}
 
 	reg := registry.New(registry.Options{StaleAfter: staleAfter})
+
+	// Provider gauges are collected at scrape time, so they always reflect what
+	// the scheduler believes right now rather than what a timer last copied.
+	if err := schedmetrics.RegisterRegistryCollector(reg); err != nil {
+		log.Error(err, "unable to register provider metrics")
+		os.Exit(1)
+	}
 
 	if err := (&controller.SandboxProviderReconciler{
 		Client:          mgr.GetClient(),
