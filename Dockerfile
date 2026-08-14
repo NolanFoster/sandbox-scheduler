@@ -1,5 +1,11 @@
 # Build in a full toolchain, ship almost nothing.
-FROM golang:1.24 AS builder
+#
+# Keep this in step with the `go` directive in go.mod. CI reads that file
+# directly (setup-go's go-version-file), so a stale pin here fails only in the
+# image build — as it did: go.mod moved to 1.26 when controller-runtime was
+# added, CI stayed green, and the image failed with "go.mod requires go >=
+# 1.26.0 (running go 1.24.13)".
+FROM golang:1.26 AS builder
 WORKDIR /workspace
 
 # Dependencies first, so a source-only change reuses the module cache layer.

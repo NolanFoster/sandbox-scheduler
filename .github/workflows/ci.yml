@@ -27,6 +27,17 @@ jobs:
       - name: Formatting
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
 
+      # The Dockerfile pins its toolchain by hand while CI reads go.mod, so the
+      # two drift silently and only the image build notices. Catch it here.
+      - name: Dockerfile Go version matches go.mod
+        run: |
+          want=$(awk '/^go /{print $2}' go.mod | cut -d. -f1,2)
+          got=$(awk '/^FROM golang:/{print $2}' Dockerfile | head -1 | cut -d: -f2 | cut -d. -f1,2)
+          if [ "$want" != "$got" ]; then
+            echo "::error::go.mod wants Go $want but Dockerfile pins $got"
+            exit 1
+          fi
+
       # Generated code drifting from its source is invisible until something
       # deserializes wrongly at runtime, so fail the build on it.
       - name: Generated files are current
