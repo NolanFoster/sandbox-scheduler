@@ -64,6 +64,14 @@ Capacity arrives asynchronously; the pipeline only reads it. This is how the
 Kubernetes scheduler achieves sub-millisecond decisions, and it is the single
 most important property here.
 
+`pkg/registry` is the other half of that: it polls providers on its own
+schedule, and `Snapshot()` returns from memory under a read lock. Two rules keep
+it honest — **a failed refresh never erases what we knew** (it ages, because a
+blip that zeroed capacity would silently redirect a fleet), and **a stale
+provider never leaves the snapshot** (it is reported unreachable with its last
+known capacity, so policy decides; dropping it makes "why wasn't civo
+considered?" unanswerable).
+
 ### Every decision explains itself
 
 A scheduler that says `gke` and nothing else is unoperable — you cannot tell a
@@ -104,9 +112,9 @@ move rather than wait when it is not.
 
 - [x] Scheduling framework: filter, score, bind, with explanations
 - [x] Built-in filters and scorers
+- [x] Capacity registry: refresh off the decision path, scheduler reads memory
 - [ ] `SandboxProvider` / `SandboxPlacementPolicy` CRDs
-- [ ] Controller reconciling placement onto `Sandbox` objects
-- [ ] Capacity registry: providers report, scheduler reads local state
+- [ ] Controller: watch CRDs, maintain the registry, serve decisions
 - [ ] Provider adapters: Kubernetes (agent-sandbox), then non-Kubernetes
 - [ ] KEP proposing this to the agent-sandbox SIG as an extension
 
