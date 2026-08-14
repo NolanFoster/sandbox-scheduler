@@ -145,9 +145,16 @@ type Decision struct {
 // Explain renders a human-readable account of the decision. Intended for
 // operator-facing logs and `kubectl describe`-style output.
 func (d *Decision) Explain() string {
+	return fmt.Sprintf("placed on %q (score %d)\n%s", d.Provider, d.Score, ExplainResults(d.Results))
+}
+
+// ExplainResults renders per-candidate reasoning without claiming anything was
+// placed. Used when nothing was: rendering a failure through Decision.Explain
+// would print `placed on ""`, which reads as a bug in the scheduler rather than
+// as the answer to "why did this fail?".
+func ExplainResults(results []CandidateResult) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "placed on %q (score %d)\n", d.Provider, d.Score)
-	for _, r := range d.Results {
+	for _, r := range results {
 		if r.Filtered {
 			fmt.Fprintf(&b, "  %-12s filtered: %s\n", r.Provider, r.Reason)
 			continue

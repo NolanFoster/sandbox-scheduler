@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sandbox-scheduler
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - placement.agents.x-k8s.io
+  resources:
+  - sandboxplacementpolicies
+  - sandboxproviders
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - placement.agents.x-k8s.io
+  resources:
+  - sandboxplacementpolicies/status
+  - sandboxproviders/status
+  verbs:
+  - get
+  - patch
+  - update

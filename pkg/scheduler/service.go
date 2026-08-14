@@ -213,8 +213,7 @@ func (s *Service) handleProviders(w http.ResponseWriter, _ *http.Request) {
 }
 
 func explainResults(results []framework.CandidateResult) string {
-	d := framework.Decision{Results: results}
-	return d.Explain()
+	return framework.ExplainResults(results)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

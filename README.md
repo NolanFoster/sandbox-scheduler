@@ -2,9 +2,8 @@
 
 Placement for agent sandboxes across multiple clusters and providers.
 
-> **Status: early.** The scheduling framework and its built-in policies work and
-> are tested. The CRDs, controller and provider adapters are not written yet.
-> Interfaces will change.
+> **Status: early but running.** Verified end to end against two real
+> Kubernetes clusters — see below. Interfaces will still change.
 
 ## What this is
 
@@ -155,23 +154,44 @@ filter to enforce it all fail validation with an explanation. Silently dropping
 an unknown filter would place workloads under weaker constraints than the
 operator wrote down, and nothing would look wrong.
 
-## Verified end to end
+## Running it
 
-Pointed at a live two-provider setup — a real Civo cluster running
-agent-sandbox, and an unreachable stand-in for GKE:
-
+```bash
+kubectl apply -f config/crd/
+kubectl create namespace sandbox-scheduler
+make run          # against whatever cluster kubectl points at
 ```
-  civo   reachable=true  warm=3  err=<nil>
-  gke    reachable=false warm=0  err=lookup gateway.invalid.example: no such host
 
+Declare a provider, and the scheduler discovers its capacity:
+
+```console
+$ kubectl get sandboxproviders
+NAME   ADAPTER         WARM   READY   AGE
+civo   agent-sandbox   3      True    24s
+gke    agent-sandbox   3      True    24s
+
+$ curl -sX POST localhost:8082/schedule -d '{"name":"sb-1"}'
 placed on "civo" (score 825)
   civo         score 825   WarmCapacity=60*5 Cost=75*3 Reachability=100*3 Affinity=0*1
-  gke          score 0     WarmCapacity=0*5 Cost=0*3 Reachability=0*3 Affinity=0*1
+  gke          score 600   WarmCapacity=60*5 Cost=0*3 Reachability=100*3 Affinity=0*1
 ```
 
-The unreachable provider stays a candidate with its reasons intact rather than
-disappearing — which is what makes the outcome explainable instead of just
-correct.
+## Verified end to end
+
+Against two real Kubernetes clusters running agent-sandbox — one on Civo, one
+on GKE — not mocks:
+
+| scenario | result |
+| --- | --- |
+| both warm and equal | placed on the cheaper cluster (825 vs 600) |
+| cheap provider drained (`disabled: true`) | spilled to the other |
+| provider with no credential | `Ready=False`, *"gateway rejected the credential (HTTP 401) — check the Secret referenced by credentialsRef"* |
+| requirement nothing satisfies | HTTP 409, naming each provider and why |
+
+The failure cases matter more than the success. An unreachable provider stays a
+candidate with its reasons intact rather than disappearing, and a rejected one
+says which Secret to look at — the difference between a scheduler that is
+correct and one that can be operated.
 
 ## Roadmap
 
@@ -180,8 +200,9 @@ correct.
 - [x] Capacity registry: refresh off the decision path, scheduler reads memory
 - [x] `SandboxProvider` / `SandboxPlacementPolicy` CRDs
 - [x] `agent-sandbox` adapter, verified against a live cluster
-- [ ] Controller: watch CRDs, maintain the registry, serve decisions
+- [x] Controller and placement API, running against two real clusters
 - [ ] Further adapters, including non-Kubernetes providers
+- [ ] Container image and Helm chart
 - [ ] KEP proposing this to the agent-sandbox SIG as an extension
 
 The intended home is upstream. `SandboxClaim`, `SandboxTemplate` and
