@@ -369,3 +369,46 @@ func TestMalformedAuthorizationHeadersAreRejected(t *testing.T) {
 		}
 	}
 }
+
+// Fleet-wide callers need every provider's address from one request. Keeping a
+// second copy of that mapping elsewhere is how a cluster ends up invisible
+// while still running workloads.
+func TestProvidersReportEndpoints(t *testing.T) {
+	h := newService(t, map[string]registry.Report{
+		"civo": {WarmCapacity: 3},
+		"gke":  {WarmCapacity: 1},
+	})
+
+	w := do(h, http.MethodGet, "/providers", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var got []scheduler.ProviderStatus
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d providers, want 2", len(got))
+	}
+	for _, ps := range got {
+		want := "https://" + ps.Provider + ".example.com"
+		if ps.Endpoint != want {
+			t.Fatalf("provider %q endpoint %q, want %q", ps.Provider, ps.Endpoint, want)
+		}
+	}
+}
+
+// Without a lookup the field is absent rather than blank, so a caller can tell
+// "not configured" from "configured as empty" instead of fanning out to "".
+func TestProvidersOmitEndpointWhenUnset(t *testing.T) {
+	reg := registry.New(registry.Options{})
+	reg.Report("civo", registry.Report{WarmCapacity: 1})
+	pl := &scheduler.PolicyList{}
+	pl.Set(nil)
+	svc := &scheduler.Service{Registry: reg, Policies: pl}
+
+	w := do(svc.Handler(), http.MethodGet, "/providers", "")
+	if strings.Contains(w.Body.String(), "endpoint") {
+		t.Fatalf("endpoint should be omitted entirely:\n%s", w.Body.String())
+	}
+}
