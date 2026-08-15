@@ -237,7 +237,18 @@ func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
 
 // ProviderStatus is one entry of GET /providers.
 type ProviderStatus struct {
-	Provider     string `json:"provider"`
+	Provider string `json:"provider"`
+
+	// Endpoint is the provider's address. Callers that need to reach every
+	// cluster in the fleet — to list what is running on each, say — would
+	// otherwise have to keep their own copy of this mapping, which then drifts
+	// from the SandboxProvider objects that actually define it. One
+	// unremarked-on difference and a whole cluster's workloads become
+	// invisible while still running.
+	//
+	// Omitted when no endpoint lookup is configured.
+	Endpoint string `json:"endpoint,omitempty"`
+
 	Reachable    bool   `json:"reachable"`
 	Stale        bool   `json:"stale"`
 	WarmCapacity int    `json:"warmCapacity"`
@@ -257,6 +268,9 @@ func (s *Service) handleProviders(w http.ResponseWriter, _ *http.Request) {
 			Stale:        st.Stale,
 			WarmCapacity: st.Report.WarmCapacity,
 			AgeSeconds:   int64(st.Age / time.Second),
+		}
+		if s.Endpoints != nil {
+			ps.Endpoint = s.Endpoints(st.Provider)
 		}
 		if st.LastError != nil {
 			ps.LastError = st.LastError.Error()
