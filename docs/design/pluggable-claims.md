@@ -1,6 +1,6 @@
 # Pluggable claims: placing *and* provisioning sandboxes beyond Kubernetes
 
-Status: **draft v5, revised after four review rounds** (OSS compatibility,
+Status: **draft v6, revised after five review rounds** (OSS compatibility,
 scalability, Kubernetes practices, Go practices). Nothing here is implemented.
 Section 12 records what changed in each revision and why.
 
@@ -100,9 +100,23 @@ package provider
 var ErrNotFound = errors.New("provider: no sandbox for key")
 
 type Provider struct {
-    Source Source      // required: capacity
-    Binder Binder      // nil: decide-only provider
-    Lister OwnedLister // nil: relies on provider-native expiry
+    Source      Source        // required: capacity
+    Binder      Binder        // nil: decide-only provider
+    Lister      OwnedLister   // nil: relies on provider-native expiry
+    BatchLookup BatchLookuper // nil: Lookups are issued one key at a time
+}
+
+// BatchLookuper resolves many keys in one provider call (for a hosted API,
+// typically one owner-labelled list filtered by a set of keys). Optional; it
+// lets the core coalesce a burst of retry Lookups (5.6). Results are per
+// request, in order, with the same semantics as Binder.Lookup.
+type BatchLookuper interface {
+    LookupMany(ctx context.Context, reqs []ClaimRequest) []LookupResult
+}
+
+type LookupResult struct {
+    Handle Handle
+    Err    error
 }
 
 type Binder interface {
@@ -150,6 +164,12 @@ type Handle struct {
     ExpiresAt time.Time         // zero = unknown
 }
 ```
+
+**Prerequisite for implementing `Binder`:** the adapter must be able to find a
+sandbox by key without listing everything (a deterministic name, provider
+metadata or tags). The Lookup rule (5.6) depends on it; `adaptertest` checks it
+by asserting `Lookup` issues a bounded number of provider calls regardless of
+how many sandboxes exist.
 
 `Factory` becomes `func(Config) (provider.Provider, error)`, changed now while
 one in-tree adapter exists. `pkg/binder` resolves a provider's `Provider`,
@@ -285,8 +305,13 @@ DELETE /api/v1alpha1/sandboxes/{provider}/{id}
   learn (timeout, connection reset); the client SDK sets it on every retry.
   `pinProvider` is set from a 504's `providers` field when it names exactly
   one.
-- Error bodies always carry `providers` (an array, possibly empty) so SDKs see
-  one response shape.
+- Error bodies always carry `providers` (an array, possibly empty) and a
+  machine-readable `reason`, so SDKs see one response shape. The two 409
+  `KeyConflict` cases are distinguished: `reason: SpecMismatch` (the key exists
+  with a different spec) versus `reason: ConstraintExcluded` (the key's sandbox
+  exists on a provider this request's filters exclude).
+- A request that joins an in-flight claim for the same key (5.6) inherits that
+  claim's deadline; its own `timeoutSeconds` is ignored.
 - Separate token `PLACEMENT_CLAIM_TOKEN` (existing-Secret pattern,
   constant-time compare).
 - Idempotency window = lifetime of the provider object. Documented: a replay
@@ -337,8 +362,13 @@ if pinProvider != "":
     ErrNotFound → claim only on pinProvider;
     KeyConflict → 409; KeyBusy or Busy → 429 {providers}; other → 504 {providers}
 elif retry:
-    probe Lookup on every claim-capable provider in parallel (bounded,
-    per-attempt timeout, separate per-provider Lookup token bucket)
+    reserve one Lookup token on every claim-capable provider, all or nothing:
+        reserve on each bucket (rate.Limiter.ReserveN); if the longest wait
+        fits before reqDeadline, wait it out and proceed; otherwise cancel
+        every reservation (spending nothing) and return 429 {providers} with
+        Retry-After = that longest wait, jittered
+    probe Lookup on every claim-capable provider in parallel (per-attempt
+    timeout), coalesced per provider (below)
     any found          → 200 if it passes the request's filters, else 409
     any KeyConflict    → 409
     all ErrNotFound    → continue as a first attempt
@@ -347,6 +377,20 @@ elif retry:
     one inconclusive   → pin to it if it passes the filters, else 504 {providers}
     more than one      → 504 {providers}
 ```
+
+Because every retry needs a token from every provider, failover recovery would
+be capped by the smallest Lookup rate in the fleet (20/s on an elastic
+provider: ~3.4 min for 4,096 retries). Three things lift that cap:
+
+- **All-or-nothing reservation** (above): a retry that cannot get every token
+  spends none, so a slow bucket does not drain the fast ones.
+- **Waiting within the deadline** instead of failing fast, so retries queue
+  smoothly rather than bouncing as 429s.
+- **Coalescing**: retry Lookups for the same provider arriving within a 50ms
+  window are sent as one `LookupMany` call when the adapter provides a
+  `BatchLookup`, and one Lookup token covers the batch. With batching, an
+  elastic provider at 20 calls/s and batches of up to 100 keys resolves 2,000
+  keys/s, so 4,096 retries clear in ~2s.
 
 An inconclusive result from a provider the filters exclude is still
 inconclusive, never "not found". The common consequence: while a provider's
@@ -357,9 +401,14 @@ duplicate, and the provider's `Claiming` condition shows the credentials reason.
 **Lease handover.** If the leader loses its lease, the process exits at once
 (controller-runtime skips graceful shutdown on lease loss), and a claim it had
 already sent may still land on its provider. A new leader therefore **holds off
-claim and Lookup traffic for one per-attempt timeout** (default 3s) after
-acquiring the lease, returning 503 with `Retry-After`; any claim the old process
-sent completes or fails within that time, so the new leader's Lookups see it.
+claim and Lookup traffic** after acquiring the lease, for the **largest
+`spec.claims.timeout` across claim-capable providers, capped by
+`--claim-timeout`** (3s with defaults), returning 503 with a **jittered**
+`Retry-After` (hold-off remaining + random 0–3s) so the retry wave does not
+return in lockstep. This is a heuristic: a create the old process already sent
+completes on the remote server within that server's own request timeout, not
+the scheduler's; in practice creates finish in milliseconds, and any leak is
+owner-labelled and bounded by its TTL.
 Graceful shutdowns release the lease only after in-flight attempts finish
 (5.7). The old leader's `placement.agents.x-k8s.io/active` pod label is left
 behind on lease loss; the next start clears it before reporting Ready
@@ -639,9 +688,15 @@ phase 6.
   modelled on `testing/fstest`; the harness injects faults the suite cannot
   reach generically (no capacity, rate limit, refuse-before-send,
   drop-after-send, auth, key conflict, deleting key), and checks that `Lookup`
-  applies the same replay rules as `Claim`. Over gRPC it also checks that
-  `KIND_UNSPECIFIED` and an unrecognised enum number map to
-  `KindUnknownOutcome`.
+  applies the same replay rules as `Claim`, that `Lookup` stays within a
+  bounded number of provider calls regardless of how many sandboxes exist, and
+  that `LookupMany` (when present) agrees with per-key `Lookup`. Over gRPC it
+  sends `KIND_UNSPECIFIED` and an unrecognised enum number and asserts both map
+  to `KindUnknownOutcome` (never `Unavailable` or any spilling kind).
+- Retry Lookups: a burst of retries against one slow bucket spends no tokens
+  on other providers' buckets (all-or-nothing); retries wait within their
+  deadline; coalesced Lookups resolve each key correctly; the hold-off uses the
+  largest provider timeout and a jittered `Retry-After`.
 - `FuzzValidateKey`, `FuzzLabels`.
 - agent-sandbox: envtest with upstream CRDs; replay with matching and
   mismatched spec-hash; replay of a deleting claim; claims on an empty pool
@@ -668,9 +723,16 @@ phase 6.
   (≈300/s warm, 70–85/s per pool refill) is the limit, not the scheduler. At
   the same table's burst p90 (≈3.2s), 512 slots sustain ~160/s per provider;
   operators expecting long bursts near 300/s raise `maxInFlight` toward 1024.
-- Retry storms after failover: up to 4,096 retries × P providers of consistent
-  Lookup GETs, spread by client jitter and capped by the per-provider Lookup
-  bucket; Lookup rate limits return 429, not 504, so they cannot loop.
+- Failover: on a crash, ~15s until the lease expires plus the hold-off (3s with
+  defaults) gives ~18s of 503s; graceful handovers skip the lease wait.
+- Retry recovery after failover ≈ in-flight retries ÷ the smallest
+  per-provider Lookup throughput. Without batching that is the smallest
+  `lookupRate` (4,096 ÷ 20/s ≈ 205s, if an elastic provider has no
+  `BatchLookup`); with batching it is that rate × batch size (≈ 2s). Retries
+  wait for tokens within their deadline, reserve all-or-nothing so slow buckets
+  do not drain fast ones, and Lookup rate limits return 429, not 504, so they
+  cannot loop. Elastic adapters are therefore expected to implement
+  `BatchLookup`; `adaptertest` reports when they do not.
 - Leader memory: ~50KB per in-flight claim, including its bind watch; the
   global cap of 4096 bounds this at ~200MB. Nothing scales with the number of
   live sandboxes.
@@ -714,6 +776,18 @@ phase 6.
   first still exists.
 
 ## 12. Changes
+
+### v5 → v6 (round 5)
+
+| v5 | v6 | Raised by |
+|---|---|---|
+| Unfiltered retry probe made failover recovery wait on the smallest Lookup bucket (20/s elastic: ~3.4 min for 4,096 retries), and failed probes drained other buckets | All-or-nothing token reservation; wait within the deadline; per-provider Lookup coalescing via optional `BatchLookup` (≈2s for 4,096); section 9 restated | Scalability (major) |
+| Hold-off fixed at the default per-attempt timeout, fixed `Retry-After` | Largest provider timeout, capped by `--claim-timeout`; jittered `Retry-After`; stated as a heuristic | Go, Kubernetes, Scalability |
+| One 409 body for spec mismatch and constraint exclusion | `reason: SpecMismatch` vs `ConstraintExcluded` | Go |
+| Joiner `timeoutSeconds` silently ignored | Documented in 5.5 | Kubernetes |
+| "Lookup by key without listing" implied | Stated as a `Binder` prerequisite; asserted in `adaptertest` | OSS |
+| Unknown proto enum test implicit | Explicit contract case; must not map to a spilling kind | Go |
+| Crash failover 503 duration unstated | ~18s stated in section 9 | Scalability |
 
 ### v4 → v5 (round 4)
 
