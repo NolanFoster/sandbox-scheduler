@@ -128,13 +128,19 @@ func TestEmptyCandidateSetIsAnError(t *testing.T) {
 func TestTiesBreakDeterministically(t *testing.T) {
 	// An unstable tiebreak makes a fleet flap between providers on every pass.
 	// That is invisible in a single decision and shows up later as churn.
+	// Warm ties, because those are the ones settled by name; cold ties spread
+	// load instead (see TestColdTiesWithEqualLoadSpreadAtRandom).
 	p := &framework.Profile{
 		Scorers: []framework.WeightedScorer{
 			{Scorer: fixedScore{"a", map[string]int64{"zeta": 10, "alpha": 10}}, Weight: 1},
 		},
 	}
+	cands := candidates("zeta", "alpha")
+	for i := range cands {
+		cands[i].WarmCapacity = 1
+	}
 	for i := 0; i < 20; i++ {
-		got, err := p.Schedule(context.Background(), &framework.Request{}, candidates("zeta", "alpha"))
+		got, err := p.Schedule(context.Background(), &framework.Request{}, cands)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -347,5 +353,23 @@ func TestColdTiesSpreadABurstEvenly(t *testing.T) {
 	}
 	if len(placed) != 4 || hi-lo > 10 {
 		t.Fatalf("placed %v; a burst of cold starts should spread evenly", placed)
+	}
+}
+
+func TestColdTiesWithEqualLoadSpreadAtRandom(t *testing.T) {
+	// Concurrent requests read their snapshots before any records its
+	// placement, so a burst sees equal counts. Breaking those by name would
+	// send the whole burst to one provider.
+	p := tiedProfile(nil)
+	placed := map[string]int{}
+	for i := 0; i < 400; i++ {
+		got, _ := p.Schedule(context.Background(), &framework.Request{}, candidates("alpha", "zeta"))
+		placed[got.Provider]++
+		if !strings.Contains(got.TieBreak, "equal, chose at random") {
+			t.Fatalf("tie-break should say it chose at random: %q", got.TieBreak)
+		}
+	}
+	if placed["alpha"] < 120 || placed["zeta"] < 120 {
+		t.Fatalf("placed %v; equal-load cold ties should split", placed)
 	}
 }

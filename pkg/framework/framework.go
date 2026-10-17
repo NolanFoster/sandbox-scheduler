@@ -311,9 +311,11 @@ func (p *Profile) Schedule(ctx context.Context, req *Request, candidates []Candi
 // provision a sandbox, and sending a burst of them to whichever name sorts
 // first queues them on one provider while equally good ones sit idle. These
 // break by the power of two choices: sample two of the tied candidates and
-// take the one with fewer cold starts in flight, so load spreads with little
-// coordination and no herd onto whichever looks emptiest. With two tied, both
-// are compared, which always picks the less loaded.
+// take the one with fewer cold starts in flight, or either at random when they
+// have the same, so load spreads with little coordination and no herd onto
+// whichever looks emptiest. With two tied, both are compared, which always
+// picks the less loaded. The randomness is what makes this robust to counts
+// that lag, which under concurrency they do.
 func (p *Profile) pick(results []CandidateResult, feasible []int, candidates []Candidate) (int, string) {
 	best := feasible[0]
 	for _, idx := range feasible[1:] {
@@ -338,13 +340,13 @@ func (p *Profile) pick(results []CandidateResult, feasible []int, candidates []C
 		return best, fmt.Sprintf("%d candidates tied; broke on provider name", len(tied))
 	}
 
+	intn := p.Rand
+	if intn == nil {
+		intn = rand.IntN
+	}
 	a, b := tied[0], tied[1]
 	how := "compared both"
 	if len(tied) > 2 {
-		intn := p.Rand
-		if intn == nil {
-			intn = rand.IntN
-		}
 		i := intn(len(tied))
 		j := intn(len(tied) - 1)
 		if j >= i {
@@ -354,11 +356,20 @@ func (p *Profile) pick(results []CandidateResult, feasible []int, candidates []C
 		how = fmt.Sprintf("sampled 2 of %d", len(tied))
 	}
 	ca, cb := &candidates[a], &candidates[b]
-	if cb.InFlightCold < ca.InFlightCold ||
-		(cb.InFlightCold == ca.InFlightCold && cb.Provider < ca.Provider) {
+	// Equal counts break at random, never by name. Concurrent requests take
+	// their snapshots before any of them records its placement, so a burst
+	// often sees the same counts everywhere; a fixed rule would send all of it
+	// to one provider. A coin spreads it, and the counts correct whatever lag
+	// remains within one decision.
+	equal := ca.InFlightCold == cb.InFlightCold
+	if cb.InFlightCold < ca.InFlightCold || (equal && intn(2) == 1) {
 		a, b = b, a
 		ca, cb = cb, ca
 	}
-	return a, fmt.Sprintf("cold candidates tied; %s: %q has %d cold starts in flight, %q has %d",
-		how, ca.Provider, ca.InFlightCold, cb.Provider, cb.InFlightCold)
+	why := ""
+	if equal {
+		why = "; equal, chose at random"
+	}
+	return a, fmt.Sprintf("cold candidates tied; %s: %q has %d cold starts in flight, %q has %d%s",
+		how, ca.Provider, ca.InFlightCold, cb.Provider, cb.InFlightCold, why)
 }
