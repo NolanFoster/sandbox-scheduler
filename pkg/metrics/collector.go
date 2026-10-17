@@ -27,6 +27,7 @@ type registryCollector struct {
 	source StatusSource
 
 	warmCapacity *prometheus.Desc
+	reserved     *prometheus.Desc
 	reachable    *prometheus.Desc
 	staleness    *prometheus.Desc
 	cost         *prometheus.Desc
@@ -39,6 +40,12 @@ func NewRegistryCollector(source StatusSource) prometheus.Collector {
 		warmCapacity: prometheus.NewDesc(
 			namespace+"_provider_warm_capacity",
 			"Pre-warmed sandboxes a provider reported at its last successful poll.",
+			[]string{"provider"}, nil,
+		),
+		reserved: prometheus.NewDesc(
+			namespace+"_provider_reserved_capacity",
+			"Warm sandboxes placed on a provider since its last poll, subtracted from its "+
+				"reported warm capacity when scheduling.",
 			[]string{"provider"}, nil,
 		),
 		reachable: prometheus.NewDesc(
@@ -65,6 +72,7 @@ func NewRegistryCollector(source StatusSource) prometheus.Collector {
 // Describe implements prometheus.Collector.
 func (c *registryCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.warmCapacity
+	ch <- c.reserved
 	ch <- c.reachable
 	ch <- c.staleness
 	ch <- c.cost
@@ -75,6 +83,8 @@ func (c *registryCollector) Collect(ch chan<- prometheus.Metric) {
 	for _, st := range c.source.Statuses() {
 		ch <- prometheus.MustNewConstMetric(
 			c.warmCapacity, prometheus.GaugeValue, float64(st.Report.WarmCapacity), st.Provider)
+		ch <- prometheus.MustNewConstMetric(
+			c.reserved, prometheus.GaugeValue, float64(st.Reserved), st.Provider)
 		ch <- prometheus.MustNewConstMetric(
 			c.reachable, prometheus.GaugeValue, boolValue(st.Reachable), st.Provider)
 		ch <- prometheus.MustNewConstMetric(

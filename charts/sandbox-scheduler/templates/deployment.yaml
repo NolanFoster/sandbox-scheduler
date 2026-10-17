@@ -28,6 +28,7 @@ spec:
             - --secret-namespace={{ .Release.Namespace }}
             - --refresh-interval={{ .Values.scheduler.refreshInterval }}
             - --stale-after={{ .Values.scheduler.staleAfter }}
+            - --reservation-grace={{ .Values.scheduler.reservationGrace }}
             - --scheduler-bind-address=:{{ .Values.service.port }}
             - --metrics-bind-address=:{{ .Values.metrics.port }}
             - --health-probe-bind-address=:8081

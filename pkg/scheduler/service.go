@@ -217,6 +217,16 @@ func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
 
 	metrics.RecordDecision(policy.Name, decision, candidates, time.Since(start))
 
+	// Count the warm sandbox this placement will take, so the requests behind
+	// it in a burst see what is left rather than what the last poll saw. A
+	// cold placement takes nothing from the pool and reserves nothing.
+	for _, c := range candidates {
+		if c.Provider == decision.Provider && c.WarmCapacity > 0 {
+			s.Registry.Reserve(decision.Provider)
+			break
+		}
+	}
+
 	resp := Response{
 		Provider:    decision.Provider,
 		Score:       decision.Score,
@@ -249,11 +259,14 @@ type ProviderStatus struct {
 	// Omitted when no endpoint lookup is configured.
 	Endpoint string `json:"endpoint,omitempty"`
 
-	Reachable    bool   `json:"reachable"`
-	Stale        bool   `json:"stale"`
-	WarmCapacity int    `json:"warmCapacity"`
-	AgeSeconds   int64  `json:"ageSeconds"`
-	LastError    string `json:"lastError,omitempty"`
+	Reachable    bool `json:"reachable"`
+	Stale        bool `json:"stale"`
+	WarmCapacity int  `json:"warmCapacity"`
+	// Reserved is how many placements since the last poll are being
+	// subtracted from WarmCapacity when scheduling.
+	Reserved   int    `json:"reserved"`
+	AgeSeconds int64  `json:"ageSeconds"`
+	LastError  string `json:"lastError,omitempty"`
 }
 
 // handleProviders exposes what the scheduler currently believes, which is the
@@ -267,6 +280,7 @@ func (s *Service) handleProviders(w http.ResponseWriter, _ *http.Request) {
 			Reachable:    st.Reachable,
 			Stale:        st.Stale,
 			WarmCapacity: st.Report.WarmCapacity,
+			Reserved:     st.Reserved,
 			AgeSeconds:   int64(st.Age / time.Second),
 		}
 		if s.Endpoints != nil {

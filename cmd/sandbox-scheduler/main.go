@@ -52,13 +52,14 @@ func utilRuntimeMust(err error) {
 
 func main() {
 	var (
-		metricsAddr     string
-		probeAddr       string
-		schedulerAddr   string
-		secretNamespace string
-		refreshInterval time.Duration
-		staleAfter      time.Duration
-		leaderElection  bool
+		metricsAddr      string
+		probeAddr        string
+		schedulerAddr    string
+		secretNamespace  string
+		refreshInterval  time.Duration
+		staleAfter       time.Duration
+		reservationGrace time.Duration
+		leaderElection   bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address for the metrics endpoint.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address for health and readiness probes.")
@@ -71,6 +72,9 @@ func main() {
 			"against load on providers, never placement latency.")
 	flag.DurationVar(&staleAfter, "stale-after", 30*time.Second,
 		"How long a capacity report stays trusted before its provider is treated as unreachable.")
+	flag.DurationVar(&reservationGrace, "reservation-grace", 5*time.Second,
+		"How long a claim may take to appear in a provider's capacity report. Placements are "+
+			"subtracted from a provider's warm capacity until a poll started this long after them succeeds.")
 	flag.BoolVar(&leaderElection, "leader-elect", false,
 		"Elect a leader for the controllers. Note the placement API is served by every replica: "+
 			"it is a read over local cache, so serving it from a single leader would add a hop for no gain.")
@@ -94,7 +98,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	reg := registry.New(registry.Options{StaleAfter: staleAfter})
+	reg := registry.New(registry.Options{StaleAfter: staleAfter, ReservationGrace: reservationGrace})
 
 	// Provider gauges are collected at scrape time, so they always reflect what
 	// the scheduler believes right now rather than what a timer last copied.
@@ -158,7 +162,7 @@ func main() {
 	}
 
 	log.Info("starting sandbox-scheduler",
-		"placementAPI", schedulerAddr, "refreshInterval", refreshInterval, "staleAfter", staleAfter)
+		"placementAPI", schedulerAddr, "refreshInterval", refreshInterval, "staleAfter", staleAfter, "reservationGrace", reservationGrace)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "manager exited with error")
 		os.Exit(1)

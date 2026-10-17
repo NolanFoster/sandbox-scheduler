@@ -34,6 +34,12 @@ scheduler:
   # as unreachable, but keeps its last known capacity so policy can still
   # choose to use it rather than fail.
   staleAfter: 30s
+  # How long a claim may take to show up in a provider's capacity report.
+  # Placements are subtracted from a provider's warm capacity until a poll
+  # started this long after them succeeds, so a burst spreads across providers
+  # instead of piling onto the one that looked best at the last poll. Each
+  # replica counts only the placements it made itself.
+  reservationGrace: 5s
 
 service:
   type: ClusterIP

@@ -71,6 +71,16 @@ provider never leaves the snapshot** (it is reported unreachable with its last
 known capacity, so policy decides; dropping it makes "why wasn't civo
 considered?" unanswerable).
 
+A cache has one weakness under a burst: every request between two polls reads
+the same capacity and reaches the same answer, so a thousand requests in a
+second all land on the provider that looked best at the last poll, long after
+its warm pool is drained. Each warm placement therefore **reserves** a
+sandbox, subtracted from that provider's capacity until a poll that started
+after it (plus `--reservation-grace`, default 5s, for the claim to show up)
+succeeds. The error this can make is counting a claim twice for one poll,
+which spills placements early rather than piling them onto an empty pool.
+Reservations are per replica: with N replicas, each sees only its own.
+
 ### Every decision explains itself
 
 A scheduler that says `gke` and nothing else is unoperable — you cannot tell a
