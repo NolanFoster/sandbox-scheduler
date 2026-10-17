@@ -23,13 +23,15 @@
 //     unanswerable, which is the failure mode operators hate most.
 //
 // One correction is layered on top of the polled reports: placements made since
-// the last poll are subtracted from the capacity a snapshot shows. See Reserve.
+// the last poll are subtracted from the capacity a snapshot shows. See
+// TryReserveWarm.
 package registry
 
 import (
 	"context"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/NolanFoster/sandbox-scheduler/pkg/framework"
@@ -94,29 +96,22 @@ type entry struct {
 	everReported bool
 	lastErr      error
 
-	// reservations are the times of placements made against this provider's
-	// warm capacity that its report may not yet reflect. See Reserve.
-	reservations []time.Time
+	// ledger counts placements made against this provider's warm capacity
+	// that its report may not yet reflect. See TryReserveWarm.
+	ledger *ledger
 }
 
-// clearReservations drops reservations made before cutoff, which a report
-// fetched after cutoff already accounts for.
-func (e *entry) clearReservations(cutoff time.Time) {
-	kept := e.reservations[:0]
-	for _, t := range e.reservations {
-		if !t.Before(cutoff) {
-			kept = append(kept, t)
-		}
-	}
-	e.reservations = kept
-}
-
-// warm is the report's warm capacity less what has been reserved since.
-func (e *entry) warm() int {
-	if w := e.report.WarmCapacity - len(e.reservations); w > 0 {
-		return w
-	}
-	return 0
+// setReport records a report and drops the reservations it accounts for:
+// those made before cutoff.
+func (e *entry) setReport(rep Report, at, cutoff time.Time) {
+	e.report = rep
+	e.updatedAt = at
+	e.everReported = true
+	e.lastErr = nil
+	// Capacity first: until the old reservations are cleared, the new report
+	// is understated, never overstated.
+	e.ledger.setWarm(rep.WarmCapacity)
+	e.ledger.clearBefore(cutoff)
 }
 
 // Registry holds current capacity for every known provider.
@@ -127,6 +122,11 @@ type Registry struct {
 	mu      sync.RWMutex
 	entries map[string]*entry
 	sources map[string]Source
+
+	// ledgers mirrors each entry's ledger in an immutable map, replaced
+	// whenever a provider is added or removed, so that reserving finds one
+	// without the lock.
+	ledgers atomic.Pointer[map[string]*ledger]
 
 	// staleAfter is how long a report stays trusted. Past it, the provider is
 	// reported unreachable but keeps its last known capacity.
@@ -181,7 +181,30 @@ func New(opts Options) *Registry {
 	if r.now == nil {
 		r.now = time.Now
 	}
+	r.ledgers.Store(&map[string]*ledger{})
 	return r
+}
+
+// entry returns the entry for a provider, creating it if needed. Callers hold
+// the write lock.
+func (r *Registry) entry(providerID string) *entry {
+	if e, ok := r.entries[providerID]; ok {
+		return e
+	}
+	e := &entry{ledger: newLedger(r.reservationGrace, r.fetchTimeout)}
+	r.entries[providerID] = e
+	r.publishLedgers()
+	return e
+}
+
+// publishLedgers replaces the lock-free view of ledgers after the set of
+// entries changes. Callers hold the write lock.
+func (r *Registry) publishLedgers() {
+	m := make(map[string]*ledger, len(r.entries))
+	for id, e := range r.entries {
+		m[id] = e.ledger
+	}
+	r.ledgers.Store(&m)
 }
 
 // AddSource registers a provider to be polled. Adding the same ProviderID twice
@@ -193,12 +216,9 @@ func (r *Registry) AddSource(s Source) {
 	defer r.mu.Unlock()
 	id := s.ProviderID()
 	r.sources[id] = s
-	if _, ok := r.entries[id]; !ok {
-		// Known but never heard from: appears in snapshots as unreachable with
-		// no capacity, so a misconfigured provider is visible rather than
-		// absent.
-		r.entries[id] = &entry{}
-	}
+	// Known but never heard from: appears in snapshots as unreachable with no
+	// capacity, so a misconfigured provider is visible rather than absent.
+	r.entry(id)
 }
 
 // SetConfig records what the operator declared about a provider.
@@ -209,12 +229,7 @@ func (r *Registry) AddSource(s Source) {
 func (r *Registry) SetConfig(providerID string, cfg ProviderConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e, ok := r.entries[providerID]
-	if !ok {
-		e = &entry{}
-		r.entries[providerID] = e
-	}
-	e.config = cfg
+	r.entry(providerID).config = cfg
 }
 
 // RemoveSource stops polling a provider and drops its capacity.
@@ -226,6 +241,7 @@ func (r *Registry) RemoveSource(providerID string) {
 	defer r.mu.Unlock()
 	delete(r.sources, providerID)
 	delete(r.entries, providerID)
+	r.publishLedgers()
 }
 
 // Report records capacity for a provider directly, for push-based providers
@@ -233,45 +249,43 @@ func (r *Registry) RemoveSource(providerID string) {
 func (r *Registry) Report(providerID string, rep Report) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e, ok := r.entries[providerID]
-	if !ok {
-		e = &entry{}
-		r.entries[providerID] = e
-	}
-	e.report = rep
-	e.updatedAt = r.now()
-	e.everReported = true
-	e.lastErr = nil
-	e.clearReservations(e.updatedAt.Add(-r.reservationGrace))
+	now := r.now()
+	r.entry(providerID).setReport(rep, now, now.Add(-r.reservationGrace))
 }
 
-// Reserve records a placement against a provider's warm capacity, so the
-// snapshots that follow show one fewer warm sandbox there.
+// TryReserveWarm claims one of a provider's warm sandboxes for a placement,
+// so the snapshots that follow show one fewer warm sandbox there. It reports
+// false, reserving nothing, when the provider has no warm capacity left
+// unreserved or is no longer registered.
 //
-// Without it, every placement between two polls reads the same capacity and
-// reaches the same answer: a burst of a thousand requests all lands on the
-// provider that looked best at the last poll, long after its warm pool is
-// drained, while warm capacity elsewhere sits idle.
+// Without reservations, every placement between two polls reads the same
+// capacity and reaches the same answer: a burst of a thousand requests all
+// lands on the provider that looked best at the last poll, long after its warm
+// pool is drained, while warm capacity elsewhere sits idle.
+//
+// Checking and claiming are one atomic step, which is what makes the result
+// trustworthy under concurrency: two requests that both saw the last warm
+// sandbox in their snapshots cannot both get it. The loser should schedule
+// again against a fresh snapshot. The call takes no lock, so placements do
+// not queue behind each other or behind a refresh.
 //
 // A reservation lasts until a poll that started more than ReservationGrace
 // after it succeeds, by which point the report itself reflects the claim.
 // While polls fail, reservations are kept: the claims they stand for are most
-// likely real, and the stale report would otherwise overstate capacity. This
-// also bounds them, since a provider shows no warm capacity once its
-// reservations reach its report, and callers only reserve warm capacity.
+// likely real, and the stale report would otherwise overstate capacity. They
+// are bounded regardless, since no more can be outstanding than the report
+// showed warm.
 //
 // The error this can make is double counting a claim the report already
 // reflects, for at most one poll. That shows a provider emptier than it is,
 // which spills placements early rather than piling them onto a drained pool.
-func (r *Registry) Reserve(providerID string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	e, ok := r.entries[providerID]
+func (r *Registry) TryReserveWarm(providerID string) bool {
+	l, ok := (*r.ledgers.Load())[providerID]
 	if !ok {
-		// Removed since the snapshot was taken; nothing left to correct.
-		return
+		// Removed since the snapshot was taken; nothing left to claim.
+		return false
 	}
-	e.reservations = append(e.reservations, r.now())
+	return l.tryReserve(r.now())
 }
 
 // Refresh polls every registered source once, concurrently.
@@ -311,13 +325,9 @@ func (r *Registry) Refresh(ctx context.Context) {
 				e.lastErr = err
 				return
 			}
-			e.report = rep
-			e.updatedAt = r.now()
-			e.everReported = true
-			e.lastErr = nil
 			// Only claims made a grace period before the fetch began are
 			// certain to be in its answer; later ones keep their reservation.
-			e.clearReservations(started.Add(-r.reservationGrace))
+			e.setReport(rep, r.now(), started.Add(-r.reservationGrace))
 		}(s)
 	}
 	wg.Wait()
@@ -362,7 +372,7 @@ func (r *Registry) Snapshot() []framework.Candidate {
 			Provider: id,
 			// Observed: the provider's own count of what is warm, less what
 			// has been placed there since.
-			WarmCapacity: e.warm(),
+			WarmCapacity: e.ledger.available(),
 			// Declared: never the provider's own claim. See ProviderConfig.
 			CostPerHour: e.config.CostPerHour,
 			// Fresh only if we have heard from it at all, and recently.
@@ -413,7 +423,7 @@ func (r *Registry) Statuses() []Status {
 			Stale:     e.everReported && age > r.staleAfter,
 			Age:       age,
 			Report:    e.report,
-			Reserved:  len(e.reservations),
+			Reserved:  e.ledger.reserved(),
 			Config:    e.config,
 			LastError: e.lastErr,
 		})
