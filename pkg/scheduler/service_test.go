@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -464,6 +465,46 @@ func TestABurstSpillsOnceTheCheapWarmPoolIsReserved(t *testing.T) {
 	}
 	if got["civo"].WarmCapacity != 20 {
 		t.Fatalf("warmCapacity %d; /providers should show the raw report", got["civo"].WarmCapacity)
+	}
+}
+
+func TestAConcurrentBurstNeverOverReservesAWarmPool(t *testing.T) {
+	// Concurrent requests read the same snapshot. Reserving is what decides
+	// which of them got the warm sandboxes; the rest must decide again rather
+	// than all being told to start warm on a pool that is already spoken for.
+	h := newServiceWithConfig(t,
+		map[string]registry.Report{
+			"civo": {WarmCapacity: 20},
+			"gke":  {WarmCapacity: 30},
+		},
+		map[string]registry.ProviderConfig{
+			"civo": {CostPerHour: 1},
+			"gke":  {CostPerHour: 4},
+		})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/schedule", strings.NewReader(`{}`)))
+			if w.Code != http.StatusOK {
+				t.Errorf("status %d, body %s", w.Code, w.Body)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Reservations never exceed a pool, and the cheap pool is fully used. How
+	// much of gke's goes depends on interleaving: once it is nearly drained,
+	// cost decides and the rest go to civo cold, as in the sequential burst.
+	got := providers(t, h)
+	if got["civo"].Reserved != 20 {
+		t.Fatalf("civo reserved %d; want its 20 warm used", got["civo"].Reserved)
+	}
+	if r := got["gke"].Reserved; r == 0 || r > 30 {
+		t.Fatalf("gke reserved %d; want some of its 30 and never more", r)
 	}
 }
 

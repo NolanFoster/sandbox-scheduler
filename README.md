@@ -79,6 +79,9 @@ sandbox, subtracted from that provider's capacity until a poll that started
 after it (plus `--reservation-grace`, default 5s, for the claim to show up)
 succeeds. The error this can make is counting a claim twice for one poll,
 which spills placements early rather than piling them onto an empty pool.
+Checking for a warm sandbox and claiming it is a single atomic step, taken
+without a lock, so concurrent requests that saw the same last sandbox cannot
+both get it; the one that loses schedules again against what is left.
 
 Reservations live in the deciding replica's memory, so they are only exact
 while one replica makes every decision. With `--leader-elect`, the leader

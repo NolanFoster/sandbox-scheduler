@@ -88,6 +88,10 @@ type ErrorResponse struct {
 	Explanation string `json:"explanation,omitempty"`
 }
 
+// maxPlacementAttempts bounds how many times one request schedules again after
+// losing a warm sandbox to a concurrent placement.
+const maxPlacementAttempts = 3
+
 // EndpointLookup resolves a provider name to its endpoint.
 type EndpointLookup func(provider string) string
 
@@ -204,45 +208,55 @@ func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
 		policy = v1alpha1.DefaultPolicy()
 	}
 
-	profile, err := policy.BuildProfile(candidates)
-	if err != nil {
-		// The policy controller marks these invalid on the object; this is the
-		// belt to that braces, for a policy edited between reconciles.
-		metrics.RecordFailure("invalid_policy", nil, policy.Name, 0)
-		writeJSON(w, http.StatusUnprocessableEntity, ErrorResponse{
-			Error: "policy " + policy.Name + " is not usable: " + err.Error(),
-		})
-		return
-	}
-
-	decision, err := profile.Schedule(r.Context(),
-		policy.BuildRequest(req.Name, req.Requires, req.PreferProvider), candidates)
-	if err != nil {
-		var noCand *framework.ErrNoCandidates
-		if errors.As(err, &noCand) {
-			metrics.RecordFailure("no_candidates", noCand.Results, policy.Name, time.Since(start))
-			writeJSON(w, http.StatusConflict, ErrorResponse{
-				Error:       err.Error(),
-				Explanation: explainResults(noCand.Results),
+	var decision *framework.Decision
+	for attempt := 1; ; attempt++ {
+		profile, err := policy.BuildProfile(candidates)
+		if err != nil {
+			// The policy controller marks these invalid on the object; this is
+			// the belt to that braces, for a policy edited between reconciles.
+			metrics.RecordFailure("invalid_policy", nil, policy.Name, 0)
+			writeJSON(w, http.StatusUnprocessableEntity, ErrorResponse{
+				Error: "policy " + policy.Name + " is not usable: " + err.Error(),
 			})
 			return
 		}
-		metrics.RecordFailure("error", nil, policy.Name, time.Since(start))
-		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-		return
+
+		decision, err = profile.Schedule(r.Context(),
+			policy.BuildRequest(req.Name, req.Requires, req.PreferProvider), candidates)
+		if err != nil {
+			var noCand *framework.ErrNoCandidates
+			if errors.As(err, &noCand) {
+				metrics.RecordFailure("no_candidates", noCand.Results, policy.Name, time.Since(start))
+				writeJSON(w, http.StatusConflict, ErrorResponse{
+					Error:       err.Error(),
+					Explanation: explainResults(noCand.Results),
+				})
+				return
+			}
+			metrics.RecordFailure("error", nil, policy.Name, time.Since(start))
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		// Claim the warm sandbox this placement will take, so the requests
+		// behind it in a burst see what is left rather than what the last
+		// poll saw. A cold placement takes nothing from the pool and reserves
+		// nothing.
+		if !warmIn(candidates, decision.Provider) || s.Registry.TryReserveWarm(decision.Provider) {
+			break
+		}
+		// A concurrent placement took the last of the warm capacity this
+		// decision was counting on, so it was made against a picture that no
+		// longer holds. Decide again against what is left. Each retry means
+		// another request claimed a sandbox, so this converges; the bound only
+		// caps latency, and past it the decision stands as a cold placement.
+		if attempt == maxPlacementAttempts {
+			break
+		}
+		candidates = s.Registry.Snapshot()
 	}
 
 	metrics.RecordDecision(policy.Name, decision, candidates, time.Since(start))
-
-	// Count the warm sandbox this placement will take, so the requests behind
-	// it in a burst see what is left rather than what the last poll saw. A
-	// cold placement takes nothing from the pool and reserves nothing.
-	for _, c := range candidates {
-		if c.Provider == decision.Provider && c.WarmCapacity > 0 {
-			s.Registry.Reserve(decision.Provider)
-			break
-		}
-	}
 
 	resp := Response{
 		Provider:    decision.Provider,
@@ -309,6 +323,16 @@ func (s *Service) handleProviders(w http.ResponseWriter, _ *http.Request) {
 		out = append(out, ps)
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// warmIn reports whether a provider showed warm capacity in candidates.
+func warmIn(candidates []framework.Candidate, provider string) bool {
+	for _, c := range candidates {
+		if c.Provider == provider {
+			return c.WarmCapacity > 0
+		}
+	}
+	return false
 }
 
 func explainResults(results []framework.CandidateResult) string {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -472,20 +473,120 @@ func TestReserveIsSubtractedFromSnapshotCapacity(t *testing.T) {
 	r := registry.New(registry.Options{Now: clk.now})
 	r.Report("civo", registry.Report{WarmCapacity: 2})
 
-	r.Reserve("civo")
+	if !r.TryReserveWarm("civo") {
+		t.Fatal("reserving the first of two warm sandboxes failed")
+	}
 	if got := r.Snapshot()[0].WarmCapacity; got != 1 {
 		t.Fatalf("capacity %d after one reservation, want 1", got)
 	}
 
-	r.Reserve("civo")
-	r.Reserve("civo")
+	if !r.TryReserveWarm("civo") {
+		t.Fatal("reserving the last warm sandbox failed")
+	}
+	if r.TryReserveWarm("civo") {
+		t.Fatal("reserved a warm sandbox the report does not have")
+	}
 	if got := r.Snapshot()[0].WarmCapacity; got != 0 {
-		t.Fatalf("capacity %d; reservations past the report must floor at 0", got)
+		t.Fatalf("capacity %d after reserving the whole pool, want 0", got)
 	}
 
 	st := r.Statuses()[0]
-	if st.Report.WarmCapacity != 2 || st.Reserved != 3 {
+	if st.Report.WarmCapacity != 2 || st.Reserved != 2 {
 		t.Fatalf("statuses should show the raw report and the reservations separately: %+v", st)
+	}
+}
+
+func TestConcurrentReservationsNeverExceedTheReport(t *testing.T) {
+	// The race TryReserveWarm exists to close: many requests that all saw the
+	// same warm pool must not claim more of it than there is.
+	r := registry.New(registry.Options{})
+	r.Report("civo", registry.Report{WarmCapacity: 100})
+
+	var won atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				if r.TryReserveWarm("civo") {
+					won.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if won.Load() != 100 {
+		t.Fatalf("%d reservations succeeded against 100 warm", won.Load())
+	}
+	if st := r.Statuses()[0]; st.Reserved != 100 {
+		t.Fatalf("status shows %d reserved, want 100", st.Reserved)
+	}
+}
+
+func TestReservationsOutliveTheRingWhilePollsFail(t *testing.T) {
+	// Reservations are counted in a ring of one-second buckets. One that is
+	// still uncleared when its bucket comes round again must be carried, not
+	// dropped, or a provider whose polls keep failing forgets its claims.
+	clk := newClock()
+	r := registry.New(registry.Options{ReservationGrace: 5 * time.Second, Now: clk.now})
+	src := &fakeSource{id: "civo"}
+	src.set(registry.Report{WarmCapacity: 1000}, nil)
+	r.AddSource(src)
+	r.Refresh(context.Background())
+
+	src.set(registry.Report{}, errors.New("connection refused"))
+	for i := 0; i < 300; i++ {
+		r.TryReserveWarm("civo")
+		clk.advance(time.Second)
+		r.Refresh(context.Background())
+	}
+	if st := r.Statuses()[0]; st.Reserved != 300 {
+		t.Fatalf("%d reserved after 300 across failing polls, want 300", st.Reserved)
+	}
+
+	// A poll that started long after all of them accounts for every one.
+	clk.advance(time.Minute)
+	src.set(registry.Report{WarmCapacity: 700}, nil)
+	r.Refresh(context.Background())
+	if st := r.Statuses()[0]; st.Reserved != 0 {
+		t.Fatalf("%d reservations left after a poll that accounts for them", st.Reserved)
+	}
+	if got := r.Snapshot()[0].WarmCapacity; got != 700 {
+		t.Fatalf("capacity %d, want the fresh report's 700", got)
+	}
+}
+
+func TestReservationsConcurrentWithPollsAreNotLost(t *testing.T) {
+	// A poll clearing old buckets while placements land in new ones must
+	// not take the new ones with it.
+	clk := newClock()
+	r := registry.New(registry.Options{ReservationGrace: time.Second, Now: clk.now})
+	r.Report("civo", registry.Report{WarmCapacity: 1 << 20})
+
+	var wg sync.WaitGroup
+	var won atomic.Int64
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 2000; j++ {
+				if r.TryReserveWarm("civo") {
+					won.Add(1)
+				}
+			}
+		}()
+	}
+	// Polls whose cutoff is always behind the clock's current second: none
+	// of these reservations is old enough for them to clear.
+	for i := 0; i < 200; i++ {
+		r.Report("civo", registry.Report{WarmCapacity: 1 << 20})
+	}
+	wg.Wait()
+
+	if st := r.Statuses()[0]; int64(st.Reserved) != won.Load() {
+		t.Fatalf("%d reserved, want %d", st.Reserved, won.Load())
 	}
 }
 
@@ -497,8 +598,8 @@ func TestPollClearsReservationsItAccountsFor(t *testing.T) {
 	r.AddSource(src)
 	r.Refresh(context.Background())
 
-	r.Reserve("civo")
-	r.Reserve("civo")
+	r.TryReserveWarm("civo")
+	r.TryReserveWarm("civo")
 
 	// A poll this soon after the claims may not see them yet: both stay.
 	clk.advance(2 * time.Second)
@@ -529,7 +630,7 @@ func TestFailedPollKeepsReservations(t *testing.T) {
 	r.AddSource(src)
 	r.Refresh(context.Background())
 
-	r.Reserve("civo")
+	r.TryReserveWarm("civo")
 	clk.advance(time.Minute)
 	src.set(registry.Report{}, errors.New("connection refused"))
 	r.Refresh(context.Background())
@@ -543,7 +644,7 @@ func TestPushReportClearsReservations(t *testing.T) {
 	clk := newClock()
 	r := registry.New(registry.Options{ReservationGrace: 5 * time.Second, Now: clk.now})
 	r.Report("hosted", registry.Report{WarmCapacity: 4})
-	r.Reserve("hosted")
+	r.TryReserveWarm("hosted")
 
 	clk.advance(10 * time.Second)
 	r.Report("hosted", registry.Report{WarmCapacity: 3})
@@ -555,8 +656,20 @@ func TestPushReportClearsReservations(t *testing.T) {
 func TestReserveOnAnUnknownProviderIsANoOp(t *testing.T) {
 	// A provider removed between snapshot and reservation must not come back.
 	r := registry.New(registry.Options{})
-	r.Reserve("gone")
+	if r.TryReserveWarm("gone") {
+		t.Fatal("reserved against a provider that does not exist")
+	}
 	if got := r.Snapshot(); len(got) != 0 {
 		t.Fatalf("reserving resurrected a provider: %+v", got)
 	}
+}
+
+func BenchmarkTryReserveWarmParallel(b *testing.B) {
+	r := registry.New(registry.Options{})
+	r.Report("civo", registry.Report{WarmCapacity: 1 << 30})
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			r.TryReserveWarm("civo")
+		}
+	})
 }
