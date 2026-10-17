@@ -263,6 +263,12 @@ func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
 		candidates = s.Registry.Snapshot()
 	}
 
+	if !warmIn(candidates, decision.Provider) {
+		// Counted so that the cold placements behind this one in a burst go
+		// to whichever equally good provider is less loaded.
+		s.Registry.RecordColdPlacement(decision.Provider)
+	}
+
 	metrics.RecordDecision(policy.Name, decision, candidates, time.Since(start))
 
 	resp := Response{
@@ -302,9 +308,12 @@ type ProviderStatus struct {
 	WarmCapacity int  `json:"warmCapacity"`
 	// Reserved is how many placements since the last poll are being
 	// subtracted from WarmCapacity when scheduling.
-	Reserved   int    `json:"reserved"`
-	AgeSeconds int64  `json:"ageSeconds"`
-	LastError  string `json:"lastError,omitempty"`
+	Reserved int `json:"reserved"`
+	// InFlightCold is how many cold starts were placed here within the cold
+	// start window; ties between cold providers go to the less loaded.
+	InFlightCold int    `json:"inFlightCold"`
+	AgeSeconds   int64  `json:"ageSeconds"`
+	LastError    string `json:"lastError,omitempty"`
 }
 
 // handleProviders exposes what the scheduler currently believes, which is the
@@ -319,6 +328,7 @@ func (s *Service) handleProviders(w http.ResponseWriter, _ *http.Request) {
 			Stale:        st.Stale,
 			WarmCapacity: st.Report.WarmCapacity,
 			Reserved:     st.Reserved,
+			InFlightCold: st.InFlightCold,
 			AgeSeconds:   int64(st.Age / time.Second),
 		}
 		if s.Endpoints != nil {

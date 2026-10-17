@@ -243,3 +243,109 @@ func asErrNoCandidates(err error, target **framework.ErrNoCandidates) bool {
 	}
 	return ok
 }
+
+// tiedProfile scores every candidate the same.
+func tiedProfile(rnd func(int) int) *framework.Profile {
+	return &framework.Profile{
+		Scorers: []framework.WeightedScorer{{Scorer: fixedScore{"a", nil}, Weight: 1}},
+		Rand:    rnd,
+	}
+}
+
+func TestColdTiesGoToTheProviderWithFewerColdStartsInFlight(t *testing.T) {
+	// Breaking on name would queue every cold start in a burst on "alpha"
+	// while "zeta", just as good, provisions nothing.
+	cands := candidates("alpha", "zeta")
+	cands[0].InFlightCold = 4
+	cands[1].InFlightCold = 1
+
+	got, err := tiedProfile(nil).Schedule(context.Background(), &framework.Request{}, cands)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Provider != "zeta" {
+		t.Fatalf("picked %s; the less loaded cold provider should win the tie", got.Provider)
+	}
+	if got.Results[0].Provider != "zeta" {
+		t.Fatalf("the winner should lead its tie in Results: %+v", got.Results)
+	}
+	if !strings.Contains(got.Explain(), `"zeta" has 1 cold starts in flight`) {
+		t.Fatalf("the tie-break should be explained:\n%s", got.Explain())
+	}
+}
+
+func TestWarmTiesStillBreakOnName(t *testing.T) {
+	// A warm claim costs a provider nothing to serve, so there is no load to
+	// spread, and a stable answer avoids flapping.
+	cands := candidates("zeta", "alpha")
+	for i := range cands {
+		cands[i].WarmCapacity = 3
+	}
+	cands[1].InFlightCold = 9 // alpha
+	for i := 0; i < 20; i++ {
+		got, _ := tiedProfile(func(int) int { t.Fatal("warm ties must not sample"); return 0 }).
+			Schedule(context.Background(), &framework.Request{}, cands)
+		if got.Provider != "alpha" {
+			t.Fatalf("picked %s; warm ties must resolve to the lowest name", got.Provider)
+		}
+	}
+}
+
+func TestInFlightColdDoesNotOverrideScore(t *testing.T) {
+	// Only ties are decided by load; a better score always wins.
+	p := &framework.Profile{
+		Scorers: []framework.WeightedScorer{
+			{Scorer: fixedScore{"a", map[string]int64{"cheap": 10, "dear": 9}}, Weight: 1},
+		},
+	}
+	cands := candidates("cheap", "dear")
+	cands[0].InFlightCold = 100
+	got, _ := p.Schedule(context.Background(), &framework.Request{}, cands)
+	if got.Provider != "cheap" || got.TieBreak != "" {
+		t.Fatalf("picked %s (tie %q); the higher score should win outright", got.Provider, got.TieBreak)
+	}
+}
+
+func TestColdTiesOfMoreThanTwoSampleTwo(t *testing.T) {
+	// Power of two choices: the least loaded overall is not necessarily
+	// chosen, only the less loaded of the two sampled. That is what keeps a
+	// burst from herding onto whichever provider looks emptiest.
+	cands := candidates("a", "b", "c")
+	cands[0].InFlightCold = 0 // least loaded, but not sampled below
+	cands[1].InFlightCold = 5
+	cands[2].InFlightCold = 3
+
+	seq := []int{1, 1} // i=1 (b), j=1 -> skips i -> 2 (c)
+	rnd := func(n int) int { v := seq[0]; seq = seq[1:]; return v }
+	got, _ := tiedProfile(rnd).Schedule(context.Background(), &framework.Request{}, cands)
+	if got.Provider != "c" {
+		t.Fatalf("picked %s; want c, the less loaded of the sampled b and c", got.Provider)
+	}
+	if !strings.Contains(got.TieBreak, "sampled 2 of 3") {
+		t.Fatalf("tie-break should say it sampled: %q", got.TieBreak)
+	}
+}
+
+func TestColdTiesSpreadABurstEvenly(t *testing.T) {
+	// With each placement feeding back into the count, two choices keep the
+	// gap between providers small no matter how long the burst runs.
+	cands := candidates("a", "b", "c", "d")
+	p := tiedProfile(nil)
+	placed := map[string]int{}
+	for i := 0; i < 400; i++ {
+		got, _ := p.Schedule(context.Background(), &framework.Request{}, cands)
+		placed[got.Provider]++
+		for j := range cands {
+			if cands[j].Provider == got.Provider {
+				cands[j].InFlightCold++
+			}
+		}
+	}
+	lo, hi := 400, 0
+	for _, n := range placed {
+		lo, hi = min(lo, n), max(hi, n)
+	}
+	if len(placed) != 4 || hi-lo > 10 {
+		t.Fatalf("placed %v; a burst of cold starts should spread evenly", placed)
+	}
+}

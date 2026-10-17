@@ -24,7 +24,8 @@
 //
 // One correction is layered on top of the polled reports: placements made since
 // the last poll are subtracted from the capacity a snapshot shows. See
-// TryReserveWarm.
+// TryReserveWarm. Cold placements are counted too, so ties between providers
+// with nothing warm can go to the least loaded; see RecordColdPlacement.
 package registry
 
 import (
@@ -139,6 +140,9 @@ type Registry struct {
 	// report. A poll keeps reservations made within this long of its start.
 	reservationGrace time.Duration
 
+	// coldStartWindow is how long a cold placement counts as in flight.
+	coldStartWindow time.Duration
+
 	now func() time.Time
 }
 
@@ -155,6 +159,13 @@ type Options struct {
 	// clears its reservation, letting a burst over-place again; too long and a
 	// claim is counted twice until the next poll, which only spills early.
 	ReservationGrace time.Duration
+	// ColdStartWindow defaults to 30s: roughly how long a cold start takes.
+	// A cold placement counts as in flight for this long, since nothing a
+	// provider reports says when it finishes. Too short and a burst of cold
+	// starts is forgotten while still loading a provider; too long and a
+	// provider that has finished them is avoided for no reason, which only
+	// matters between providers that tie.
+	ColdStartWindow time.Duration
 	// Now is injectable for tests.
 	Now func() time.Time
 }
@@ -167,6 +178,7 @@ func New(opts Options) *Registry {
 		staleAfter:       opts.StaleAfter,
 		fetchTimeout:     opts.FetchTimeout,
 		reservationGrace: opts.ReservationGrace,
+		coldStartWindow:  opts.ColdStartWindow,
 		now:              opts.Now,
 	}
 	if r.staleAfter <= 0 {
@@ -177,6 +189,9 @@ func New(opts Options) *Registry {
 	}
 	if r.reservationGrace <= 0 {
 		r.reservationGrace = 5 * time.Second
+	}
+	if r.coldStartWindow <= 0 {
+		r.coldStartWindow = 30 * time.Second
 	}
 	if r.now == nil {
 		r.now = time.Now
@@ -191,7 +206,7 @@ func (r *Registry) entry(providerID string) *entry {
 	if e, ok := r.entries[providerID]; ok {
 		return e
 	}
-	e := &entry{ledger: newLedger(r.reservationGrace, r.fetchTimeout)}
+	e := &entry{ledger: newLedger(r.reservationGrace, r.fetchTimeout, r.coldStartWindow)}
 	r.entries[providerID] = e
 	r.publishLedgers()
 	return e
@@ -288,6 +303,21 @@ func (r *Registry) TryReserveWarm(providerID string) bool {
 	return l.tryReserve(r.now())
 }
 
+// RecordColdPlacement counts a placement that takes no warm sandbox, so that
+// snapshots for the next ColdStartWindow show it in the provider's
+// InFlightCold.
+//
+// A cold start is the expensive kind for a provider — it provisions rather
+// than hands over — and a burst of them on one provider queues behind each
+// other while an equally good provider sits idle. Scheduling uses the count to
+// send ties between cold providers to the less loaded one. Like reserving, it
+// takes no lock.
+func (r *Registry) RecordColdPlacement(providerID string) {
+	if l, ok := (*r.ledgers.Load())[providerID]; ok {
+		l.recordCold(r.now())
+	}
+}
+
 // Refresh polls every registered source once, concurrently.
 //
 // Sources are polled in parallel and independently: one slow or broken provider
@@ -373,6 +403,7 @@ func (r *Registry) Snapshot() []framework.Candidate {
 			// Observed: the provider's own count of what is warm, less what
 			// has been placed there since.
 			WarmCapacity: e.ledger.available(),
+			InFlightCold: e.ledger.inFlightCold(now),
 			// Declared: never the provider's own claim. See ProviderConfig.
 			CostPerHour: e.config.CostPerHour,
 			// Fresh only if we have heard from it at all, and recently.
@@ -400,9 +431,12 @@ type Status struct {
 	Report    Report
 	// Reserved is how many placements since the last poll are subtracted
 	// from Report.WarmCapacity in snapshots.
-	Reserved  int
-	Config    ProviderConfig
-	LastError error
+	Reserved int
+	// InFlightCold is how many cold placements were made within the cold
+	// start window.
+	InFlightCold int
+	Config       ProviderConfig
+	LastError    error
 }
 
 // Statuses returns the registry's view of every provider, ordered by id.
@@ -418,14 +452,15 @@ func (r *Registry) Statuses() []Status {
 			age = now.Sub(e.updatedAt)
 		}
 		out = append(out, Status{
-			Provider:  id,
-			Reachable: e.everReported && age <= r.staleAfter,
-			Stale:     e.everReported && age > r.staleAfter,
-			Age:       age,
-			Report:    e.report,
-			Reserved:  e.ledger.reserved(),
-			Config:    e.config,
-			LastError: e.lastErr,
+			Provider:     id,
+			Reachable:    e.everReported && age <= r.staleAfter,
+			Stale:        e.everReported && age > r.staleAfter,
+			Age:          age,
+			Report:       e.report,
+			Reserved:     e.ledger.reserved(),
+			InFlightCold: e.ledger.inFlightCold(now),
+			Config:       e.config,
+			LastError:    e.lastErr,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Provider < out[j].Provider })

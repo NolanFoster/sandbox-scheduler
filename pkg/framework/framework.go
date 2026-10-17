@@ -24,6 +24,7 @@ package framework
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"sort"
 	"strings"
 )
@@ -52,6 +53,12 @@ type Candidate struct {
 	// This is the difference between a ~100ms start and a ~30s cold start,
 	// which is why it exists as a first-class field rather than an attribute.
 	WarmCapacity int
+
+	// InFlightCold is how many cold starts were recently placed here. Not
+	// scored: it only decides between cold candidates that tie, so a burst of
+	// cold starts spreads across equally good providers instead of queueing
+	// on the alphabetically first. See Profile.Schedule.
+	InFlightCold int
 
 	// Attributes carry provider facts that filters and scorers match on:
 	// runtime=gvisor, gpu=true, region=nyc1, kubernetes=true. Free-form so a
@@ -137,6 +144,9 @@ type CandidateResult struct {
 type Decision struct {
 	Provider string
 	Score    int64
+	// TieBreak says how the winner was chosen among candidates with the same
+	// score. Empty when nothing tied.
+	TieBreak string
 	// Results covers every candidate considered, in evaluation order, so a
 	// decision can be explained after the fact from this value alone.
 	Results []CandidateResult
@@ -145,7 +155,11 @@ type Decision struct {
 // Explain renders a human-readable account of the decision. Intended for
 // operator-facing logs and `kubectl describe`-style output.
 func (d *Decision) Explain() string {
-	return fmt.Sprintf("placed on %q (score %d)\n%s", d.Provider, d.Score, ExplainResults(d.Results))
+	head := fmt.Sprintf("placed on %q (score %d)\n", d.Provider, d.Score)
+	if d.TieBreak != "" {
+		head += "  tie: " + d.TieBreak + "\n"
+	}
+	return head + ExplainResults(d.Results)
 }
 
 // ExplainResults renders per-candidate reasoning without claiming anything was
@@ -192,13 +206,19 @@ type Profile struct {
 	Name    string
 	Filters []Filter
 	Scorers []WeightedScorer
+
+	// Rand returns a uniform int in [0, n). It is used only to sample between
+	// cold candidates that tie; nil means math/rand/v2's IntN. Tests inject a
+	// fixed sequence.
+	Rand func(n int) int
 }
 
 // Schedule runs filter then score and returns the winner.
 //
 // Pure: no I/O, no clock, no provider calls. Everything time-varying arrives
 // through the candidates, which is what makes the policy testable and the hot
-// path fast.
+// path fast. The one source of variation is Rand, and only between cold
+// candidates that tie on score.
 func (p *Profile) Schedule(ctx context.Context, req *Request, candidates []Candidate) (*Decision, error) {
 	results := make([]CandidateResult, 0, len(candidates))
 	feasible := make([]int, 0, len(candidates))
@@ -250,16 +270,8 @@ func (p *Profile) Schedule(ctx context.Context, req *Request, candidates []Candi
 		return nil, &ErrNoCandidates{Results: results}
 	}
 
-	// Highest score wins; ties break on provider name. Deterministic ordering
-	// matters: an unstable tiebreak makes a fleet flap between providers on
-	// every scheduling pass, which is invisible until it shows up as churn.
-	best := feasible[0]
-	for _, idx := range feasible[1:] {
-		if results[idx].Total > results[best].Total ||
-			(results[idx].Total == results[best].Total && results[idx].Provider < results[best].Provider) {
-			best = idx
-		}
-	}
+	best, tieBreak := p.pick(results, feasible, candidates)
+	winner := results[best].Provider
 
 	// Stable output ordering, best first, so callers can log the top N.
 	ordered := append([]CandidateResult(nil), results...)
@@ -270,12 +282,83 @@ func (p *Profile) Schedule(ctx context.Context, req *Request, candidates []Candi
 		if ordered[i].Total != ordered[j].Total {
 			return ordered[i].Total > ordered[j].Total
 		}
+		// The winner leads its tie, so the first line is always the choice.
+		if (ordered[i].Provider == winner) != (ordered[j].Provider == winner) {
+			return ordered[i].Provider == winner
+		}
 		return ordered[i].Provider < ordered[j].Provider
 	})
 
 	return &Decision{
-		Provider: results[best].Provider,
+		Provider: winner,
 		Score:    results[best].Total,
+		TieBreak: tieBreak,
 		Results:  ordered,
 	}, nil
+}
+
+// pick chooses the winner among the feasible results and explains any tie.
+//
+// Highest score wins. Results and candidates share indices.
+//
+// A tie with any warm candidate in it breaks on provider name. Deterministic
+// ordering matters there: an unstable tiebreak makes a fleet flap between
+// providers on every scheduling pass, which is invisible until it shows up as
+// churn, and a warm claim costs a provider nothing to serve, so there is no
+// load to spread.
+//
+// A tie among cold candidates is different. Each cold start makes its provider
+// provision a sandbox, and sending a burst of them to whichever name sorts
+// first queues them on one provider while equally good ones sit idle. These
+// break by the power of two choices: sample two of the tied candidates and
+// take the one with fewer cold starts in flight, so load spreads with little
+// coordination and no herd onto whichever looks emptiest. With two tied, both
+// are compared, which always picks the less loaded.
+func (p *Profile) pick(results []CandidateResult, feasible []int, candidates []Candidate) (int, string) {
+	best := feasible[0]
+	for _, idx := range feasible[1:] {
+		if results[idx].Total > results[best].Total ||
+			(results[idx].Total == results[best].Total && results[idx].Provider < results[best].Provider) {
+			best = idx
+		}
+	}
+
+	var tied []int
+	cold := true
+	for _, idx := range feasible {
+		if results[idx].Total == results[best].Total {
+			tied = append(tied, idx)
+			cold = cold && candidates[idx].WarmCapacity <= 0
+		}
+	}
+	if len(tied) == 1 {
+		return best, ""
+	}
+	if !cold {
+		return best, fmt.Sprintf("%d candidates tied; broke on provider name", len(tied))
+	}
+
+	a, b := tied[0], tied[1]
+	how := "compared both"
+	if len(tied) > 2 {
+		intn := p.Rand
+		if intn == nil {
+			intn = rand.IntN
+		}
+		i := intn(len(tied))
+		j := intn(len(tied) - 1)
+		if j >= i {
+			j++
+		}
+		a, b = tied[i], tied[j]
+		how = fmt.Sprintf("sampled 2 of %d", len(tied))
+	}
+	ca, cb := &candidates[a], &candidates[b]
+	if cb.InFlightCold < ca.InFlightCold ||
+		(cb.InFlightCold == ca.InFlightCold && cb.Provider < ca.Provider) {
+		a, b = b, a
+		ca, cb = cb, ca
+	}
+	return a, fmt.Sprintf("cold candidates tied; %s: %q has %d cold starts in flight, %q has %d",
+		how, ca.Provider, ca.InFlightCold, cb.Provider, cb.InFlightCold)
 }

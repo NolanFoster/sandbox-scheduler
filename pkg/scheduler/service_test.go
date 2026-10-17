@@ -520,6 +520,40 @@ func TestColdPlacementsReserveNothing(t *testing.T) {
 	}
 }
 
+func TestABurstOfColdStartsSpreadsAcrossTiedProviders(t *testing.T) {
+	// Nothing warm anywhere and nothing to tell the providers apart: breaking
+	// on name would send every cold start to civo.
+	h := newService(t, map[string]registry.Report{
+		"civo": {WarmCapacity: 0},
+		"gke":  {WarmCapacity: 0},
+	})
+	placed := map[string]int{}
+	for i := 0; i < 100; i++ {
+		w, resp, _ := post(t, h, `{}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d: status %d", i, w.Code)
+		}
+		placed[resp.Provider]++
+	}
+	if placed["civo"] != 50 || placed["gke"] != 50 {
+		t.Fatalf("placed %v; want an even split", placed)
+	}
+	got := providers(t, h)
+	if got["civo"].InFlightCold != 50 || got["gke"].InFlightCold != 50 {
+		t.Fatalf("inFlightCold civo=%d gke=%d, want 50 each", got["civo"].InFlightCold, got["gke"].InFlightCold)
+	}
+}
+
+func TestWarmPlacementsAreNotCountedAsCold(t *testing.T) {
+	h := newService(t, map[string]registry.Report{"civo": {WarmCapacity: 2}})
+	post(t, h, `{}`)
+	post(t, h, `{}`)
+	post(t, h, `{}`) // the pool is reserved; this one is cold
+	if got := providers(t, h)["civo"]; got.InFlightCold != 1 || got.Reserved != 2 {
+		t.Fatalf("inFlightCold=%d reserved=%d; want 1 and 2", got.InFlightCold, got.Reserved)
+	}
+}
+
 func TestStandbyRefusesPlacementButServesProviders(t *testing.T) {
 	// A standby placing against its own empty reservations would undo the
 	// point of having one replica decide.
