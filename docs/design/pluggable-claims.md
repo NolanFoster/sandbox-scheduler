@@ -1,6 +1,6 @@
 # Pluggable claims: placing *and* provisioning sandboxes beyond Kubernetes
 
-Status: **draft v4, revised after three review rounds** (OSS compatibility,
+Status: **draft v5, revised after four review rounds** (OSS compatibility,
 scalability, Kubernetes practices, Go practices). Nothing here is implemented.
 Section 12 records what changed in each revision and why.
 
@@ -115,6 +115,8 @@ type Binder interface {
     // bound is waited for. ErrNotFound (matched with errors.Is) means the
     // provider definitively has none; anything else means it cannot tell.
     // It is a consistent read: a cached "not found" could create a duplicate.
+    // Waiting for binding stays within ctx: a slow bind returns an
+    // inconclusive error at the deadline rather than blocking the probe.
     Lookup(ctx context.Context, req ClaimRequest) (Handle, error)
     // Release must work from Provider and ID alone, and returns nil when the
     // sandbox is already gone.
@@ -296,41 +298,72 @@ DELETE /api/v1alpha1/sandboxes/{provider}/{id}
 de-duplicates in-flight keys with `singleflight.Group` keyed by key: a second
 request for a key already being claimed joins the first one's result instead of
 deciding independently (two first attempts could otherwise land on different
-providers, where per-provider idempotency cannot see each other). If the joining
-request's spec-hash differs, it gets 409 `KeyConflict`. This makes "at most one
-sandbox per key" hold for concurrent requests on one leader.
+providers, where per-provider idempotency cannot see each other).
+
+- A joiner whose spec-hash differs gets 409 `KeyConflict` immediately.
+- A joiner otherwise receives the first request's outcome, decided under the
+  first request's filters and deadline; its own `timeoutSeconds` does not extend
+  it. The shared result is then checked against the joiner's own filters
+  (`requires`, `warmOnly`): if it fails them, the joiner gets 409
+  `KeyConflict`, never a sandbox its constraints exclude. A successful joiner
+  gets 200 (replay), not 201.
+- Joiners wait with `DoChan` and `select` on their own context, so a joiner whose
+  client leaves stops waiting without affecting the flight. The shared function
+  recovers its own panics (converting them to `UnknownOutcome`), since a panic
+  under `DoChan` would otherwise crash the process.
+- At most `--max-joiners-per-key` (default 8) joiners per key; beyond that,
+  429. Joiners count toward the global in-flight cap.
+- If the first request's client disconnects, spilling stops and joiners receive
+  its outcome; they retry, and the Lookup rule finds the sandbox.
+
+This makes "at most one sandbox per key" hold for concurrent requests on one
+leader.
 
 **Lookup rule (no duplicates across retries and failover, without server
 state).** A request may create a new sandbox only if it is a first attempt, or
-if every candidate it probes returns `ErrNotFound`. The probe set is the
-candidates that **pass the request's filter phase** (`requires`,
-`TemplateAvailable`, `Reachable` if configured), so a retry can never return a
-sandbox on a provider the request's constraints exclude; `Lookup` compares the
-spec-hash, so a retry with a different spec gets `KeyConflict`, as a create
-would.
+if **every claim-capable provider** returns `ErrNotFound`. The probe set is
+**unfiltered**: the provider holding the key is often the one that just flaked,
+is now stale or unreachable, and would be dropped by a filter, after which the
+rest would all say "not found" and a duplicate would be created. Constraints are
+enforced on the *result* instead: a sandbox found on a provider the request's
+filters exclude returns 409 `KeyConflict` (never 200, never a new claim), so a
+retry still cannot obtain a sandbox its constraints exclude. `Lookup` compares
+the spec-hash, so a retry with a different spec also gets `KeyConflict`.
 
 ```
 if pinProvider != "":
     Lookup(pinProvider, req)
-    found → 200; ErrNotFound → claim only on pinProvider;
+    found → 200 if it passes the request's filters, else 409;
+    ErrNotFound → claim only on pinProvider;
     KeyConflict → 409; KeyBusy or Busy → 429 {providers}; other → 504 {providers}
 elif retry:
-    probe Lookup on filtered candidates in parallel (bounded, per-attempt
-    timeout, separate per-provider Lookup token bucket)
-    any found          → 200 that handle (or 409 on KeyConflict)
+    probe Lookup on every claim-capable provider in parallel (bounded,
+    per-attempt timeout, separate per-provider Lookup token bucket)
+    any found          → 200 if it passes the request's filters, else 409
+    any KeyConflict    → 409
     all ErrNotFound    → continue as a first attempt
     any Busy / KeyBusy → 429 {providers} with Retry-After (not 504, so a rate
                          limit on Lookups cannot loop into more Lookups)
-    one inconclusive   → pin to it (claim there with the same key)
+    one inconclusive   → pin to it if it passes the filters, else 504 {providers}
     more than one      → 504 {providers}
 ```
 
-**Residual window, documented:** if the leader loses its lease, the process
-exits at once (controller-runtime skips graceful shutdown on lease loss), and a
-claim it had already sent may land on the provider after the new leader's
-Lookup for a retry returned `ErrNotFound`. The window is bounded by the
-provider's request latency; the duplicate is owner-labelled and bounded by its
-TTL. Graceful shutdowns do not have this window (5.7).
+An inconclusive result from a provider the filters exclude is still
+inconclusive, never "not found". The common consequence: while a provider's
+credentials are broken (401/403 → `Rejected`, inconclusive), retries of keys
+that might be there return 504 or pin and fail with 422; they never create a
+duplicate, and the provider's `Claiming` condition shows the credentials reason.
+
+**Lease handover.** If the leader loses its lease, the process exits at once
+(controller-runtime skips graceful shutdown on lease loss), and a claim it had
+already sent may still land on its provider. A new leader therefore **holds off
+claim and Lookup traffic for one per-attempt timeout** (default 3s) after
+acquiring the lease, returning 503 with `Retry-After`; any claim the old process
+sent completes or fails within that time, so the new leader's Lookups see it.
+Graceful shutdowns release the lease only after in-flight attempts finish
+(5.7). The old leader's `placement.agents.x-k8s.io/active` pod label is left
+behind on lease loss; the next start clears it before reporting Ready
+(`internal/leader`).
 
 **Claim loop.**
 
@@ -411,7 +444,8 @@ the end of each attempt, not of the request.
   a `metadata.name` field selector, **started from the `resourceVersion` the
   create returned** (so a bind that lands before the watch opens is not missed;
   410 Gone falls back to a GET), closed on bind or timeout; bounded by
-  `maxInFlight`. No informer over all owned claims, so memory is per in-flight
+  `maxInFlight`; watches opened by a `Lookup` waiting for binding count against
+  the same `maxInFlight` and stream budget. No informer over all owned claims, so memory is per in-flight
   claim, not per live sandbox, and leader failover relists nothing. The
   apiserver has no field index for a custom resource's `metadata.name`, so each
   claim event is filtered against every open watch in the namespace: at 512
@@ -423,8 +457,10 @@ the end of each attempt, not of the request.
   remote identity is shipped (upstream's APF overlay covers only its own
   controller).
 - **Lookups** have their own per-provider token bucket (`spec.claims.lookupRate`,
-  default 200/s), separate from claims, and are always consistent reads (no
-  `resourceVersion=0`).
+  burst equal to one second of rate), separate from claims, and are always
+  consistent reads (no `resourceVersion=0`). Default 200/s for Kubernetes
+  providers and 20/s for elastic (hosted) providers, whose own API limits are
+  often lower.
 - **Shutdown**: detached attempts are tracked by a counter plus a done channel;
   the closing flag and the counter increment are under one mutex, so no attempt
   starts after shutdown begins and none races the channel close. Shutdown
@@ -478,7 +514,12 @@ path every 10s. Readiness never depends on claim outcomes.
 - `proto/adapter/v1alpha1`: `GetInfo` (capabilities: claim, lookup, list,
   elastic), `Fetch`, `Claim`, `Lookup`, `Release`, `ListOwned`, with `Kind` as a
   proto enum following buf lint style: `KIND_UNSPECIFIED = 0`, handled exactly
-  like `KIND_UNKNOWN_OUTCOME`, then the named kinds; published as its own Go
+  like `KIND_UNKNOWN_OUTCOME`, then the named kinds. Enum numbers are
+  append-only and never reused; the host maps `UNSPECIFIED` **and any
+  unrecognised number** (a newer sidecar talking to an older host) to
+  `KindUnknownOutcome`. `GetInfo` reports which kinds the adapter can return
+  (notably `KEY_BUSY`, `KEY_CONFLICT`), so an older sidecar is handled
+  predictably. Published as its own Go
   module once stable; deprecation policy stated before v1.
 - `spec.adapter: grpc`, `spec.endpoint: unix:///var/run/adapters/<name>.sock`.
 - Pod hardening so each sidecar holds only its own credentials:
@@ -510,6 +551,10 @@ path every 10s. Readiness never depends on claim outcomes.
      kubeconfigs only. The client is rebuilt when the Secret's resourceVersion
      changes, closing the old transport.
   Remote RBAC: namespaced Role, `sandboxclaims: create,get,list,watch,delete`.
+  RBAC cannot restrict `delete` by label, so the owner label and UID
+  preconditions are the only guard against touching other tenants' claims;
+  the documented setup is a **namespace dedicated to the scheduler** on each
+  remote cluster.
 - **Options** are typed (`spec.kubeapi.namespace`), not annotations.
 - **Claim**: `SandboxClaim` named `sc-` + first 20 hex of
   sha256(owner + "/" + key) (starts with a letter, ≤ 63, DNS-1035-safe for the
@@ -521,6 +566,11 @@ path every 10s. Readiness never depends on claim outcomes.
   its `shutdownTime` and about to be → `KeyBusy` with a short `RetryAfter`,
   pinned to this provider, so the key is not reused elsewhere while its sandbox
   still exists.
+- **Relation to the upstream SDK's `AdoptExisting`**: the naming convention is
+  shared but the replay semantics differ deliberately: a terminating claim is
+  `KeyBusy` (wait and retry) where the SDK fails, and a spec-hash over
+  template, labels and TTL bucket replaces the SDK's warm-pool comparison.
+  The two cannot collide: scheduler claim names are hashed from owner and key.
 - **Lookup** = one consistent GET of the deterministic claim name (no list).
   `ErrNotFound` only on 404; 401/403 are `Rejected` (inconclusive for the
   Lookup rule), never "not found".
@@ -573,10 +623,13 @@ phase 6.
 - Binder loop: table tests over every `Kind`, including `KeyConflict` (no
   retry, no spill), `KeyBusy` (pins, never spills) versus `Busy` (spills), and
   inconclusive `Lookup` on retry (pins, never claims elsewhere); a retry whose
-  `requires` excludes the provider holding the key does not return it; a retry
-  with a different template gets 409; concurrent first attempts with one key
-  join one claim (singleflight); slot released on every return path; mixed
-  outcomes; deadlines and backoff under `testing/synctest`;
+  holding provider is unreachable still finds the sandbox (unfiltered probe);
+  a retry whose `requires` excludes the holding provider gets 409, never a new
+  claim; a retry with a different template gets 409; concurrent first attempts
+  with one key join one claim (singleflight), a joiner failing its own filters
+  gets 409, joiners beyond the per-key cap get 429, and a panic in the shared
+  function is recovered; requests during the post-election hold-off get 503;
+  slot released on every return path; mixed outcomes; deadlines and backoff under `testing/synctest`;
   concurrent same-key claims under `-race` asserting at most one sandbox; a
   burst against one full provider spreads to others without spending spills;
   all-full returns 429, never 409.
@@ -586,7 +639,9 @@ phase 6.
   modelled on `testing/fstest`; the harness injects faults the suite cannot
   reach generically (no capacity, rate limit, refuse-before-send,
   drop-after-send, auth, key conflict, deleting key), and checks that `Lookup`
-  applies the same replay rules as `Claim`.
+  applies the same replay rules as `Claim`. Over gRPC it also checks that
+  `KIND_UNSPECIFIED` and an unrecognised enum number map to
+  `KindUnknownOutcome`.
 - `FuzzValidateKey`, `FuzzLabels`.
 - agent-sandbox: envtest with upstream CRDs; replay with matching and
   mismatched spec-hash; replay of a deleting claim; claims on an empty pool
@@ -659,6 +714,20 @@ phase 6.
   first still exists.
 
 ## 12. Changes
+
+### v4 → v5 (round 4)
+
+| v4 | v5 | Raised by |
+|---|---|---|
+| Retry Lookup probed only filter-passing candidates, so a flaked (now unreachable) holder was skipped and a duplicate created | Unfiltered probe of every claim-capable provider; constraints enforced on the result (found on an excluded provider → 409); inconclusive on an excluded provider stays inconclusive | Go (major), reconciling the Kubernetes round-3 finding |
+| Singleflight joiner semantics unspecified | Joiner gets the first's outcome and deadline; result checked against the joiner's filters (409 if excluded); `DoChan` + own ctx; panic recovered in the shared function; 200 replay; per-key joiner cap → 429; joiners count toward the global cap | Go, Scalability |
+| Lease-loss duplicate window documented only | New leader holds off claims/Lookups for one per-attempt timeout; stale `active` label noted | Go, Kubernetes |
+| Lookup could block on binding indefinitely; its watches unbounded | Lookup stays within ctx; its watches count against maxInFlight and the stream budget | Go, Kubernetes |
+| Lookup bucket burst and hosted defaults unspecified | Burst = 1s of rate; 200/s Kubernetes, 20/s elastic | Scalability |
+| Broken-credential retries undocumented | Documented: 504/422, never a duplicate; `Claiming` credentials reason | Kubernetes |
+| Shared remote namespace | Dedicated namespace recommended (RBAC cannot restrict delete by label) | Kubernetes |
+| Difference from upstream `AdoptExisting` implicit | Stated in 5.11 | OSS |
+| Proto enum evolution unspecified | Append-only numbers; unknown → UnknownOutcome; `GetInfo` reports supported kinds; contract test | OSS |
 
 ### v3 → v4 (round 3)
 
