@@ -88,10 +88,6 @@ type ErrorResponse struct {
 	Explanation string `json:"explanation,omitempty"`
 }
 
-// maxPlacementAttempts bounds how many times one request schedules again after
-// losing a warm sandbox to a concurrent placement.
-const maxPlacementAttempts = 3
-
 // EndpointLookup resolves a provider name to its endpoint.
 type EndpointLookup func(provider string) string
 
@@ -208,21 +204,21 @@ func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
 		policy = v1alpha1.DefaultPolicy()
 	}
 
-	var decision *framework.Decision
-	for attempt := 1; ; attempt++ {
-		profile, err := policy.BuildProfile(candidates)
-		if err != nil {
-			// The policy controller marks these invalid on the object; this is
-			// the belt to that braces, for a policy edited between reconciles.
-			metrics.RecordFailure("invalid_policy", nil, policy.Name, 0)
-			writeJSON(w, http.StatusUnprocessableEntity, ErrorResponse{
-				Error: "policy " + policy.Name + " is not usable: " + err.Error(),
-			})
-			return
-		}
+	profile, err := policy.BuildProfile(candidates)
+	if err != nil {
+		// The policy controller marks these invalid on the object; this is the
+		// belt to that braces, for a policy edited between reconciles.
+		metrics.RecordFailure("invalid_policy", nil, policy.Name, 0)
+		writeJSON(w, http.StatusUnprocessableEntity, ErrorResponse{
+			Error: "policy " + policy.Name + " is not usable: " + err.Error(),
+		})
+		return
+	}
+	schedReq := policy.BuildRequest(req.Name, req.Requires, req.PreferProvider)
 
-		decision, err = profile.Schedule(r.Context(),
-			policy.BuildRequest(req.Name, req.Requires, req.PreferProvider), candidates)
+	var decision *framework.Decision
+	for {
+		decision, err = profile.Schedule(r.Context(), schedReq, candidates)
 		if err != nil {
 			var noCand *framework.ErrNoCandidates
 			if errors.As(err, &noCand) {
@@ -245,22 +241,18 @@ func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
 		if !warmIn(candidates, decision.Provider) || s.Registry.TryReserveWarm(decision.Provider) {
 			break
 		}
-		// A concurrent placement took the last of the warm capacity this
-		// decision was counting on, so it was made against a picture that no
-		// longer holds. Decide again against what is left. Each retry means
-		// another request claimed a sandbox, so this converges; the bound only
-		// caps latency, and past it the decision stands as a cold placement.
-		if attempt == maxPlacementAttempts {
-			// Recorded as one too: the snapshot still shows the warm sandbox
-			// this placement lost, and the warm label must not count it.
-			for i := range candidates {
-				if candidates[i].Provider == decision.Provider {
-					candidates[i].WarmCapacity = 0
-				}
+		// A concurrent placement took the last of this provider's warm
+		// capacity, so the decision counted on a sandbox that is gone. Mark it
+		// empty in this request's copy and decide again: every other
+		// provider's warm count is still checked when it is claimed, and each
+		// pass empties one more provider, so this ends within one pass per
+		// warm provider, on a sandbox that was free or on a cold placement no
+		// warm one could have beaten.
+		for i := range candidates {
+			if candidates[i].Provider == decision.Provider {
+				candidates[i].WarmCapacity = 0
 			}
-			break
 		}
-		candidates = s.Registry.Snapshot()
 	}
 
 	if !warmIn(candidates, decision.Provider) {

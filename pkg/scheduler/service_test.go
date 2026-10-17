@@ -2,6 +2,7 @@ package scheduler_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -505,6 +506,42 @@ func TestAConcurrentBurstNeverOverReservesAWarmPool(t *testing.T) {
 	}
 	if r := got["gke"].Reserved; r == 0 || r > 30 {
 		t.Fatalf("gke reserved %d; want some of its 30 and never more", r)
+	}
+}
+
+func TestNoRequestStartsColdWhileWarmCapacityRemains(t *testing.T) {
+	// One warm sandbox on each of many providers, and exactly that many
+	// concurrent requests. Requests that lose a race keep looking until they
+	// claim one, however many providers they lose on first, so every request
+	// starts warm. A fixed retry bound would let one lose three races and
+	// start cold beside a provider still holding a warm sandbox.
+	const n = 12
+	reports := map[string]registry.Report{}
+	for i := 0; i < n; i++ {
+		reports[fmt.Sprintf("p%02d", i)] = registry.Report{WarmCapacity: 1}
+	}
+	for round := 0; round < 30; round++ {
+		h := newService(t, reports)
+		var wg sync.WaitGroup
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				w := httptest.NewRecorder()
+				h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/schedule", strings.NewReader(`{}`)))
+				if w.Code != http.StatusOK {
+					t.Errorf("status %d, body %s", w.Code, w.Body)
+				}
+			}()
+		}
+		wg.Wait()
+
+		for name, p := range providers(t, h) {
+			if p.Reserved != 1 || p.InFlightCold != 0 {
+				t.Fatalf("round %d: %s reserved=%d inFlightCold=%d; every request should have claimed a warm sandbox",
+					round, name, p.Reserved, p.InFlightCold)
+			}
+		}
 	}
 }
 
