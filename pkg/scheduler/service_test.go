@@ -478,3 +478,29 @@ func TestColdPlacementsReserveNothing(t *testing.T) {
 		t.Fatalf("%d reservations from cold placements", got.Reserved)
 	}
 }
+
+func TestStandbyRefusesPlacementButServesProviders(t *testing.T) {
+	// A standby placing against its own empty reservations would undo the
+	// point of having one replica decide.
+	reg := registry.New(registry.Options{})
+	reg.Report("civo", registry.Report{WarmCapacity: 3})
+	active := false
+	h := (&scheduler.Service{
+		Registry: reg,
+		Policies: &scheduler.PolicyList{},
+		Active:   func() bool { return active },
+	}).Handler()
+
+	w, _, errResp := post(t, h, `{}`)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(errResp.Error, "standby") {
+		t.Fatalf("standby: status %d, error %q; want 503 naming the standby", w.Code, errResp.Error)
+	}
+	if got := providers(t, h)["civo"]; got.WarmCapacity != 3 || got.Reserved != 0 {
+		t.Fatalf("standby should still report capacity, and must not have reserved: %+v", got)
+	}
+
+	active = true
+	if w, resp, _ := post(t, h, `{}`); w.Code != http.StatusOK || resp.Provider != "civo" {
+		t.Fatalf("leader: status %d, provider %q", w.Code, resp.Provider)
+	}
+}

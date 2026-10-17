@@ -79,7 +79,17 @@ sandbox, subtracted from that provider's capacity until a poll that started
 after it (plus `--reservation-grace`, default 5s, for the claim to show up)
 succeeds. The error this can make is counting a claim twice for one poll,
 which spills placements early rather than piling them onto an empty pool.
-Reservations are per replica: with N replicas, each sees only its own.
+
+Reservations live in the deciding replica's memory, so they are only exact
+while one replica makes every decision. With `--leader-elect`, the leader
+alone serves placement: it labels its own pod `placement.agents.x-k8s.io/active=true`,
+and the chart's placement Service selects on that label. Standbys keep their
+registry polled and current, so a new leader places correctly from its first
+request, and refuse placement with a 503 if one reaches them directly. This
+costs no throughput worth having — one replica decides in tens of
+microseconds, orders of magnitude faster than any cluster can claim sandboxes
+— and a handover takes seconds on a graceful shutdown, or the 15s lease on a
+crash.
 
 ### Every decision explains itself
 

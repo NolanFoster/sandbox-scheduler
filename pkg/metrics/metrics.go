@@ -57,7 +57,7 @@ var (
 			Name:      "placement_failures_total",
 			Help: "Placement requests that produced no decision, by reason: " +
 				"no_providers (nothing configured), no_candidates (nothing satisfied the request), " +
-				"invalid_policy, or policy_selection_error.",
+				"invalid_policy, policy_selection_error, or standby (sent to a replica that is not the leader).",
 		},
 		[]string{"reason"},
 	)

@@ -11,7 +11,9 @@ metadata:
     {{- end }}
 spec:
   selector:
-    matchLabels: {{- include "sandbox-scheduler.selectorLabels" . | nindent 6 }}
+    matchLabels:
+      {{- include "sandbox-scheduler.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: metrics
   endpoints:
     - port: metrics
       interval: {{ .Values.metrics.serviceMonitor.interval }}

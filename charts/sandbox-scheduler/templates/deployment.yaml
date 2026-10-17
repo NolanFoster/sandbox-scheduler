@@ -1,3 +1,6 @@
+{{- if and (gt (int .Values.replicaCount) 1) (not .Values.leaderElection) }}
+{{- fail "replicaCount > 1 requires leaderElection=true: placement reservations are only exact while one replica makes every decision" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -40,6 +43,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # The leader labels its own pod by name for the placement Service.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             {{- if or .Values.placementApi.token .Values.placementApi.existingSecret }}
             - name: PLACEMENT_API_TOKEN
               valueFrom:

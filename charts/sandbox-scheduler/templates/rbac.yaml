@@ -35,8 +35,10 @@ subjects:
     namespace: {{ .Release.Namespace }}
 {{- if .Values.leaderElection }}
 ---
-# Leader election coordinates the controllers only. Namespaced, because the
-# lease lives beside the deployment rather than cluster-wide.
+# Leader election, and the leader labeling its own pod so the placement Service
+# routes to it. Namespaced, because the lease and the pods live beside the
+# deployment rather than cluster-wide. The pod grant cannot name the pod, which
+# a Deployment does not know in advance, so it covers the namespace.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -50,6 +52,9 @@ rules:
   - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

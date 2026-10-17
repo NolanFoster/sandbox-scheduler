@@ -17,14 +17,19 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-# More than one replica is safe and useful: the placement API is a read over
-# each replica's own cache, so every replica can serve it. Only the controllers
-# are leader-elected.
+# One leader serves placement; the other replicas are warm standbys. Placement
+# reserves warm capacity in the deciding replica's memory, which is only exact
+# while one replica makes every decision, so extra replicas add availability,
+# not throughput. One replica decides in microseconds, far faster than any
+# cluster can claim sandboxes.
 replicaCount: 2
 
-# Leave off for a single replica. With more than one, enable it so the
-# controllers do not fight over status writes.
-leaderElection: false
+# Required with more than one replica, and the chart refuses to render without
+# it. The leader labels its own pod placement.agents.x-k8s.io/active=true and
+# the placement Service selects on that label. Standbys stay Ready, keep their
+# registry current, and take over when the leader goes. A graceful shutdown
+# hands over within seconds; a crash waits out the 15s lease.
+leaderElection: true
 
 scheduler:
   # How often provider capacity is polled. Off the placement path entirely, so
@@ -37,8 +42,8 @@ scheduler:
   # How long a claim may take to show up in a provider's capacity report.
   # Placements are subtracted from a provider's warm capacity until a poll
   # started this long after them succeeds, so a burst spreads across providers
-  # instead of piling onto the one that looked best at the last poll. Each
-  # replica counts only the placements it made itself.
+  # instead of piling onto the one that looked best at the last poll. Only the
+  # leader places, so its count covers every placement.
   reservationGrace: 5s
 
 service:

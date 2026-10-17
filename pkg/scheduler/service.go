@@ -107,6 +107,12 @@ type Service struct {
 	// reconnaissance for anyone deciding where to aim, so anything exposing
 	// this beyond the cluster must set a token.
 	Token string
+
+	// Active, when set, reports whether this replica may place. Placement
+	// reserves capacity in this process's memory, which is only exact while
+	// one replica makes every decision, so a standby refuses rather than
+	// placing against reservations it cannot see. Nil means always active.
+	Active func() bool
 }
 
 // Handler returns the HTTP handler.
@@ -155,6 +161,17 @@ func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
 	// problem; what this defends is the claim that placement itself reads local
 	// memory and stays out of the API server.
 	start := time.Now()
+
+	if s.Active != nil && !s.Active() {
+		// Normally unreachable: the placement Service only selects the
+		// leader. This covers a request that arrives during a handover, or
+		// one sent to a pod directly.
+		metrics.RecordFailure("standby", nil, "", 0)
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error: "this replica is a standby; placement is served by the elected leader",
+		})
+		return
+	}
 
 	var req Request
 	if r.ContentLength != 0 {
