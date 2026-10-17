@@ -181,6 +181,18 @@ helm install sandbox-scheduler charts/sandbox-scheduler \
   --namespace sandbox-scheduler --create-namespace
 ```
 
+**Upgrading from a release without leader-only placement** (0.1.0 and
+earlier): expect the placement API — `/schedule` and `/providers` — to be
+unreachable for up to about a minute, once. The new Service selects only the
+pod labeled `placement.agents.x-k8s.io/active=true`, which the old pods never
+carry, so it has no endpoints until the first upgraded pod has started, been
+elected and labeled itself. If the old release ran with `leaderElection=true`,
+add up to the 15s lease, which the old binary does not release on shutdown.
+Callers should retry through it. Later upgrades hand over between labeled
+replicas in a couple of seconds. The chart also now refuses
+`replicaCount > 1` without `leaderElection=true`, and serves metrics from a
+separate `<release>-metrics` Service.
+
 Or run it locally against whatever cluster `kubectl` points at:
 
 ```bash
