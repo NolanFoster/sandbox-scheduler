@@ -83,6 +83,16 @@ Checking for a warm sandbox and claiming it is a single atomic step, taken
 without a lock, so concurrent requests that saw the same last sandbox cannot
 both get it; the one that loses schedules again against what is left.
 
+Cold starts load a provider in a way warm claims do not, so they are counted
+too: each cold placement is in flight for `--cold-start-window` (default 30s).
+When providers with no warm capacity tie on score, the next cold start goes to
+the one with fewer in flight, by the power of two choices (sample two of the
+tied, take the less loaded, flip a coin when equal), rather than to whichever
+name sorts first. The coin matters: concurrent requests snapshot before any
+records its placement, so a burst often sees equal counts, and a fixed rule
+would send all of it to one provider. Ties with warm capacity still break on
+name.
+
 Reservations live in the deciding replica's memory, so they are only exact
 while one replica makes every decision. With `--leader-elect`, the leader
 alone serves placement: it labels its own pod `placement.agents.x-k8s.io/active=true`,

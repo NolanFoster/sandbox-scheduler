@@ -2,6 +2,7 @@ package scheduler_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -508,6 +509,42 @@ func TestAConcurrentBurstNeverOverReservesAWarmPool(t *testing.T) {
 	}
 }
 
+func TestNoRequestStartsColdWhileWarmCapacityRemains(t *testing.T) {
+	// One warm sandbox on each of many providers, and exactly that many
+	// concurrent requests. Requests that lose a race keep looking until they
+	// claim one, however many providers they lose on first, so every request
+	// starts warm. A fixed retry bound would let one lose three races and
+	// start cold beside a provider still holding a warm sandbox.
+	const n = 12
+	reports := map[string]registry.Report{}
+	for i := 0; i < n; i++ {
+		reports[fmt.Sprintf("p%02d", i)] = registry.Report{WarmCapacity: 1}
+	}
+	for round := 0; round < 30; round++ {
+		h := newService(t, reports)
+		var wg sync.WaitGroup
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				w := httptest.NewRecorder()
+				h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/schedule", strings.NewReader(`{}`)))
+				if w.Code != http.StatusOK {
+					t.Errorf("status %d, body %s", w.Code, w.Body)
+				}
+			}()
+		}
+		wg.Wait()
+
+		for name, p := range providers(t, h) {
+			if p.Reserved != 1 || p.InFlightCold != 0 {
+				t.Fatalf("round %d: %s reserved=%d inFlightCold=%d; every request should have claimed a warm sandbox",
+					round, name, p.Reserved, p.InFlightCold)
+			}
+		}
+	}
+}
+
 func TestColdPlacementsReserveNothing(t *testing.T) {
 	// A cold placement takes nothing from the pool, so it must not eat into
 	// capacity the next poll reports.
@@ -517,6 +554,40 @@ func TestColdPlacementsReserveNothing(t *testing.T) {
 	}
 	if got := providers(t, h)["civo"]; got.Reserved != 0 {
 		t.Fatalf("%d reservations from cold placements", got.Reserved)
+	}
+}
+
+func TestABurstOfColdStartsSpreadsAcrossTiedProviders(t *testing.T) {
+	// Nothing warm anywhere and nothing to tell the providers apart: breaking
+	// on name would send every cold start to civo.
+	h := newService(t, map[string]registry.Report{
+		"civo": {WarmCapacity: 0},
+		"gke":  {WarmCapacity: 0},
+	})
+	placed := map[string]int{}
+	for i := 0; i < 100; i++ {
+		w, resp, _ := post(t, h, `{}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d: status %d", i, w.Code)
+		}
+		placed[resp.Provider]++
+	}
+	if placed["civo"] != 50 || placed["gke"] != 50 {
+		t.Fatalf("placed %v; want an even split", placed)
+	}
+	got := providers(t, h)
+	if got["civo"].InFlightCold != 50 || got["gke"].InFlightCold != 50 {
+		t.Fatalf("inFlightCold civo=%d gke=%d, want 50 each", got["civo"].InFlightCold, got["gke"].InFlightCold)
+	}
+}
+
+func TestWarmPlacementsAreNotCountedAsCold(t *testing.T) {
+	h := newService(t, map[string]registry.Report{"civo": {WarmCapacity: 2}})
+	post(t, h, `{}`)
+	post(t, h, `{}`)
+	post(t, h, `{}`) // the pool is reserved; this one is cold
+	if got := providers(t, h)["civo"]; got.InFlightCold != 1 || got.Reserved != 2 {
+		t.Fatalf("inFlightCold=%d reserved=%d; want 1 and 2", got.InFlightCold, got.Reserved)
 	}
 }
 

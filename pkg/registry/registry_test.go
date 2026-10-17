@@ -673,3 +673,89 @@ func BenchmarkTryReserveWarmParallel(b *testing.B) {
 		}
 	})
 }
+
+func TestColdPlacementsAreInFlightForTheWindow(t *testing.T) {
+	clk := newClock()
+	r := registry.New(registry.Options{ColdStartWindow: 10 * time.Second, Now: clk.now})
+	r.Report("civo", registry.Report{})
+
+	r.RecordColdPlacement("civo")
+	r.RecordColdPlacement("civo")
+	clk.advance(4 * time.Second)
+	r.RecordColdPlacement("civo")
+	if got := r.Snapshot()[0].InFlightCold; got != 3 {
+		t.Fatalf("in flight %d, want 3", got)
+	}
+
+	clk.advance(5 * time.Second) // 9s after the first two
+	if got := r.Statuses()[0].InFlightCold; got != 3 {
+		t.Fatalf("in flight %d at 9s; still inside the window", got)
+	}
+	clk.advance(time.Second) // 10s: the first two age out
+	if got := r.Snapshot()[0].InFlightCold; got != 1 {
+		t.Fatalf("in flight %d at 10s, want 1", got)
+	}
+	clk.advance(10 * time.Second)
+	if got := r.Snapshot()[0].InFlightCold; got != 0 {
+		t.Fatalf("in flight %d after the window, want 0", got)
+	}
+}
+
+func TestColdPlacementsAreNotClearedByPolls(t *testing.T) {
+	// A report says nothing about cold starts still provisioning, so it must
+	// not reset the count the way it clears reservations.
+	clk := newClock()
+	r := registry.New(registry.Options{ColdStartWindow: 30 * time.Second, Now: clk.now})
+	r.Report("civo", registry.Report{})
+	r.RecordColdPlacement("civo")
+	clk.advance(20 * time.Second)
+	r.Report("civo", registry.Report{})
+	if got := r.Snapshot()[0].InFlightCold; got != 1 {
+		t.Fatalf("in flight %d; a poll must not clear cold starts", got)
+	}
+}
+
+func TestColdCountStaysWindowedAcrossTheRing(t *testing.T) {
+	// The ring is reused every few dozen seconds; a steady stream must read
+	// as the window's worth, not drift up or lose buckets.
+	clk := newClock()
+	r := registry.New(registry.Options{ColdStartWindow: 30 * time.Second, Now: clk.now})
+	r.Report("civo", registry.Report{})
+	for i := 0; i < 500; i++ {
+		r.RecordColdPlacement("civo")
+		r.RecordColdPlacement("civo")
+		clk.advance(time.Second)
+	}
+	// 30 one-second buckets back from now: the last 29 seconds of placements,
+	// the current second being empty.
+	if got := r.Snapshot()[0].InFlightCold; got != 58 {
+		t.Fatalf("in flight %d, want 58", got)
+	}
+}
+
+func TestConcurrentColdPlacementsAreAllCounted(t *testing.T) {
+	r := registry.New(registry.Options{})
+	r.Report("civo", registry.Report{})
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				r.RecordColdPlacement("civo")
+			}
+		}()
+	}
+	wg.Wait()
+	if got := r.Snapshot()[0].InFlightCold; got != 3200 {
+		t.Fatalf("in flight %d, want 3200", got)
+	}
+}
+
+func TestColdPlacementOnAnUnknownProviderIsANoOp(t *testing.T) {
+	r := registry.New(registry.Options{})
+	r.RecordColdPlacement("gone")
+	if got := r.Snapshot(); len(got) != 0 {
+		t.Fatalf("recording resurrected a provider: %+v", got)
+	}
+}

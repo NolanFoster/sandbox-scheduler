@@ -45,6 +45,10 @@ scheduler:
   # instead of piling onto the one that looked best at the last poll. Only the
   # leader places, so its count covers every placement.
   reservationGrace: 5s
+  # How long a cold placement counts as in flight, roughly how long a cold
+  # start takes. When providers with no warm capacity tie, the next cold start
+  # goes to the one with fewer in flight rather than the first by name.
+  coldStartWindow: 30s
 
 service:
   type: ClusterIP

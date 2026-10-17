@@ -28,6 +28,7 @@ type registryCollector struct {
 
 	warmCapacity *prometheus.Desc
 	reserved     *prometheus.Desc
+	inFlightCold *prometheus.Desc
 	reachable    *prometheus.Desc
 	staleness    *prometheus.Desc
 	cost         *prometheus.Desc
@@ -46,6 +47,12 @@ func NewRegistryCollector(source StatusSource) prometheus.Collector {
 			namespace+"_provider_reserved_capacity",
 			"Warm sandboxes placed on a provider since its last poll, subtracted from its "+
 				"reported warm capacity when scheduling.",
+			[]string{"provider"}, nil,
+		),
+		inFlightCold: prometheus.NewDesc(
+			namespace+"_provider_in_flight_cold_starts",
+			"Cold starts placed on a provider within the cold start window. Ties between "+
+				"providers with no warm capacity go to the one with fewer.",
 			[]string{"provider"}, nil,
 		),
 		reachable: prometheus.NewDesc(
@@ -73,6 +80,7 @@ func NewRegistryCollector(source StatusSource) prometheus.Collector {
 func (c *registryCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.warmCapacity
 	ch <- c.reserved
+	ch <- c.inFlightCold
 	ch <- c.reachable
 	ch <- c.staleness
 	ch <- c.cost
@@ -85,6 +93,8 @@ func (c *registryCollector) Collect(ch chan<- prometheus.Metric) {
 			c.warmCapacity, prometheus.GaugeValue, float64(st.Report.WarmCapacity), st.Provider)
 		ch <- prometheus.MustNewConstMetric(
 			c.reserved, prometheus.GaugeValue, float64(st.Reserved), st.Provider)
+		ch <- prometheus.MustNewConstMetric(
+			c.inFlightCold, prometheus.GaugeValue, float64(st.InFlightCold), st.Provider)
 		ch <- prometheus.MustNewConstMetric(
 			c.reachable, prometheus.GaugeValue, boolValue(st.Reachable), st.Provider)
 		ch <- prometheus.MustNewConstMetric(

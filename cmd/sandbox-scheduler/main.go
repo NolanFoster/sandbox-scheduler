@@ -65,6 +65,7 @@ func main() {
 		refreshInterval  time.Duration
 		staleAfter       time.Duration
 		reservationGrace time.Duration
+		coldStartWindow  time.Duration
 		leaderElection   bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address for the metrics endpoint.")
@@ -81,6 +82,9 @@ func main() {
 	flag.DurationVar(&reservationGrace, "reservation-grace", 5*time.Second,
 		"How long a claim may take to appear in a provider's capacity report. Placements are "+
 			"subtracted from a provider's warm capacity until a poll started this long after them succeeds.")
+	flag.DurationVar(&coldStartWindow, "cold-start-window", 30*time.Second,
+		"How long a cold placement counts as in flight. Ties between providers with no warm "+
+			"capacity go to the one with fewer cold starts in flight.")
 	flag.BoolVar(&leaderElection, "leader-elect", false,
 		"Elect a leader. Required with more than one replica: only the leader serves placement and "+
 			"writes status, while the others keep a warm registry to take over from. Set POD_NAME so "+
@@ -119,7 +123,11 @@ func main() {
 		}
 	}
 
-	reg := registry.New(registry.Options{StaleAfter: staleAfter, ReservationGrace: reservationGrace})
+	reg := registry.New(registry.Options{
+		StaleAfter:       staleAfter,
+		ReservationGrace: reservationGrace,
+		ColdStartWindow:  coldStartWindow,
+	})
 
 	// Provider gauges are collected at scrape time, so they always reflect what
 	// the scheduler believes right now rather than what a timer last copied.
@@ -211,7 +219,8 @@ func main() {
 	}
 
 	log.Info("starting sandbox-scheduler",
-		"placementAPI", schedulerAddr, "refreshInterval", refreshInterval, "staleAfter", staleAfter, "reservationGrace", reservationGrace)
+		"placementAPI", schedulerAddr, "refreshInterval", refreshInterval, "staleAfter", staleAfter, "reservationGrace", reservationGrace,
+		"coldStartWindow", coldStartWindow)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "manager exited with error")
 		os.Exit(1)

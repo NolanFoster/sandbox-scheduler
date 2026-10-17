@@ -28,9 +28,8 @@ import (
 type ledger struct {
 	state atomic.Uint64
 
-	// buckets is a power-of-two ring indexed by epoch second.
-	buckets []atomic.Uint64
-	mask    uint32
+	// reservations holds each reservation under the second it was made.
+	reservations ring
 
 	// carry holds reservations whose bucket was reused for a later second
 	// before any poll cleared them, packed with the latest second among them.
@@ -38,19 +37,81 @@ type ledger struct {
 	// reservations after one trip round the ring, and its stale report would
 	// overstate capacity.
 	carry atomic.Uint64
+
+	// cold holds each cold placement under the second it was made. Unlike a
+	// reservation, nothing a provider reports says when a cold start is done,
+	// so these simply age out of the window; see Options.ColdStartWindow.
+	cold       ring
+	coldWindow uint32
 }
 
-// newLedger sizes the ring to outlast the longest a reservation should wait
-// for a poll that clears it: the grace period plus one fetch, plus a second
-// for the bucket straddling the cutoff. A smaller ring is still correct, but
-// sends more reservations to carry, which clears later.
-func newLedger(grace, fetchTimeout time.Duration) *ledger {
-	need := uint((grace+fetchTimeout)/time.Second) + 2
-	size := uint32(1) << bits.Len(need-1)
+// newLedger sizes the reservation ring to outlast the longest a reservation
+// should wait for a poll that clears it: the grace period plus one fetch, plus
+// a second for the bucket straddling the cutoff. A smaller ring is still
+// correct, but sends more reservations to carry, which clears later. The cold
+// ring covers the window plus the second in progress.
+func newLedger(grace, fetchTimeout, coldWindow time.Duration) *ledger {
+	window := uint32(coldWindow / time.Second)
+	if window < 1 {
+		window = 1
+	}
+	return &ledger{
+		reservations: newRing(uint((grace+fetchTimeout)/time.Second) + 2),
+		cold:         newRing(uint(window) + 1),
+		coldWindow:   window,
+	}
+}
+
+// ring is a power-of-two ring of one-second buckets, each an atomic word
+// packing the second it counts with the count.
+type ring struct {
+	buckets []atomic.Uint64
+	mask    uint32
+}
+
+// newRing builds a ring covering at least seconds, and never fewer than 8.
+func newRing(seconds uint) ring {
+	size := uint32(1) << bits.Len(seconds-1)
 	if size < 8 {
 		size = 8
 	}
-	return &ledger{buckets: make([]atomic.Uint64, size), mask: size - 1}
+	return ring{buckets: make([]atomic.Uint64, size), mask: size - 1}
+}
+
+// add counts one in the bucket for sec. Whatever the ring cannot keep is
+// returned as a count with its latest second: the bucket's previous contents
+// when the slot is reused for sec, or this one itself when the slot has
+// already moved past sec because the clock stepped back or the caller stalled
+// for a whole ring.
+func (r *ring) add(sec uint32) (spilledSec, spilled uint32) {
+	b := &r.buckets[sec&r.mask]
+	for {
+		old := b.Load()
+		e, c := unpack(old)
+		switch {
+		case e == sec:
+			if b.CompareAndSwap(old, pack(sec, c+1)) {
+				return 0, 0
+			}
+		case e > sec:
+			return sec, 1
+		default:
+			if b.CompareAndSwap(old, pack(sec, 1)) {
+				return e, c
+			}
+		}
+	}
+}
+
+// sumSince is the count across buckets for second since and later.
+func (r *ring) sumSince(since uint32) int {
+	n := 0
+	for i := range r.buckets {
+		if e, c := unpack(r.buckets[i].Load()); c > 0 && e >= since {
+			n += int(c)
+		}
+	}
+	return n
 }
 
 // epoch is the one-second bucket t falls in. Seconds since the Unix epoch fit
@@ -103,31 +164,21 @@ func (l *ledger) tryReserve(now time.Time) bool {
 	return true
 }
 
-// record counts one reservation in the bucket for sec.
+// record counts one reservation in the bucket for sec, carrying whatever the
+// ring cannot keep.
 func (l *ledger) record(sec uint32) {
-	b := &l.buckets[sec&l.mask]
-	for {
-		old := b.Load()
-		e, c := unpack(old)
-		switch {
-		case e == sec:
-			if b.CompareAndSwap(old, pack(sec, c+1)) {
-				return
-			}
-		case e > sec:
-			// The slot has moved on to a later second: the clock stepped back,
-			// or this goroutine stalled for a whole ring. Carry it instead.
-			l.addCarry(sec, 1)
-			return
-		default:
-			if b.CompareAndSwap(old, pack(sec, 1)) {
-				if c > 0 {
-					l.addCarry(e, c)
-				}
-				return
-			}
-		}
+	if e, c := l.reservations.add(sec); c > 0 {
+		l.addCarry(e, c)
 	}
+}
+
+// recordCold counts one cold placement. Nothing is carried: by the time the
+// ring reuses a bucket, its second is outside the window.
+func (l *ledger) recordCold(now time.Time) { l.cold.add(epoch(now)) }
+
+// inFlightCold is the number of cold placements made within the window.
+func (l *ledger) inFlightCold(now time.Time) int {
+	return l.cold.sumSince(epoch(now) - l.coldWindow + 1)
 }
 
 func (l *ledger) addCarry(sec, n uint32) {
@@ -163,8 +214,8 @@ func (l *ledger) clearBefore(cutoff time.Time) {
 			}
 		}
 	}
-	for i := range l.buckets {
-		drop(&l.buckets[i])
+	for i := range l.reservations.buckets {
+		drop(&l.reservations.buckets[i])
 	}
 	drop(&l.carry)
 	if freed == 0 {
