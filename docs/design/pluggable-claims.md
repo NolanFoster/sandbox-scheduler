@@ -1,6 +1,6 @@
 # Pluggable claims: placing *and* provisioning sandboxes beyond Kubernetes
 
-Status: **draft v3, revised after two review rounds** (OSS compatibility,
+Status: **draft v4, revised after three review rounds** (OSS compatibility,
 scalability, Kubernetes practices, Go practices). Nothing here is implemented.
 Section 12 records what changed in each revision and why.
 
@@ -109,9 +109,13 @@ type Binder interface {
     // Claim must be idempotent on req.Key: repeating it returns the same
     // sandbox. Implementations that cannot guarantee this must not be Binders.
     Claim(ctx context.Context, req ClaimRequest) (Handle, error)
-    // Lookup returns the sandbox previously claimed with key, ErrNotFound if
-    // there is none, or another error if it cannot tell.
-    Lookup(ctx context.Context, key string) (Handle, error)
+    // Lookup returns the sandbox previously claimed with req.Key, applying the
+    // same replay rules as Claim (5.11): a different req.SpecHash is
+    // KeyConflict, a sandbox still being deleted is KeyBusy, one not yet
+    // bound is waited for. ErrNotFound (matched with errors.Is) means the
+    // provider definitively has none; anything else means it cannot tell.
+    // It is a consistent read: a cached "not found" could create a duplicate.
+    Lookup(ctx context.Context, req ClaimRequest) (Handle, error)
     // Release must work from Provider and ID alone, and returns nil when the
     // sandbox is already gone.
     Release(ctx context.Context, h Handle) error
@@ -125,6 +129,7 @@ type OwnedLister interface {
 type ClaimRequest struct {
     Template string            // provider-neutral name (5.3)
     Key      string            // idempotency key
+    SpecHash string            // set by the core: hash of template, labels, TTL bucket
     Owner    string            // scheduler instance identity (5.9)
     Labels   map[string]string // caller labels; nil and empty are equivalent
     TTL      time.Duration     // set by the core before Validate (5.9)
@@ -162,8 +167,9 @@ const (
     KindNoCapacity
     KindUnavailable
     KindRejected
-    KindBusy        // rate-limited or transiently unable; honour RetryAfter
+    KindBusy        // provider rate-limited us; honour RetryAfter; spills
     KindKeyConflict // key already used with a different spec; terminal
+    KindKeyBusy     // key's previous sandbox still being deleted; pins
 )
 
 type ClaimError struct {
@@ -180,6 +186,7 @@ func Unavailable(err error) error
 func Rejected(err error) error
 func Busy(after time.Duration, err error) error
 func KeyConflict(err error) error
+func KeyBusy(after time.Duration, err error) error
 
 // KindOf classifies a non-nil error; anything unclassified, including a
 // ClaimError value rather than pointer, is KindUnknownOutcome. Callers check
@@ -193,10 +200,11 @@ Unclassified errors, a missing `Kind`, and panics in `Claim` are all
 
 | Kind | Meaning | Binder loop | Final HTTP |
 |---|---|---|---|
-| `UnknownOutcome` | Sent, outcome unknown; or unclassified | Pin to this provider: `Lookup`, then retry same key within budget; never spill | 504 `{provider}` |
+| `UnknownOutcome` | Sent, outcome unknown; or unclassified | Pin to this provider: `Lookup`, then retry same key within budget; never spill | 504 `{providers}` |
 | `KeyConflict` | Same key exists with a different spec | Stop: no retry, no spill (either would create a second sandbox under the key) | 409 `KeyConflict` |
 | `NoCapacity` | Provider confirmed it cannot serve | Mark provider refused **globally** for `--refusal-ttl` (1s); next candidate | 409 with reasons |
-| `Busy` | Provider rate limit, or the key's previous sandbox is still being deleted | Cooldown for `RetryAfter`; next candidate, except a deleting key (pin, retry after) | 429 + `Retry-After` |
+| `Busy` | Provider rate limit (e.g. 429) | Cooldown for `RetryAfter`; next candidate | 429 + `Retry-After` |
+| `KeyBusy` | The key's previous sandbox is still being deleted | Pin: retry this provider after `RetryAfter` within the deadline; never spill (the key's sandbox still exists here) | 429 + `Retry-After`, `providers` set |
 | `Unavailable` | Failed provably before taking effect | Release reservation; health signal (5.8); next candidate | 503 |
 | `Rejected` | Permanent for this provider (unknown template, auth) | Release reservation; config-error metric + `Claiming` condition; next candidate | 422 if all rejected |
 
@@ -264,7 +272,7 @@ POST /api/v1alpha1/sandboxes
     "pinProvider", "warmOnly", "ttlSeconds", "timeoutSeconds" }
   201 created | 200 idempotent replay (same key, same spec)
   409 no capacity | 409 KeyConflict (same key, different spec)
-  422 all rejected | 429 busy (+Retry-After, jittered) | 504 unknown {provider}
+  422 all rejected | 429 busy (+Retry-After, jittered) | 504 unknown {providers}
 
 DELETE /api/v1alpha1/sandboxes/{provider}/{id}
   204 | 404 (gone; success for clients)
@@ -273,7 +281,10 @@ DELETE /api/v1alpha1/sandboxes/{provider}/{id}
 - `key` required; claims without idempotency are rejected (400).
 - `retry: true` marks a client retry of a request whose outcome it did not
   learn (timeout, connection reset); the client SDK sets it on every retry.
-  `pinProvider` is set from a 504's `provider` field when the client has one.
+  `pinProvider` is set from a 504's `providers` field when it names exactly
+  one.
+- Error bodies always carry `providers` (an array, possibly empty) so SDKs see
+  one response shape.
 - Separate token `PLACEMENT_CLAIM_TOKEN` (existing-Secret pattern,
   constant-time compare).
 - Idempotency window = lifetime of the provider object. Documented: a replay
@@ -281,21 +292,45 @@ DELETE /api/v1alpha1/sandboxes/{provider}/{id}
 
 ### 5.6 Binder loop (`pkg/binder`)
 
-**Lookup rule (no duplicates without server state).** A request may create a
-new sandbox only if it is a first attempt, or if every claim-capable candidate
-it probes returns `ErrNotFound`:
+**Concurrent same-key requests.** Binding is leader-only, so the leader
+de-duplicates in-flight keys with `singleflight.Group` keyed by key: a second
+request for a key already being claimed joins the first one's result instead of
+deciding independently (two first attempts could otherwise land on different
+providers, where per-provider idempotency cannot see each other). If the joining
+request's spec-hash differs, it gets 409 `KeyConflict`. This makes "at most one
+sandbox per key" hold for concurrent requests on one leader.
+
+**Lookup rule (no duplicates across retries and failover, without server
+state).** A request may create a new sandbox only if it is a first attempt, or
+if every candidate it probes returns `ErrNotFound`. The probe set is the
+candidates that **pass the request's filter phase** (`requires`,
+`TemplateAvailable`, `Reachable` if configured), so a retry can never return a
+sandbox on a provider the request's constraints exclude; `Lookup` compares the
+spec-hash, so a retry with a different spec gets `KeyConflict`, as a create
+would.
 
 ```
 if pinProvider != "":
-    h, err := Lookup(pinProvider, key)
-    found → 200; ErrNotFound → claim only on pinProvider; other err → 504 {pinProvider}
+    Lookup(pinProvider, req)
+    found → 200; ErrNotFound → claim only on pinProvider;
+    KeyConflict → 409; KeyBusy or Busy → 429 {providers}; other → 504 {providers}
 elif retry:
-    probe Lookup on all claim-capable candidates in parallel (bounded, per-attempt timeout)
-    any found        → 200 that handle
-    all ErrNotFound  → continue as a first attempt
-    any inconclusive → pin to that provider (claim there with the same key);
-                       if more than one is inconclusive → 504 {providers}
+    probe Lookup on filtered candidates in parallel (bounded, per-attempt
+    timeout, separate per-provider Lookup token bucket)
+    any found          → 200 that handle (or 409 on KeyConflict)
+    all ErrNotFound    → continue as a first attempt
+    any Busy / KeyBusy → 429 {providers} with Retry-After (not 504, so a rate
+                         limit on Lookups cannot loop into more Lookups)
+    one inconclusive   → pin to it (claim there with the same key)
+    more than one      → 504 {providers}
 ```
+
+**Residual window, documented:** if the leader loses its lease, the process
+exits at once (controller-runtime skips graceful shutdown on lease loss), and a
+claim it had already sent may land on the provider after the new leader's
+Lookup for a retry returned `ErrNotFound`. The window is bounded by the
+provider's request latency; the duplicate is owner-labelled and bounded by its
+TTL. Graceful shutdowns do not have this window (5.7).
 
 **Claim loop.**
 
@@ -307,15 +342,26 @@ loop while spills < --max-spill (3) and before reqDeadline:
   decision := Schedule(candidates − excluded − globally refused − over maxRate)
   if none:
       if every remaining exclusion is "slots full": wait for any slot (5.7) once
+      elif every remaining exclusion is "over maxRate":
+          return 429, Retry-After = earliest token-bucket refill
       else return per collected outcomes
   if !TryAcquire(slot of decision.Provider):          // non-blocking
       excluded += provider (locally, slots full); continue  // costs no spill
+  release := slot.Release; defer release()             // every return path
   reserve warm/cold (existing ledger)                  // after the slot
   h, err := Claim(attempt ctx, req)                    // 5.7
   if err == nil: return 201 h
   switch KindOf(err) { ... per 5.2; spill kinds do spills++ ... }
-  release slot
 ```
+
+In Go the per-attempt body is its own function so `defer` releases the slot at
+the end of each attempt, not of the request.
+
+- Skipping a full provider can trade a warm start there for a cold or elastic
+  start elsewhere. That is deliberate: 512 slots already exceed a cluster's
+  ~300 claims/s, so a full provider is genuinely saturated. If measurements
+  show warm→cold downgrades dominating, a short wait (≤ the provider's p50)
+  only when the re-decision downgrades warm to cold is the follow-up.
 
 - Non-blocking slot acquisition: a full provider is re-decided away from
   immediately, so a burst spreads across providers at once instead of queueing
@@ -362,15 +408,28 @@ loop while spills < --max-spill (3) and before reqDeadline:
   `MaxIdleConnsPerHost = MaxConnsPerHost = maxInFlight` and HTTP/2 where
   offered.
 - **Binding detection (agent-sandbox)**: one watch per **in-flight** claim with
-  a `metadata.name` field selector, opened after create and closed on bind or
-  timeout, falling back to a single GET; bounded by `maxInFlight`. No informer
-  over all owned claims, so memory is per in-flight claim, not per live sandbox,
-  and leader failover relists nothing. An example FlowSchema for the
-  scheduler's remote identity is shipped (upstream's APF overlay covers only its
-  own controller).
-- **Shutdown**: detached attempts are tracked by a counter plus a done channel
-  (`wg.Go` is not called once shutdown begins; shutdown `select`s on the done
-  channel against the claim deadline, since `WaitGroup.Wait` has no timeout).
+  a `metadata.name` field selector, **started from the `resourceVersion` the
+  create returned** (so a bind that lands before the watch opens is not missed;
+  410 Gone falls back to a GET), closed on bind or timeout; bounded by
+  `maxInFlight`. No informer over all owned claims, so memory is per in-flight
+  claim, not per live sandbox, and leader failover relists nothing. The
+  apiserver has no field index for a custom resource's `metadata.name`, so each
+  claim event is filtered against every open watch in the namespace: at 512
+  watches and ~1K events/s that is ~0.5M cheap checks/s, tolerable. Watches and
+  creates share one transport per provider; the apiserver's HTTP/2
+  streams-per-connection limit must exceed `maxInFlight` plus headroom, or
+  client-go is configured to open more connections. An example FlowSchema
+  covering `create`, `get` and `watch` on `sandboxclaims` for the scheduler's
+  remote identity is shipped (upstream's APF overlay covers only its own
+  controller).
+- **Lookups** have their own per-provider token bucket (`spec.claims.lookupRate`,
+  default 200/s), separate from claims, and are always consistent reads (no
+  `resourceVersion=0`).
+- **Shutdown**: detached attempts are tracked by a counter plus a done channel;
+  the closing flag and the counter increment are under one mutex, so no attempt
+  starts after shutdown begins and none races the channel close. Shutdown
+  `select`s on the done channel against the claim deadline, since
+  `WaitGroup.Wait` has no timeout.
   HTTP shutdown timeout and `ctrl.Options.GracefulShutdownTimeout` = claim
   timeout + 5s; the chart sets `terminationGracePeriodSeconds` ≥ preStop +
   claim timeout + 10s and a native `preStop.sleep` of 5s (the image has no
@@ -381,7 +440,8 @@ loop while spills < --max-spill (3) and before reqDeadline:
 Claim health is tracked separately from poll health: a windowed error ratio
 (≥ 50% `Unavailable` over ≥ 20 attempts) demotes the provider's claim path.
 Recovery is through **half-open probes**: a `Lookup` of a random, never-used key
-(cheap and side-effect free; `ErrNotFound` counts as healthy), with exponential
+(cheap and side-effect free; `ErrNotFound` counts as healthy; 401/403 count as
+unhealthy and set the `Claiming` reason to a credentials problem), with exponential
 backoff, not the next poll, so a healthy `/warmpool` cannot flap a broken claim
 path every 10s. Readiness never depends on claim outcomes.
 
@@ -417,7 +477,8 @@ path every 10s. Readiness never depends on claim outcomes.
 
 - `proto/adapter/v1alpha1`: `GetInfo` (capabilities: claim, lookup, list,
   elastic), `Fetch`, `Claim`, `Lookup`, `Release`, `ListOwned`, with `Kind` as a
-  proto enum whose zero value is `UNKNOWN_OUTCOME`; published as its own Go
+  proto enum following buf lint style: `KIND_UNSPECIFIED = 0`, handled exactly
+  like `KIND_UNKNOWN_OUTCOME`, then the named kinds; published as its own Go
   module once stable; deprecation policy stated before v1.
 - `spec.adapter: grpc`, `spec.endpoint: unix:///var/run/adapters/<name>.sock`.
 - Pod hardening so each sidecar holds only its own credentials:
@@ -436,8 +497,10 @@ path every 10s. Readiness never depends on claim outcomes.
      release namespace), read with a namespaced Role. If the ClusterProfile CRD
      is not installed (checked via discovery), the provider reports
      `Claiming=False, reason ClusterProfileUnavailable`. Its access providers
-     run credential plugins (e.g. `gke-gcloud-auth-plugin`, `kubelogin`); these
-     ship in an `-plugins` image variant or are mounted from a volume, and are
+     run credential plugins (e.g. `gke-gcloud-auth-plugin`, `kubelogin`). The
+     documented default is mounting them from a volume the operator supplies;
+     an optional `-plugins` image variant redistributes them only with a NOTICE
+     file, per-plugin license checks and CVE tracking. Either way they are
      configured by the operator in the deployment, never by a Secret.
   2. Workload-identity federation.
   3. **Kubeconfig Secret** (fallback). Parsed with `clientcmd.Load` and rejected
@@ -452,12 +515,15 @@ path every 10s. Readiness never depends on claim outcomes.
   sha256(owner + "/" + key) (starts with a letter, ≤ 63, DNS-1035-safe for the
   derived Sandbox/Service names), `warmPoolRef` from the template mapping,
   lifecycle per 5.9, owner/key labels, spec-hash annotation.
-- **Replay** on `AlreadyExists`: live claim with matching spec-hash → 200;
-  different hash → `KeyConflict` (409); claim being deleted, or past its
-  `shutdownTime` and about to be → `Busy` with a short `RetryAfter`, pinned to
-  this provider, so the key is not reused elsewhere while its sandbox still
-  exists.
-- **Lookup** = GET of the deterministic claim name (cheap; no list).
+- **Replay** on `AlreadyExists`, and **Lookup**, apply one shared rule: live
+  claim with matching spec-hash → the handle (waiting for binding if not yet
+  bound); different hash → `KeyConflict` (409); claim being deleted, or past
+  its `shutdownTime` and about to be → `KeyBusy` with a short `RetryAfter`,
+  pinned to this provider, so the key is not reused elsewhere while its sandbox
+  still exists.
+- **Lookup** = one consistent GET of the deterministic claim name (no list).
+  `ErrNotFound` only on 404; 401/403 are `Rejected` (inconclusive for the
+  Lookup rule), never "not found".
 - **Bound** when `status.sandbox.name` is set (there is no Bound condition);
   `Connect` carries `X-Sandbox-ID` (the Sandbox name) and
   `X-Sandbox-Namespace`.
@@ -505,8 +571,12 @@ phase 6.
 ## 7. Testing
 
 - Binder loop: table tests over every `Kind`, including `KeyConflict` (no
-  retry, no spill) and inconclusive `Lookup` on retry (pins, never claims
-  elsewhere); mixed outcomes; deadlines and backoff under `testing/synctest`;
+  retry, no spill), `KeyBusy` (pins, never spills) versus `Busy` (spills), and
+  inconclusive `Lookup` on retry (pins, never claims elsewhere); a retry whose
+  `requires` excludes the provider holding the key does not return it; a retry
+  with a different template gets 409; concurrent first attempts with one key
+  join one claim (singleflight); slot released on every return path; mixed
+  outcomes; deadlines and backoff under `testing/synctest`;
   concurrent same-key claims under `-race` asserting at most one sandbox; a
   burst against one full provider spreads to others without spending spills;
   all-full returns 429, never 409.
@@ -514,8 +584,9 @@ phase 6.
   ledger unchanged (property test over interleavings).
 - `adaptertest.TestBinder(t *testing.T, newHarness func(*testing.T) Harness)`
   modelled on `testing/fstest`; the harness injects faults the suite cannot
-  reach generically (no capacity, refuse-before-send, drop-after-send, auth,
-  key conflict, deleting key).
+  reach generically (no capacity, rate limit, refuse-before-send,
+  drop-after-send, auth, key conflict, deleting key), and checks that `Lookup`
+  applies the same replay rules as `Claim`.
 - `FuzzValidateKey`, `FuzzLabels`.
 - agent-sandbox: envtest with upstream CRDs; replay with matching and
   mismatched spec-hash; replay of a deleting claim; claims on an empty pool
@@ -539,7 +610,12 @@ phase 6.
   upstream's measured latencies (agent-sandbox `docs/performance-tuning.md`:
   warm burst p90 ≤ 0.2s, 300-claim burst p50 ≈ 1.27s, sustained p90
   0.68–1.03s), headroom is ~400–2,500 claims/s per provider; the cluster
-  (≈300/s warm, 70–85/s per pool refill) is the limit, not the scheduler.
+  (≈300/s warm, 70–85/s per pool refill) is the limit, not the scheduler. At
+  the same table's burst p90 (≈3.2s), 512 slots sustain ~160/s per provider;
+  operators expecting long bursts near 300/s raise `maxInFlight` toward 1024.
+- Retry storms after failover: up to 4,096 retries × P providers of consistent
+  Lookup GETs, spread by client jitter and capped by the per-provider Lookup
+  bucket; Lookup rate limits return 429, not 504, so they cannot loop.
 - Leader memory: ~50KB per in-flight claim, including its bind watch; the
   global cap of 4096 bounds this at ~200MB. Nothing scales with the number of
   live sandboxes.
@@ -578,11 +654,31 @@ phase 6.
   sandboxes and relists on failover; per-claim watches bounded by `maxInFlight`
   keep state proportional to work in flight.
 - *Mapping a deleting claim to `Rejected`* (acceptable to the Go review if
-  documented): chose `Busy` pinned to the provider instead (Kubernetes review),
+  documented): chose `KeyBusy` (pinned) to the provider instead (Kubernetes review),
   since spilling would create a second sandbox under the same key while the
   first still exists.
 
 ## 12. Changes
+
+### v3 → v4 (round 3)
+
+| v3 | v4 | Raised by |
+|---|---|---|
+| One `KindBusy` for rate limits (spill) and deleting keys (pin) | Separate `KindKeyBusy` that pins; `Busy` spills | Go (major) |
+| Concurrent first attempts with one key could land on different providers | Leader `singleflight` per key; joiner with a different spec gets 409 | Go (major) |
+| Retry Lookup probed all providers and ignored the spec | Probe only filter-passing candidates; Lookup takes the request and applies Claim's replay rules (KeyConflict, KeyBusy, wait for bind) | Kubernetes (major) |
+| Lease-loss duplicate window undocumented | Documented and bounded | Go |
+| Busy Lookups → 504 | 429 with Retry-After; separate Lookup token bucket; consistent reads | Scalability |
+| All candidates over rate → "per outcomes" | 429 with refill-time Retry-After | Scalability |
+| Watch start point unspecified | From create's resourceVersion; 410 → GET; stream limits; FlowSchema covers get/watch | Kubernetes, Scalability |
+| Slot release after the switch | `defer` per attempt | Go |
+| Shutdown flag and counter unsynchronised | Same mutex | Go |
+| `ErrNotFound` compared directly | `errors.Is` | Go |
+| Half-open probe ignored 401/403 | Unhealthy + credentials reason | Kubernetes |
+| 504 `{provider}` vs `{providers}` | Always a `providers` array | OSS |
+| Proto zero value `UNKNOWN_OUTCOME` | `KIND_UNSPECIFIED = 0` handled as unknown (buf style) | OSS |
+| `-plugins` image as a default | Volume mount is the default; image variant needs NOTICE + license + CVE tracking | OSS |
+| Warm→cold trade-off and burst p90 unstated | Stated in 5.6 and section 9 | Scalability, OSS |
 
 ### v2 → v3 (round 2)
 
