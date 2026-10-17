@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"math"
 	"math/bits"
 	"sync/atomic"
 	"time"
@@ -15,17 +16,17 @@ import (
 // compare-and-swap, which can only zero a bucket still holding the second it
 // inspected, so a reservation landing concurrently is never lost.
 //
-// outstanding is the sum the scheduler subtracts, kept in its own word so that
-// checking capacity and claiming it is a single compare-and-swap. It is raised
+// state packs the report's warm capacity with the number of reservations
+// outstanding against it, the sum the scheduler subtracts. They share one word
+// so that a claim is a compare-and-swap on everything it was decided from: if
+// they were separate, a report lowering capacity and clearing reservations
+// could return the count to a value a stalled claim had already read, and the
+// claim would land against capacity that no longer exists. The count is raised
 // before a bucket and lowered after one, so between the two it can only
 // overstate reservations, which spills placements early rather than
 // overplacing.
 type ledger struct {
-	// warm is the report's warm capacity, mirrored here so a reservation can
-	// check it without the registry's lock. Written under that lock.
-	warm atomic.Int64
-
-	outstanding atomic.Int64
+	state atomic.Uint64
 
 	// buckets is a power-of-two ring indexed by epoch second.
 	buckets []atomic.Uint64
@@ -56,18 +57,45 @@ func newLedger(grace, fetchTimeout time.Duration) *ledger {
 // in 32 bits until 2106.
 func epoch(t time.Time) uint32 { return uint32(t.Unix()) }
 
-func pack(epoch, count uint32) uint64 { return uint64(epoch)<<32 | uint64(count) }
+// pack and unpack split a word into two 32-bit halves: (second, count) for a
+// bucket or carry, (warm, outstanding) for state.
+func pack(hi, lo uint32) uint64 { return uint64(hi)<<32 | uint64(lo) }
 
-func unpack(w uint64) (epoch, count uint32) { return uint32(w >> 32), uint32(w) }
+func unpack(w uint64) (hi, lo uint32) { return uint32(w >> 32), uint32(w) }
+
+// setWarm records the report's warm capacity, keeping outstanding reservations.
+func (l *ledger) setWarm(n int) {
+	warm := uint32(0)
+	switch {
+	case int64(n) > math.MaxUint32:
+		warm = math.MaxUint32
+	case n > 0:
+		warm = uint32(n)
+	}
+	for {
+		old := l.state.Load()
+		_, out := unpack(old)
+		if l.state.CompareAndSwap(old, pack(warm, out)) {
+			return
+		}
+	}
+}
+
+// reserved is the number of reservations outstanding.
+func (l *ledger) reserved() int {
+	_, out := unpack(l.state.Load())
+	return int(out)
+}
 
 // tryReserve claims one warm sandbox if the report has any left unreserved.
 func (l *ledger) tryReserve(now time.Time) bool {
 	for {
-		n := l.outstanding.Load()
-		if l.warm.Load()-n <= 0 {
+		old := l.state.Load()
+		warm, out := unpack(old)
+		if out >= warm {
 			return false
 		}
-		if l.outstanding.CompareAndSwap(n, n+1) {
+		if l.state.CompareAndSwap(old, pack(warm, out+1)) {
 			break
 		}
 	}
@@ -121,7 +149,7 @@ func (l *ledger) addCarry(sec, n uint32) {
 // straddling is kept until the next poll.
 func (l *ledger) clearBefore(cutoff time.Time) {
 	sec := epoch(cutoff)
-	var freed int64
+	var freed uint32
 	drop := func(w *atomic.Uint64) {
 		for {
 			old := w.Load()
@@ -130,7 +158,7 @@ func (l *ledger) clearBefore(cutoff time.Time) {
 				return
 			}
 			if w.CompareAndSwap(old, 0) {
-				freed += int64(c)
+				freed += c
 				return
 			}
 		}
@@ -139,13 +167,24 @@ func (l *ledger) clearBefore(cutoff time.Time) {
 		drop(&l.buckets[i])
 	}
 	drop(&l.carry)
-	l.outstanding.Add(-freed)
+	if freed == 0 {
+		return
+	}
+	for {
+		// Never below zero: every count in a bucket was first added here.
+		old := l.state.Load()
+		warm, out := unpack(old)
+		if l.state.CompareAndSwap(old, pack(warm, out-freed)) {
+			return
+		}
+	}
 }
 
 // available is the report's warm capacity less outstanding reservations.
 func (l *ledger) available() int {
-	if w := l.warm.Load() - l.outstanding.Load(); w > 0 {
-		return int(w)
+	warm, out := unpack(l.state.Load())
+	if out >= warm {
+		return 0
 	}
-	return 0
+	return int(warm - out)
 }

@@ -251,6 +251,13 @@ func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
 		// another request claimed a sandbox, so this converges; the bound only
 		// caps latency, and past it the decision stands as a cold placement.
 		if attempt == maxPlacementAttempts {
+			// Recorded as one too: the snapshot still shows the warm sandbox
+			// this placement lost, and the warm label must not count it.
+			for i := range candidates {
+				if candidates[i].Provider == decision.Provider {
+					candidates[i].WarmCapacity = 0
+				}
+			}
 			break
 		}
 		candidates = s.Registry.Snapshot()

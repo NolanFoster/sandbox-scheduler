@@ -110,7 +110,7 @@ func (e *entry) setReport(rep Report, at, cutoff time.Time) {
 	e.lastErr = nil
 	// Capacity first: until the old reservations are cleared, the new report
 	// is understated, never overstated.
-	e.ledger.warm.Store(int64(rep.WarmCapacity))
+	e.ledger.setWarm(rep.WarmCapacity)
 	e.ledger.clearBefore(cutoff)
 }
 
@@ -423,7 +423,7 @@ func (r *Registry) Statuses() []Status {
 			Stale:     e.everReported && age > r.staleAfter,
 			Age:       age,
 			Report:    e.report,
-			Reserved:  int(e.ledger.outstanding.Load()),
+			Reserved:  e.ledger.reserved(),
 			Config:    e.config,
 			LastError: e.lastErr,
 		})
