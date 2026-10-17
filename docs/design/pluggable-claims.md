@@ -1,367 +1,490 @@
 # Pluggable claims: placing *and* provisioning sandboxes beyond Kubernetes
 
-Status: **draft for review**. Nothing here is implemented.
+Status: **draft v2, revised after review** (OSS compatibility, scalability,
+Kubernetes practices, Go practices). Nothing here is implemented. Section 12
+records what changed from v1 and why.
 
 ## 1. Summary
 
 Today the scheduler answers "where should this sandbox go?" (`POST /schedule`)
 and the caller creates the sandbox. This plan adds an optional second step: the
 scheduler makes the claim on the chosen provider and, if that provider refuses,
-tries the next one, through a pluggable `Binder` interface that a Kubernetes
-cluster and a hosted API (E2B, Daytona, Modal, Fly) can both implement.
+tries the next one, through a pluggable interface that a Kubernetes cluster and
+a hosted API (E2B, Daytona, Modal, Fly) can both implement.
 
 Decide-only stays the default and stays unchanged. Claiming is opt-in per
-deployment and per provider.
+deployment (`--enable-claims`) and per provider (`spec.claims.enabled`).
 
 ## 2. Goals and non-goals
 
 Goals
 
 1. One provider-neutral API to obtain a sandbox from any configured provider.
-2. Automatic spill to the next-best provider when a claim is refused, with no
-   duplicate sandboxes.
-3. Providers plug in through a small, stable interface, first in-process (Go),
-   later out-of-process (gRPC), without changing the core.
-4. Keep the properties that exist today: placement decisions are in-memory and
-   sub-millisecond; the scheduler stores no per-sandbox state; a provider's
-   self-reported facts never drive placement.
+2. Spill to the next-best provider when a claim is refused, with no duplicate
+   sandboxes, including across scheduler failover and client retries.
+3. Providers plug in through a small interface, defined once as protobuf and
+   implemented in-process (Go) or out-of-process (gRPC sidecar).
+4. Keep today's properties: decisions are in-memory and sub-millisecond; the
+   scheduler stores no per-sandbox state; self-reported provider facts never
+   drive placement.
 
-Non-goals (this plan)
+Non-goals
 
-- Data plane: exec, file transfer, port access. Handles carry provider-native
-  connection details through untouched.
-- Suspend/resume. On agent-sandbox this is `Sandbox.spec.operatingMode` in the
-  owning cluster and needs no placement.
-- Lifecycle tracking or a placement database. The scheduler keeps no record of
-  sandboxes it created.
-- The marginal-cost scorer (sunk-cost capacity vs per-second billing). It is
-  needed for cost-led multicloud placement but is a separate plan; this plan
-  only adds the capacity fields it will need (section 5.4).
+- Data plane (exec, files, ports). Handles pass provider-native connection
+  details through untouched.
+- Suspend/resume. On agent-sandbox it is `Sandbox.spec.operatingMode` in the
+  owning cluster and needs no placement. On Substrate, resume *is* a scheduling
+  decision (worker selection inside its control plane); resuming an actor in a
+  different cluster is out of scope here, not unnecessary.
+- Lifecycle tracking or a placement database.
+- The marginal-cost scorer (sunk-cost capacity vs per-second billing). Separate
+  plan; no billing field is added until it lands.
 
 ## 3. Current state (main @ 2bbbd7d)
 
-- `pkg/adapter`: name-keyed registry (`Register(name, Factory)`), where
-  `Factory func(Config) (registry.Source, error)` and `registry.Source` is
-  `ProviderID() string` + `Fetch(ctx) (Report, error)`. One adapter exists:
-  `agent-sandbox`, which reads `GET <endpoint>/warmpool` from an
-  **operator-owned gateway** (not an upstream component) with a bearer token.
-- `pkg/registry`: polls sources off the decision path; `Snapshot()` is a
-  lock-free read; `TryReserveWarm(provider)` atomically reserves one warm
-  sandbox; `RecordColdPlacement` feeds power-of-two-choices tie-breaking.
-- `pkg/framework` / `pkg/plugins`: filter/score profile, pure functions.
-- `pkg/scheduler`: `POST /schedule` decides, reserves (re-deciding when a
-  reservation loses a race), responds with provider + endpoint. `GET
-  /providers`. Bearer-token auth. Served by the elected leader only.
-- API: `SandboxProvider` (cluster-scoped; adapter, endpoint, credentialsRef,
-  attributes, costPerHour, refreshInterval, disabled) and
-  `SandboxPlacementPolicy`, group `placement.agents.x-k8s.io/v1alpha1`.
+- `pkg/adapter`: name-keyed registry; `Factory func(Config) (registry.Source,
+  error)`. One adapter, `agent-sandbox`, reading `GET <endpoint>/warmpool` from
+  an **operator-owned gateway** (not an upstream component).
+- `pkg/registry`: polling off the decision path; lock-free `Snapshot()`;
+  atomic `TryReserveWarm`; `RecordColdPlacement` for power-of-two-choices.
+- `pkg/scheduler`: `POST /schedule`, `GET /providers`; bearer token; leader-only
+  serving via pod label.
+- API group `placement.agents.x-k8s.io/v1alpha1` (see 10.1).
+- Module pins k8s.io/* v0.36 and controller-runtime v0.24.1; upstream
+  agent-sandbox (`sigs.k8s.io/agent-sandbox` @ e0b002e) requires v0.37.1 and
+  v0.25.1.
 
-## 4. Architecture
+**Existing issue found in review, fixed first (phase 0):** the chart's
+ClusterRole grants cluster-wide `get/list/watch` on Secrets and the manager sets
+no cache restriction, so the reconciler's cached Secret reads start a
+cluster-wide Secret informer: every Secret in the cluster is held in memory by
+a process that serves HTTP, although only `--secret-namespace` is ever read.
 
-```
-            POST /schedule (unchanged)            POST /v1alpha1/sandboxes (new)
-                     │                                       │
-                     ▼                                       ▼
-   registry.Snapshot ─► framework.Profile ─► reserve ─► [binder loop] ─► adapter.Binder.Claim
-                                                         │  error kind decides:
-                                                         │  next candidate / same provider / fail
-                                                         ▼
-                                                      Handle{provider, id, endpoint, connect}
-```
+## 4. Ecosystem alignment
 
-The decision path is shared and unchanged. The binder loop is new code in a new
-package (`pkg/binder`) and is the only place that performs provider I/O on the
-request path.
+| Upstream work | Relationship |
+|---|---|
+| agent-sandbox v1beta1 (`SandboxClaim`, `SandboxWarmPool`) | The `agent-sandbox` binder creates `SandboxClaim`s with `warmPoolRef`; reuses the Go SDK's deterministic `ClaimName` + `AdoptExisting` convention. |
+| KEP-1434 multi-cluster fleet (implementable) | 1434 decides **which cluster holds which warm pools** (minutes); this project decides **which provider serves each request** (milliseconds), across clusters *and* hosted APIs. A `fleet` capacity adapter reads 1434 capacity reports instead of a private gateway endpoint. Positioned as the cross-provider router above 1434, not an alternative. |
+| SIG-Multicluster ClusterProfile (KEP-4322) | Preferred source of cluster access for the kubeapi transport (`spec.clusterProfileRef`, access providers / credential plugins). Raw kubeconfig Secrets are a fallback. |
+| Substrate | Named as a target provider (capacity = idle-worker headroom from `ate-api-server`; claim = create actor). Its out-of-process `objectstore.v1` sidecar is precedent for 5.10. |
+
+The custom gateway `POST /claims` contract from v1 is dropped as a first-class
+transport; operators with a gateway can implement the gRPC adapter protocol
+(5.10) instead of a second bespoke HTTP contract.
 
 ## 5. Design
 
-### 5.1 Adapter interfaces (`pkg/adapter`)
+### 5.1 Adapter contract (`pkg/provider`, new leaf package)
 
-`Source` (capacity) stays mandatory. Claiming is a set of **optional**
-interfaces the same value may implement, discovered by type assertion (the
-`http.Flusher` pattern), so an adapter can ship capacity-only first:
+A new package with **standard-library imports only**, so out-of-tree adapters
+depend on a small surface and later changes cannot create import cycles
+(`pkg/adapter` imports `pkg/registry` today). `pkg/registry` keeps
+`type Source = provider.Source` for compatibility.
+
+Capabilities are explicit fields, not discovered by type assertion: a decorator
+(metrics, retries) wrapping a `Source` would silently hide an asserted
+`Binder`.
 
 ```go
-// Binder claims and releases sandboxes on one provider.
+// Package provider is the contract between the scheduler and a provider
+// adapter.
 //
-// Claim must be idempotent on req.Key: a second call with the same key returns
-// the same sandbox (or an equivalent "already exists" Handle), never a second
-// one. An adapter that cannot guarantee this must not implement Binder.
+// Experimental: this API may change incompatibly until a non-Kubernetes
+// adapter has implemented it (see docs/design/pluggable-claims.md, phase 5).
+package provider
+
+type Provider struct {
+    Source Source      // required: capacity
+    Binder Binder      // nil: decide-only provider
+    Lister OwnedLister // nil: relies on provider-native expiry
+}
+
 type Binder interface {
+    // Claim must be idempotent on req.Key: repeating it returns the same
+    // sandbox. Implementations that cannot guarantee this must not be Binders.
     Claim(ctx context.Context, req ClaimRequest) (Handle, error)
+    // Lookup returns the sandbox previously claimed with key, or ErrNotFound.
+    // It is what makes failover and client retries safe without server state.
+    Lookup(ctx context.Context, key string) (Handle, error)
+    // Release must work from Provider and ID alone, and returns nil when the
+    // sandbox is already gone.
     Release(ctx context.Context, h Handle) error
 }
 
-// OwnedLister lets the reaper find sandboxes this scheduler created. Optional;
-// required only for providers without a native TTL.
 type OwnedLister interface {
-    ListOwned(ctx context.Context, owner string) ([]Handle, error)
+    // ListOwned is paged; pageToken "" starts, a returned "" ends.
+    ListOwned(ctx context.Context, owner, pageToken string, limit int) (hs []Handle, next string, err error)
 }
-```
 
-Types are plain data so they map 1:1 onto protobuf later (section 5.10):
-
-```go
 type ClaimRequest struct {
-    Template string            // provider-neutral name; mapped per provider (5.3)
-    Key      string            // idempotency key, [a-z0-9-]{1,40}, from the caller
-    Owner    string            // scheduler instance identity, for the reaper
-    Labels   map[string]string // caller labels, validated + prefixed
-    TTL      time.Duration     // 0 = provider default; upper bound on lifetime
+    Template string            // provider-neutral name (5.3)
+    Key      string            // idempotency key, validated by Validate
+    Owner    string            // scheduler instance identity (5.9)
+    Labels   map[string]string // caller labels; nil and empty are equivalent
+    TTL      time.Duration     // always > 0 after Validate (5.9)
 }
+
+func (r ClaimRequest) Validate() error // key regex, label domains, TTL bounds
 
 type Handle struct {
-    Provider  string            // SandboxProvider name
-    ID        string            // provider-native identifier
-    Endpoint  string            // where to connect, if the provider has one
-    Connect   map[string]string // provider-native connection details (opaque)
-    ExpiresAt *time.Time        // when the provider will reclaim it, if known
+    Provider  string
+    ID        string
+    Endpoint  string
+    Connect   map[string]string // provider-native, documented per adapter
+    ExpiresAt time.Time         // zero = unknown
 }
 ```
+
+`Factory` becomes `func(Config) (provider.Provider, error)`, changed now while
+one in-tree adapter exists. No JSON tags on these types; wire types live in
+`pkg/scheduler`. The same messages are defined in `proto/adapter/v1alpha1`
+from phase 1 so in-process and gRPC adapters share one contract.
 
 ### 5.2 Error taxonomy
 
-The binder loop is generic only if every adapter maps its failures onto a fixed
-set of kinds. Adapters return `*adapter.ClaimError{Kind, Err}`; the core uses
-`errors.As` and never inspects provider-specific errors.
+```go
+type Kind int
 
-| Kind | Meaning | Binder loop action | HTTP if final |
+const (
+    KindUnknownOutcome Kind = iota // zero value: the safe default
+    KindNoCapacity
+    KindUnavailable
+    KindRejected
+    KindBusy        // provider rate-limited us; honour RetryAfter
+)
+
+type ClaimError struct {
+    Kind       Kind
+    RetryAfter time.Duration
+    Err        error
+}
+
+func NoCapacity(err error) error  // constructors so authors never hand-build
+func Unavailable(err error) error
+func Rejected(err error) error
+func Busy(after time.Duration, err error) error
+func KindOf(err error) Kind       // errors.As; anything unclassified → KindUnknownOutcome
+```
+
+**Unclassified errors, a missing `Kind`, and panics in `Claim` are all
+`UnknownOutcome`**, the one kind that never spills and so never duplicates.
+
+| Kind | Meaning | Binder loop | Final HTTP |
 |---|---|---|---|
-| `NoCapacity` | Pool empty, quota or rate limit | Mark provider empty in this request's candidate copy; next candidate | 409 with per-provider reasons |
-| `Unavailable` | Failed **before** the request could have taken effect (dial, 5xx without side effect, timeout before send) | Next candidate; feed a passive health signal (5.8) | 503 |
-| `Rejected` | Permanent for this request on this provider (unknown template, auth) | Next candidate; surface as config error in metrics and provider status | 422 if all rejected |
-| `UnknownOutcome` | Timed out or connection lost **after** sending | Retry the **same provider with the same key** up to `--claim-retries` within the deadline; never spill | 504 with `provider` set, so a client retry can stay on it |
+| `UnknownOutcome` | Sent, outcome unknown; or unclassified | `Lookup`, then retry same provider + key within budget; never spill | 504 `{provider}` |
+| `NoCapacity` | Provider confirmed it cannot serve | Mark provider refused **globally** for `--refusal-ttl` (1s); next candidate | 409 with reasons |
+| `Busy` | Provider rate limit (e.g. 429) | Cooldown for `RetryAfter`; next candidate | 429 + `Retry-After` |
+| `Unavailable` | Failed provably before taking effect | Release reservation; health signal (5.8); next candidate | 503 |
+| `Rejected` | Permanent for this provider (unknown template, auth) | Release reservation; config-error metric + `Claiming` condition; next candidate | 422 if all rejected |
 
-Rule of thumb for adapter authors: if you cannot prove the provider did not act,
-it is `UnknownOutcome`.
+agent-sandbox never refuses for capacity: an empty warm pool cold-starts the
+claim (`sandboxclaim_controller.go`, "Cold path"). For that adapter, warm vs
+cold is decided by the existing reservation before the claim, and a cold start
+is a success. Requests may set `"warmOnly": true`, in which case a provider
+whose reservation fails is skipped without a claim.
 
 ### 5.3 Templates by reference
 
-Callers name a template; each provider maps names to its native form. New
-optional spec field:
-
-```yaml
-spec:
-  templates:
-    python-gvisor: python-gvisor          # agent-sandbox: SandboxTemplate name
-    node-gvisor: node-gvisor
-# on an E2B provider:
-#   python-gvisor: 3k9x2...               # E2B template ID
-```
-
-- New filter plugin `TemplateAvailable`: drops candidates whose `templates`
-  lacks the requested name. Added to the default profile only when a template
-  is requested, so `/schedule` behaviour is unchanged.
-- Template names follow DNS-1123 label rules; values are adapter-validated.
-- Spec passthrough (callers sending a full sandbox spec) is explicitly out of
-  scope: it forces the core to model every provider's spec format.
-
-### 5.4 Capacity for elastic providers
-
-Hosted APIs have no warm count; they accept or rate-limit. `registry.Report`
-gains:
-
 ```go
-Elastic bool // capacity is effectively unbounded; WarmCapacity is ignored
+// +listType=map
+// +listMapKey=name
+// +kubebuilder:validation:MaxItems=256
+Templates []TemplateMapping `json:"templates,omitempty"`
+
+type TemplateMapping struct {
+    // +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+    // +kubebuilder:validation:MaxLength=63
+    Name string `json:"name"`
+    // Provider-native reference: a SandboxWarmPool name for agent-sandbox
+    // (cold-only use is a pool with replicas: 0), a template ID elsewhere.
+    // +kubebuilder:validation:MaxLength=253
+    Ref string `json:"ref"`
+}
 ```
 
-- Elastic providers appear in snapshots with `Elastic=true`; `WarmCapacity`
-  scores them as a fixed configurable value (default: the saturation point,
-  since a hosted API "has warm capacity" in the sense that matters — its start
-  latency), and `TryReserveWarm` always succeeds.
-- `SandboxProviderSpec.billing: Provisioned | PerUse` (default `Provisioned`)
-  is added now, unused by scoring until the marginal-cost plan lands, so the
-  CRD change happens once.
+- Mappings stay on the provider (they are inherently per provider; a separate
+  CRD adds a cross-object reference for little gain).
+- New filter `TemplateAvailable`, added to the profile only when a template is
+  requested, so `/schedule` is unchanged.
 
-### 5.5 API
+### 5.4 Elastic providers
 
-New endpoints, versioned in the path (the existing ones stay unversioned for
-compatibility, and are aliased under `/v1alpha1/` too):
+`provider.Report` gains `Elastic bool`. Elastic providers:
+
+- score `spec.claims.elasticWarmScore` (default **20 of 100**), not saturation:
+  at saturation an elastic provider (5×100+3×0+3×100 = 800) beat every cold
+  cluster (≤ 600) at any price and absorbed all overflow at per-use rates;
+- are rate-bounded by `spec.claims.maxRate` (token bucket), so they take a
+  bounded share of a burst;
+- record cold placements (they are cold starts), so spreading between elastic
+  providers works.
+
+### 5.5 HTTP API
+
+Versioned separately from the CRD: `/api/v1alpha1/...`. The unversioned
+`/schedule` and `/providers` are aliased under it and kept until v1beta1, with
+removal announced one minor release ahead.
 
 ```
-POST   /v1alpha1/sandboxes
-  { "template": "python-gvisor", "key": "run-42-step-7",
-    "labels": {...}, "requires": {...}, "preferProvider": "civo",
-    "ttlSeconds": 3600, "timeoutSeconds": 30 }
-  201 { "provider": "civo", "id": "...", "endpoint": "...", "connect": {...},
-        "expiresAt": "...", "attempts": [ {provider, outcome, ms}, ... ],
-        "explanation": "..." }
-  200 same body when the key already existed on that provider (idempotent replay)
+POST /api/v1alpha1/sandboxes
+  { "template", "key", "labels", "requires", "preferProvider", "pinProvider",
+    "warmOnly", "ttlSeconds", "timeoutSeconds" }
+  201 created | 200 idempotent replay (same key, same spec)
+  409 no capacity | 409 KeyConflict (same key, different spec)
+  422 all rejected | 429 busy (+Retry-After, jittered) | 504 unknown {provider}
 
-DELETE /v1alpha1/sandboxes/{provider}/{id}
-  204 | 404 (already gone, treated as success by clients) | 502/503
+DELETE /api/v1alpha1/sandboxes/{provider}/{id}
+  204 | 404 (gone; success for clients)
 ```
 
-- `key` is **required**. A request without one is rejected (400): claiming
-  without idempotency is the one way this feature creates leaks.
-- Cross-request idempotency without server state: on `UnknownOutcome` the 504
-  body names the provider; the client SDK retries with `pinProvider` set, which
-  turns the request into "claim on this provider or fail". This keeps the
-  scheduler stateless at the cost of a client contract (open question 10.1).
-- Auth: the same bearer token scheme, but a **separate token** for claim
-  endpoints (`PLACEMENT_CLAIM_TOKEN`), since claiming spends money and
-  `/schedule` does not. Per-tenant authorization is out of scope.
+- `key` required; claims without idempotency are rejected (400).
+- Separate token `PLACEMENT_CLAIM_TOKEN` (existing-Secret pattern,
+  constant-time compare).
+- Idempotency window = lifetime of the provider object. Documented: a replay
+  after the sandbox expired creates a new one.
 
 ### 5.6 Binder loop (`pkg/binder`)
 
 ```
-deadline := min(request timeout, --claim-timeout)
-excluded := {}
-loop:
-  decision := profile.Schedule(candidates minus excluded)      // pure, in-memory
-  if none: return 409/422/503 per collected outcomes
-  reserve warm (existing TryReserveWarm / RecordColdPlacement)
-  acquire per-provider in-flight slot (5.7) or treat as NoCapacity
-  h, err := binder.Claim(ctx with per-attempt timeout, req)
-  switch kind(err):
-    nil:            return 201 h
-    NoCapacity:     zero provider's warm in local copy; excluded += provider
-    Unavailable:    excluded += provider; health.observe(provider, fail)
-    Rejected:       excluded += provider; record config error
-    UnknownOutcome: retry same provider, same key, until retries/deadline;
-                    then return 504 {provider}
+reqDeadline := min(timeoutSeconds, --claim-timeout)
+if retry or pinProvider: h := Lookup(key) on pinned/all claim-capable
+                         candidates (parallel, bounded); found → 200
+for attempt := 0; attempt < --max-spill (3); attempt++:
+  if client gone: stop spilling (an in-flight attempt still completes)
+  decision := Schedule(candidates − excluded − globally refused)
+  if none: return per collected outcomes
+  slot := acquire provider slot, waiting until reqDeadline     // bulkhead
+           timeout → excluded += provider (busy, not empty)
+  reserve warm/cold (existing ledger)                           // after the slot
+  h, err := Claim(attempt ctx, req)                             // 5.7
+  switch KindOf(err) { ... per 5.2 ... }
+  release slot
+if every exclusion was busy: 429 with jittered Retry-After
 ```
 
-- Bounded: at most one attempt per provider plus `--claim-retries` on the
-  provider with an unknown outcome; the deadline bounds wall time.
-- A reservation taken for a refused claim is **kept** until the next poll (the
-  existing conservative rule: under-count rather than over-place).
-- Decisions remain explainable: the response lists every attempt and outcome.
+- Slot before reservation: refusals that never reach a provider no longer
+  drain its ledger.
+- New `registry.ReleaseReservation(provider)` (CAS decrement of the ledger
+  state and bucket) for `Busy`, `Unavailable`, `Rejected` and bulkhead
+  timeouts; reservations are kept only for `NoCapacity` and `UnknownOutcome`.
+- A provider-confirmed refusal is recorded **globally** for `--refusal-ttl`, so
+  a fleet-wide shortage costs one refused call per provider per TTL, not one per
+  request per provider.
+- Retries (`UnknownOutcome`) use full-jitter exponential backoff (100 ms base,
+  2 s cap) and a per-provider retry budget (≤ 10% of claims, token bucket).
 
-### 5.7 Concurrency, limits, timeouts
+### 5.7 Concurrency, timeouts, transports, shutdown
 
-- Per-provider in-flight semaphore (`spec.claims.maxInFlight`, default 64): a
-  slow provider cannot absorb all request goroutines; a full semaphore counts
-  as `NoCapacity` for that request (bulkhead).
-- Global in-flight cap (`--claim-max-inflight`, default 1024); beyond it the
-  endpoint sheds load with 429 + `Retry-After`.
-- Per-attempt timeout per provider (`spec.claims.timeout`, default 10s);
-  request deadline from `timeoutSeconds` capped by `--claim-timeout`.
-- `http.Server` gains `WriteTimeout`/`IdleTimeout` sized above the claim
-  deadline (today only `ReadHeaderTimeout` is set).
-- All provider I/O uses the request context; client disconnect cancels the
-  attempt (which an adapter must then report as `UnknownOutcome` if it had
-  already sent).
+- Each attempt runs on `context.WithTimeout(context.WithoutCancel(reqCtx),
+  perAttempt)`: a client disconnect stops spilling but never abandons a claim
+  mid-flight (the key makes the result recoverable via replay).
+- Detached attempts are tracked in a `sync.WaitGroup`; shutdown and
+  leadership loss wait up to the claim deadline.
+- Per-attempt timeout default **3s** (`spec.claims.timeout`, CEL-bounded
+  1s–5m).
+- `spec.claims.maxInFlight` default sized from measured latency: upstream
+  measures claim p90 of 0.2s (warm burst) to ~1.0s (sustained with refill), so
+  ~300 claims/s per cluster needs ≈ 300 × 1.0 × 1.5 ≈ **450** in flight at the
+  slow end. Default 256, bounds 1–4096; an adaptive (AIMD) limit is a later
+  option.
+- Global cap `--claim-max-inflight` (default 2048) → 429.
+- Per-provider transports: client-go QPS/burst set ≥ maxInFlight
+  (`--remote-qps`, `--remote-burst`; defaults 5/10 would cap claims at ~5/s);
+  hosted APIs get their own `http.Transport` with `MaxIdleConnsPerHost =
+  MaxConnsPerHost = maxInFlight` and HTTP/2 where offered.
+- Kubernetes: binding detected via one shared, owner-label-filtered informer
+  per remote namespace on the leader, not a GET or watch per claim; an example
+  FlowSchema for the scheduler's remote identity is shipped (upstream's APF
+  overlay covers only its own controller).
+- Shutdown: HTTP shutdown timeout = claim timeout + 5s; chart sets
+  `terminationGracePeriodSeconds` ≥ preStop + claim timeout + 10s and a native
+  `preStop.sleep` of 5s (the image has no shell).
 
 ### 5.8 Health from claims
 
-A claim outcome is a fresher signal than a 10s poll. `registry` gains
-`ObserveClaim(provider, ok bool)`; N consecutive `Unavailable` outcomes mark the
-provider unreachable until the next successful poll or claim. This is a
-demotion (Reachability scorer), consistent with the existing "stale demotes,
-never removes" rule.
+Claim health is tracked separately from poll health: a windowed error ratio
+(≥ 50% `Unavailable` over ≥ 20 attempts) demotes the provider's claim path;
+recovery is through half-open probes with exponential backoff, not the next
+poll, so a healthy `/warmpool` cannot flap a broken claim path every 10s.
+Readiness never depends on claim outcomes.
 
-### 5.9 Ownership and cleanup
+### 5.9 Ownership, expiry and cleanup
 
-- Every claimed sandbox carries `placement.agents.x-k8s.io/owner=<owner>` and
-  `.../key=<key>` (as labels, annotations or provider tags).
-- Prefer provider-native expiry: agent-sandbox `SandboxClaim.spec.lifecycle`
-  (shutdown time + policy); hosted APIs' timeout parameters.
-- For providers without native expiry, a leader-only reaper uses `OwnedLister`
-  to delete owned sandboxes past `ExpiresAt`. The reaper never deletes anything
-  without the owner label, and has a dry-run mode.
-- `Owner` defaults to the Helm release fullname, so two scheduler installs never
-  reap each other's sandboxes.
+- **Owner** = short hash of (release fullname, namespace, `kube-system`
+  namespace UID); the readable name goes in an annotation. Two installs with the
+  default release name in different clusters cannot reap each other.
+- Owner and key are **labels on the provider object only** (selectors);
+  `placement.agents.x-k8s.io/spec-hash` (template, labels, TTL bucket) is an
+  annotation. Caller labels that reach pods must use upstream's allowlisted
+  domain (default `sandbox.users.io`) and are validated up front.
+- **Expiry is always bounded**: `TTL` defaults to and is capped by
+  `--claim-max-ttl`. agent-sandbox claims always set `lifecycle.shutdownTime =
+  now + TTL`, `shutdownPolicy: Delete` (upstream defaults to `Retain`, which
+  leaves claims forever) and `ttlSecondsAfterFinished`.
+- **Reaper** only for providers without native expiry: leader-only runnable;
+  paged `ListOwned` (500/page, server-side selector, metadata-only on
+  Kubernetes); per-object deletes with UID/resourceVersion preconditions, never
+  DeleteCollection; skips objects already deleting; token-bucket rate limit and
+  `--reap-max-per-cycle` circuit breaker; server-side `DryRun: All` mode with an
+  Event. No finalizers.
 
-### 5.10 Out-of-process adapters (later phase)
+### 5.10 Out-of-process adapters
 
-- A `grpc` adapter that speaks a small protobuf service mirroring 5.1/5.2
-  (`Fetch`, `Claim`, `Release`, `ListOwned`) to a sidecar over a Unix socket;
-  `spec.adapter: grpc`, `spec.endpoint: unix:///var/run/adapters/e2b.sock`.
-- Each sidecar holds only its own provider's credentials — the main reason to
-  do this, since claiming otherwise concentrates write credentials for every
-  provider in one process.
-- Versioned proto package (`adapter.v1`), capability negotiation via a
-  `GetInfo` RPC (supports_claim, supports_list_owned, elastic).
+- `proto/adapter/v1alpha1`: `GetInfo` (capabilities: claim, lookup, list,
+  elastic), `Fetch`, `Claim`, `Lookup`, `Release`, `ListOwned`; published as its
+  own Go module once stable; deprecation policy stated before v1.
+- `spec.adapter: grpc`, `spec.endpoint: unix:///var/run/adapters/<name>.sock`.
+- Pod hardening so each sidecar holds only its own credentials:
+  `automountServiceAccountToken: false` with a projected token for the
+  scheduler container only; sidecar Secrets outside the namespace the scheduler
+  can read; socket in an `emptyDir`, mode 0660, distinct `runAsUser` per
+  sidecar; the chart's restricted `securityContext` copied.
+- `adaptertest` is importable and can run against a socket, so third parties
+  can certify adapters.
 
-### 5.11 agent-sandbox Binder
+### 5.11 agent-sandbox binder
 
-The existing adapter reads an operator-owned gateway, not the Kubernetes API.
-Two transports, chosen per provider by an option:
-
-- **gateway** (default): requires the gateway to expose
-  `POST /claims {template, key, labels, ttlSeconds}` and `DELETE /claims/{id}`.
-  The gateway is the operator's code; this plan specifies the contract and
-  ships a reference handler, not a gateway.
-- **kubeapi**: credentials Secret holds a kubeconfig; the adapter creates a
-  `SandboxClaim` (`extensions.agents.x-k8s.io/v1beta1`) named
-  `sc-<hash(key)>` in a configured namespace with `sandboxTemplateRef` from the
-  template mapping and `lifecycle` from `TTL`. `AlreadyExists` on create =
-  idempotent replay (fetch and return). Uses a typed client from upstream's
-  generated clientset, not dynamic unstructured objects.
-
-`Claim` returns when the claim is **accepted** (created and bound to a
-sandbox), not when the sandbox is Ready; `Connect` carries the router headers
-(`X-Sandbox-ID`, `X-Sandbox-Namespace`). Waiting for readiness is the caller's
-job, against the provider, as today.
+- **Access**, in order of preference: ClusterProfile access providers →
+  workload-identity federation → kubeconfig Secret. Kubeconfigs are parsed with
+  `clientcmd.Load` and rejected if they use `exec`, `auth-provider`,
+  `tokenFile` or client-certificate file paths. The client is rebuilt when the
+  Secret's resourceVersion changes, closing the old transport. Remote RBAC:
+  namespaced Role, `sandboxclaims: create,get,list,watch,delete`.
+- **Options** are typed (`spec.kubeapi.namespace`), not annotations.
+- **Claim**: `SandboxClaim` named `sc-` + first 20 hex of
+  sha256(owner + "/" + key) (starts with a letter, ≤ 63, DNS-1035-safe for the
+  derived Sandbox/Service names), `warmPoolRef` from the template mapping,
+  lifecycle per 5.9, owner/key labels, spec-hash annotation.
+- **Replay** on `AlreadyExists`: live claim with matching spec-hash → 200;
+  different hash → 409 `KeyConflict`; deleting or expired → `Rejected`.
+- **Bound** when `status.sandbox.name` is set (there is no Bound condition);
+  `Connect` carries `X-Sandbox-ID` (the Sandbox name) and
+  `X-Sandbox-Namespace`.
+- **Dependency**: importing upstream's generated clientset pulls the root module
+  `sigs.k8s.io/agent-sandbox` and upgrades this repo to k8s.io v0.37 /
+  controller-runtime v0.25. Done as its own PR pinned to a tagged upstream
+  release, with a version matrix in the README.
 
 ## 6. Phases
 
-Each phase is one PR, independently shippable, with `--enable-claims` (default
-false) gating everything user-visible until phase 4.
+Each phase is one PR. `--enable-claims` stays off by default until after
+phase 5.
 
-1. **Interfaces and taxonomy.** `Binder`, `OwnedLister`, `ClaimRequest`,
-   `Handle`, `ClaimError` + kinds in `pkg/adapter`; a fake binder for tests;
-   docs for adapter authors. No behaviour change.
-2. **API fields.** `spec.templates`, `spec.claims{enabled,maxInFlight,timeout}`,
-   `spec.billing`; `Report.Elastic`; `TemplateAvailable` filter; CRD regen.
-   Additive only.
-3. **Binder loop and endpoints.** `pkg/binder`, `POST/DELETE /v1alpha1/sandboxes`,
-   limits, metrics (`claim_attempts_total{provider,outcome}`,
-   `claim_duration_seconds{provider}`, `claim_spills_total`), health from
-   claims. Leader-only, like `/schedule`.
-4. **agent-sandbox Binder** (kubeapi transport first; gateway contract
-   documented). Flip `--enable-claims` default only after a real-cluster test.
-5. **First hosted adapter** (E2B or Daytona): capacity (`Elastic`) + `Binder` +
-   native TTL. Revise 5.1/5.2 if it does not fit — before declaring the
-   interface stable.
-6. **Reaper** for providers without native expiry.
-7. **gRPC adapter protocol** and sidecar packaging in the chart.
-
-Phase 5 is the validation gate: the interface is not called stable until a
-non-Kubernetes provider implements it.
+0. **Secret scope fix** (independent, ship now): namespace-scoped Secret cache
+   (`cache.Options.ByObject`) and a namespaced Role instead of the cluster-wide
+   Secret rule.
+1. **Contract**: `pkg/provider` (types, `Kind`, constructors, `KindOf`,
+   `Validate`), `Factory` returns `Provider`, `proto/adapter/v1alpha1`,
+   `adaptertest` skeleton, fake binder. No behaviour change.
+2. **API fields**: `templates` list-map, `claims{enabled, maxInFlight, timeout,
+   maxRate, elasticWarmScore}`, `clusterProfileRef`, `kubeapi{namespace}`;
+   `Claiming` condition + `status.claims`; printer columns; status writes on the
+   existing 15s loop via merge patch; `TemplateAvailable` filter.
+3. **Binder loop and endpoints**: `pkg/binder`, `/api/v1alpha1/sandboxes`,
+   bulkheads, refusal TTL, retry budget, `ReleaseReservation`, health from
+   claims, metrics (`claim_attempts_total{provider,kind}`,
+   `claim_duration_seconds{provider}`, `claim_spills_total`), shutdown sizing.
+4. **Dependency bump** to upstream's k8s/controller-runtime versions.
+5. **agent-sandbox binder** (5.11) + envtest with upstream CRDs + a real-cluster
+   run.
+6. **First hosted adapter** (Daytona has an Apache-2.0 Go SDK; E2B needs a
+   hand-written REST client), out-of-tree module or sidecar so vendor
+   dependencies stay out of the core. **Interface stability gate.**
+7. **Reaper.**
+8. **gRPC adapter host** and chart sidecar packaging; `fleet` (KEP-1434)
+   capacity adapter.
 
 ## 7. Testing
 
-- Unit: binder loop table tests over every error kind and combination, with a
-  fake clock and fake binders; idempotent replay; deadline expiry mid-loop;
-  semaphore exhaustion.
-- Contract test suite in `pkg/adapter/adaptertest` that every adapter runs:
-  idempotency on key, error-kind classification for injected faults, Release of
-  an unknown ID returns success-equivalent.
-- agent-sandbox kubeapi: envtest with upstream CRDs installed.
-- Race detector on the binder under concurrent claims.
-- Benchmark: decision path latency must not regress (`BenchmarkSchedule`).
+- Binder loop: table tests over every `Kind` and mixed outcomes; deadlines and
+  backoff under `testing/synctest`; concurrent same-key claims under `-race`
+  asserting at most one sandbox; bulkhead saturation returns 429, never 409.
+- `adaptertest.TestBinder(t *testing.T, newHarness func(*testing.T) Harness)`
+  modelled on `testing/fstest`; the harness injects faults the suite cannot
+  reach generically (no capacity, refuse-before-send, drop-after-send, auth).
+- `FuzzValidateKey`, `FuzzLabels`.
+- agent-sandbox: envtest with upstream CRDs; replay with matching and
+  mismatched spec-hash; claims on an empty pool (cold success).
+- Benchmarks: decision path must not regress; binder loop at 10K in-flight
+  fake claims (memory per claim).
+- License check in CI for any adapter dependency.
 
 ## 8. Compatibility and migration
 
-- `/schedule` and `/providers` unchanged; all CRD changes additive within
-  `v1alpha1`; unknown adapters still reported, not rejected.
-- `--enable-claims=false` default; claim endpoints 404 when disabled.
-- RBAC: kubeapi transport needs no new in-cluster RBAC (it uses remote
-  kubeconfigs from Secrets already readable via `credentialsRef`).
+- `/schedule` and `/providers` unchanged (also served under `/api/v1alpha1`).
+- CRD changes additive within v1alpha1; `spec.claims.enabled: true` with the
+  flag off surfaces `Claiming=False, reason DisabledByFlag`.
+- Phase 0 narrows RBAC; installs that point `credentialsRef` at another
+  namespace already fail today (reads are confined to `--secret-namespace`).
 
-## 9. Scalability notes
+## 9. Scalability
 
-- Decision path untouched: still memory-only.
-- Claim throughput is bounded by provider latency × in-flight limits, not CPU;
-  with 64 in flight per provider and ~150 ms warm claims that is ~400 claims/s
-  per provider, above upstream's measured ~300 warm claims/s per cluster.
-- No per-sandbox state in the scheduler; the reaper lists owned sandboxes per
-  provider, paged, on the leader only.
-- Leader-only binding is a phase 3 simplification. Because providers arbitrate
-  claims, the binding endpoint could later run active-active, with reservations
-  as a per-replica hint; deferred until measured need.
+- Decision path unchanged: memory-only, ~20µs/decision.
+- Claim throughput per provider is λ = in-flight / latency. With upstream's
+  measured p90 of 0.2–1.0s, 256 slots give ~250–1,250 claims/s of headroom; the
+  cluster (≈300/s warm, 70–85/s per pool refill) is the limit, not the
+  scheduler.
+- Leader memory: ~50KB per in-flight claim; 10K in flight ≈ 0.5GB.
+- Shortage amplification is bounded: one refused call per provider per
+  `--refusal-ttl`, at most `--max-spill` attempts per request, retries within a
+  10% budget.
+- Leader-only binding is acceptable for throughput; for availability, `Lookup`
+  makes failover safe (a client retry after a reset finds the original sandbox
+  instead of creating a second). Active-active later: reservations as
+  per-replica hints, per-provider limits divided by replica count, keys routed
+  by consistent hash or recovered by `Lookup`.
 
 ## 10. Open questions
 
-1. Cross-request idempotency: is `pinProvider` on client retry acceptable, or
-   should adapters implement `Lookup(key)` so the scheduler can probe all
-   binders on a replayed key (N calls, no client contract)?
-2. Should `Rejected` spill at all, or fail fast so config errors are loud?
-3. Should `Handle.Connect` be typed per adapter (a versioned schema) rather
-   than an opaque map?
-4. Should templates be their own cluster-scoped CRD (`SandboxProfile`) instead
-   of a map on each provider, to avoid repeating mappings?
-5. Is a separate claim token enough, or does claiming need per-tenant quotas
-   before it is enabled anywhere shared?
+1. **API group.** `placement.agents.x-k8s.io` sits in upstream agent-sandbox's
+   namespace and implies endorsement; upstream could add a `placement` subgroup.
+   Options: seek sponsorship from agent-sandbox/SIG-Apps, or rename now (e.g.
+   `placement.sandbox-scheduler.io`) while v1alpha1 makes it cheap. **Owner
+   decision needed before phase 2.**
+2. `Lookup` fan-out on retries with no `pinProvider`: bounded to claim-capable
+   candidates in parallel; acceptable cost, or require clients to send
+   `pinProvider` from the 504?
+3. Per-tenant quotas before enabling claims anywhere shared, or is the separate
+   claim token enough for now?
+4. Should the `fleet` (KEP-1434) adapter replace the gateway `/warmpool`
+   adapter as the recommended agent-sandbox capacity source?
+
+## 11. Review findings not adopted
+
+- *Separate Go module for the adapter contract now* (OSS): deferred until the
+  contract is declared stable at phase 6; a v0 single module avoids release
+  overhead while it still changes. The package is marked experimental instead.
+- *Waiting for a bulkhead slot until the request deadline* (scalability) is
+  adopted, but capped by `--claim-queue-timeout` (default 1s) so a saturated
+  provider cannot hold request goroutines for the full claim timeout.
+
+## 12. Changes from v1
+
+| v1 | v2 | Raised by |
+|---|---|---|
+| `sandboxTemplateRef` on SandboxClaim | `warmPoolRef` (the real v1beta1 field) | OSS, Kubernetes |
+| TTL via lifecycle, default policy | Always bounded `shutdownTime`, `shutdownPolicy: Delete` | OSS, Kubernetes |
+| Replay on AlreadyExists | Spec-hash; `KeyConflict`; deleting/expired → Rejected | Kubernetes |
+| Optional interfaces by type assertion | `Provider{Source, Binder, Lister}` struct | Go |
+| Types in `pkg/adapter` | Stdlib-only leaf `pkg/provider` | Go |
+| Unclassified errors undefined | Zero `Kind` = `UnknownOutcome`; constructors; panics recovered | Go |
+| Client disconnect cancels the attempt | Detached attempt; disconnect stops spill only | Go, Kubernetes |
+| Full bulkhead = NoCapacity (409) | Busy: bounded wait, then 429 | Scalability |
+| Reserve, then acquire slot; keep all reservations | Slot first; release reservations unless NoCapacity/UnknownOutcome | Scalability |
+| Per-request spill on refusal | Global refusal TTL, spill cap, retry budget, jitter | Scalability |
+| maxInFlight 64, timeout 10s, ~400/s claim | 256 / 3s, restated from measured p90 | Scalability |
+| client-go defaults | QPS/burst ≥ maxInFlight; shared informer; FlowSchema | Scalability, Kubernetes |
+| Elastic = saturated warm | Score 20/100 + rate bound | Scalability |
+| N consecutive failures | Windowed ratio + half-open probes | Scalability |
+| `ListOwned` unpaged | Paged; reaper safety rules | Scalability, Kubernetes |
+| Owner = release name | Hash incl. cluster UID | Kubernetes |
+| Kubeconfig Secrets only | ClusterProfile first; exec/file auth rejected; rotation | OSS, Kubernetes |
+| Templates as a map | List-map with validation | Kubernetes |
+| `billing` added early | Dropped until used | Kubernetes |
+| Private gateway `POST /claims` | Dropped; gRPC adapter protocol instead | OSS |
+| No mention of KEP-1434 / ClusterProfile | Ecosystem section; fleet adapter | OSS |
+| gRPC proto at phase 7 | Proto from phase 1 | OSS |
+| `/v1alpha1/` tied to CRD | `/api/v1alpha1/`, deprecation policy | OSS, Kubernetes |
+| — | Phase 0: Secret cache scope fix | Kubernetes |
+| — | Phase 4: k8s/controller-runtime bump for upstream clientset | OSS |
