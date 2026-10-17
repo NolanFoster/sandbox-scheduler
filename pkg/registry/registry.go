@@ -21,6 +21,9 @@
 //     with Reachable=false and its last known capacity, leaving the decision to
 //     policy. Dropping it would make "why wasn't civo considered?"
 //     unanswerable, which is the failure mode operators hate most.
+//
+// One correction is layered on top of the polled reports: placements made since
+// the last poll are subtracted from the capacity a snapshot shows. See Reserve.
 package registry
 
 import (
@@ -90,6 +93,30 @@ type entry struct {
 	// second has capacity worth remembering.
 	everReported bool
 	lastErr      error
+
+	// reservations are the times of placements made against this provider's
+	// warm capacity that its report may not yet reflect. See Reserve.
+	reservations []time.Time
+}
+
+// clearReservations drops reservations made before cutoff, which a report
+// fetched after cutoff already accounts for.
+func (e *entry) clearReservations(cutoff time.Time) {
+	kept := e.reservations[:0]
+	for _, t := range e.reservations {
+		if !t.Before(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	e.reservations = kept
+}
+
+// warm is the report's warm capacity less what has been reserved since.
+func (e *entry) warm() int {
+	if w := e.report.WarmCapacity - len(e.reservations); w > 0 {
+		return w
+	}
+	return 0
 }
 
 // Registry holds current capacity for every known provider.
@@ -108,6 +135,10 @@ type Registry struct {
 	// fetchTimeout bounds a single Source.Fetch.
 	fetchTimeout time.Duration
 
+	// reservationGrace is how long a claim may take to show up in a provider's
+	// report. A poll keeps reservations made within this long of its start.
+	reservationGrace time.Duration
+
 	now func() time.Time
 }
 
@@ -119,6 +150,11 @@ type Options struct {
 	// FetchTimeout defaults to 5s. Generous, because it is off the hot path —
 	// the cost of a slow provider is stale data, not a slow placement.
 	FetchTimeout time.Duration
+	// ReservationGrace defaults to 5s: the time a claim may take to show up in
+	// a provider's report. Too short and a poll that has not yet seen a claim
+	// clears its reservation, letting a burst over-place again; too long and a
+	// claim is counted twice until the next poll, which only spills early.
+	ReservationGrace time.Duration
 	// Now is injectable for tests.
 	Now func() time.Time
 }
@@ -126,17 +162,21 @@ type Options struct {
 // New builds an empty Registry.
 func New(opts Options) *Registry {
 	r := &Registry{
-		entries:      map[string]*entry{},
-		sources:      map[string]Source{},
-		staleAfter:   opts.StaleAfter,
-		fetchTimeout: opts.FetchTimeout,
-		now:          opts.Now,
+		entries:          map[string]*entry{},
+		sources:          map[string]Source{},
+		staleAfter:       opts.StaleAfter,
+		fetchTimeout:     opts.FetchTimeout,
+		reservationGrace: opts.ReservationGrace,
+		now:              opts.Now,
 	}
 	if r.staleAfter <= 0 {
 		r.staleAfter = 30 * time.Second
 	}
 	if r.fetchTimeout <= 0 {
 		r.fetchTimeout = 5 * time.Second
+	}
+	if r.reservationGrace <= 0 {
+		r.reservationGrace = 5 * time.Second
 	}
 	if r.now == nil {
 		r.now = time.Now
@@ -202,6 +242,36 @@ func (r *Registry) Report(providerID string, rep Report) {
 	e.updatedAt = r.now()
 	e.everReported = true
 	e.lastErr = nil
+	e.clearReservations(e.updatedAt.Add(-r.reservationGrace))
+}
+
+// Reserve records a placement against a provider's warm capacity, so the
+// snapshots that follow show one fewer warm sandbox there.
+//
+// Without it, every placement between two polls reads the same capacity and
+// reaches the same answer: a burst of a thousand requests all lands on the
+// provider that looked best at the last poll, long after its warm pool is
+// drained, while warm capacity elsewhere sits idle.
+//
+// A reservation lasts until a poll that started more than ReservationGrace
+// after it succeeds, by which point the report itself reflects the claim.
+// While polls fail, reservations are kept: the claims they stand for are most
+// likely real, and the stale report would otherwise overstate capacity. This
+// also bounds them, since a provider shows no warm capacity once its
+// reservations reach its report, and callers only reserve warm capacity.
+//
+// The error this can make is double counting a claim the report already
+// reflects, for at most one poll. That shows a provider emptier than it is,
+// which spills placements early rather than piling them onto a drained pool.
+func (r *Registry) Reserve(providerID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.entries[providerID]
+	if !ok {
+		// Removed since the snapshot was taken; nothing left to correct.
+		return
+	}
+	e.reservations = append(e.reservations, r.now())
 }
 
 // Refresh polls every registered source once, concurrently.
@@ -224,6 +294,7 @@ func (r *Registry) Refresh(ctx context.Context) {
 			defer wg.Done()
 			fetchCtx, cancel := context.WithTimeout(ctx, r.fetchTimeout)
 			defer cancel()
+			started := r.now()
 			rep, err := s.Fetch(fetchCtx)
 
 			r.mu.Lock()
@@ -244,6 +315,9 @@ func (r *Registry) Refresh(ctx context.Context) {
 			e.updatedAt = r.now()
 			e.everReported = true
 			e.lastErr = nil
+			// Only claims made a grace period before the fetch began are
+			// certain to be in its answer; later ones keep their reservation.
+			e.clearReservations(started.Add(-r.reservationGrace))
 		}(s)
 	}
 	wg.Wait()
@@ -286,8 +360,9 @@ func (r *Registry) Snapshot() []framework.Candidate {
 	for id, e := range r.entries {
 		c := framework.Candidate{
 			Provider: id,
-			// Observed: the provider's own count of what is warm.
-			WarmCapacity: e.report.WarmCapacity,
+			// Observed: the provider's own count of what is warm, less what
+			// has been placed there since.
+			WarmCapacity: e.warm(),
 			// Declared: never the provider's own claim. See ProviderConfig.
 			CostPerHour: e.config.CostPerHour,
 			// Fresh only if we have heard from it at all, and recently.
@@ -313,6 +388,9 @@ type Status struct {
 	Stale     bool
 	Age       time.Duration
 	Report    Report
+	// Reserved is how many placements since the last poll are subtracted
+	// from Report.WarmCapacity in snapshots.
+	Reserved  int
 	Config    ProviderConfig
 	LastError error
 }
@@ -335,6 +413,7 @@ func (r *Registry) Statuses() []Status {
 			Stale:     e.everReported && age > r.staleAfter,
 			Age:       age,
 			Report:    e.report,
+			Reserved:  len(e.reservations),
 			Config:    e.config,
 			LastError: e.lastErr,
 		})

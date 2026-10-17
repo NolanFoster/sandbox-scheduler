@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	crcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/NolanFoster/sandbox-scheduler/api/v1alpha1"
@@ -57,6 +58,15 @@ type SandboxProviderReconciler struct {
 
 	// StatusInterval overrides defaultStatusInterval in tests.
 	StatusInterval time.Duration
+
+	// WriteStatus, when set, reports whether this replica may write status.
+	//
+	// The reconciler runs on every replica, not only the leader, because it
+	// is what fills the registry: a standby with an empty registry would
+	// take over unable to place anything until it had reconciled and polled
+	// every provider. Status, though, is written by the leader alone, so
+	// replicas do not overwrite each other. Nil means always.
+	WriteStatus func() bool
 }
 
 // +kubebuilder:rbac:groups=placement.agents.x-k8s.io,resources=sandboxproviders,verbs=get;list;watch
@@ -202,6 +212,10 @@ func (r *SandboxProviderReconciler) reportRegistryStatus(ctx context.Context, p 
 func (r *SandboxProviderReconciler) setStatus(ctx context.Context, p *v1alpha1.SandboxProvider,
 	status metav1.ConditionStatus, reason, message string) (ctrl.Result, error) {
 
+	if r.WriteStatus != nil && !r.WriteStatus() {
+		return ctrl.Result{RequeueAfter: r.statusInterval()}, nil
+	}
+
 	meta := metav1.Condition{
 		Type:               ConditionReady,
 		Status:             status,
@@ -262,7 +276,9 @@ func setCondition(conditions *[]metav1.Condition, next metav1.Condition) {
 
 // SetupWithManager registers the controller.
 func (r *SandboxProviderReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	everyReplica := false
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.SandboxProvider{}).
+		WithOptions(crcontroller.Options{NeedLeaderElection: &everyReplica}).
 		Complete(r)
 }

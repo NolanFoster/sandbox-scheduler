@@ -4,6 +4,11 @@
 // It runs two things in one process: a controller-runtime manager reconciling
 // the placement API, and an HTTP server answering placement questions.
 //
+// With --leader-elect, every replica keeps a warm registry but only the leader
+// serves placement: reservations live in the deciding replica's memory, so
+// they are only exact while one replica makes every decision. See
+// internal/leader.
+//
 // They share state through the manager's informer cache rather than through
 // copies. A List against that cache is a memory read, so the HTTP path stays
 // off the API server entirely — which is the whole reason decisions are served
@@ -31,6 +36,7 @@ import (
 
 	"github.com/NolanFoster/sandbox-scheduler/api/v1alpha1"
 	"github.com/NolanFoster/sandbox-scheduler/internal/controller"
+	"github.com/NolanFoster/sandbox-scheduler/internal/leader"
 	_ "github.com/NolanFoster/sandbox-scheduler/pkg/adapter/agentsandbox"
 	schedmetrics "github.com/NolanFoster/sandbox-scheduler/pkg/metrics"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/registry"
@@ -52,13 +58,14 @@ func utilRuntimeMust(err error) {
 
 func main() {
 	var (
-		metricsAddr     string
-		probeAddr       string
-		schedulerAddr   string
-		secretNamespace string
-		refreshInterval time.Duration
-		staleAfter      time.Duration
-		leaderElection  bool
+		metricsAddr      string
+		probeAddr        string
+		schedulerAddr    string
+		secretNamespace  string
+		refreshInterval  time.Duration
+		staleAfter       time.Duration
+		reservationGrace time.Duration
+		leaderElection   bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address for the metrics endpoint.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address for health and readiness probes.")
@@ -71,9 +78,13 @@ func main() {
 			"against load on providers, never placement latency.")
 	flag.DurationVar(&staleAfter, "stale-after", 30*time.Second,
 		"How long a capacity report stays trusted before its provider is treated as unreachable.")
+	flag.DurationVar(&reservationGrace, "reservation-grace", 5*time.Second,
+		"How long a claim may take to appear in a provider's capacity report. Placements are "+
+			"subtracted from a provider's warm capacity until a poll started this long after them succeeds.")
 	flag.BoolVar(&leaderElection, "leader-elect", false,
-		"Elect a leader for the controllers. Note the placement API is served by every replica: "+
-			"it is a read over local cache, so serving it from a single leader would add a hop for no gain.")
+		"Elect a leader. Required with more than one replica: only the leader serves placement and "+
+			"writes status, while the others keep a warm registry to take over from. Set POD_NAME so "+
+			"the leader can label its own pod for the placement Service to select.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -88,13 +99,27 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElection,
 		LeaderElectionID:       "sandbox-scheduler.placement.agents.x-k8s.io",
+		// Hand over on a graceful shutdown rather than leaving placement
+		// unserved until the lease expires. Safe because main exits as soon as
+		// the manager stops.
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		log.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
-	reg := registry.New(registry.Options{StaleAfter: staleAfter})
+	// True from election onward; always true when leader election is off.
+	elected := func() bool {
+		select {
+		case <-mgr.Elected():
+			return true
+		default:
+			return false
+		}
+	}
+
+	reg := registry.New(registry.Options{StaleAfter: staleAfter, ReservationGrace: reservationGrace})
 
 	// Provider gauges are collected at scrape time, so they always reflect what
 	// the scheduler believes right now rather than what a timer last copied.
@@ -107,6 +132,7 @@ func main() {
 		Client:          mgr.GetClient(),
 		Registry:        reg,
 		SecretNamespace: secretNamespace,
+		WriteStatus:     elected,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to create controller", "controller", "SandboxProvider")
 		os.Exit(1)
@@ -119,10 +145,11 @@ func main() {
 	}
 
 	// Capacity refresh, on its own schedule and independent of reconcile timing.
-	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+	// On every replica, so a standby takes over with current capacity.
+	if err := mgr.Add(everyReplica{manager.RunnableFunc(func(ctx context.Context) error {
 		reg.Run(ctx, refreshInterval)
 		return nil
-	})); err != nil {
+	})}); err != nil {
 		log.Error(err, "unable to add the capacity refresher")
 		os.Exit(1)
 	}
@@ -143,6 +170,26 @@ func main() {
 		Endpoints: endpointLookup(mgr.GetClient()),
 		Token:     apiToken,
 	}
+	var labeler *leader.PodLabeler
+	if leaderElection {
+		svc.Active = elected
+		if podName := os.Getenv("POD_NAME"); podName != "" {
+			labeler = &leader.PodLabeler{
+				Client:    mgr.GetClient(),
+				Namespace: envOr("POD_NAMESPACE", secretNamespace),
+				Name:      podName,
+				Elected:   mgr.Elected(),
+				Log:       ctrl.Log.WithName("leader"),
+			}
+			if err := mgr.Add(labeler); err != nil {
+				log.Error(err, "unable to add the leader labeler")
+				os.Exit(1)
+			}
+		} else {
+			log.Info("POD_NAME is unset, so the leader cannot label its pod; standbys will " +
+				"refuse placement requests routed to them")
+		}
+	}
 	if err := mgr.Add(&httpServer{addr: schedulerAddr, handler: svc.Handler(), log: ctrl.Log.WithName("placement-api")}); err != nil {
 		log.Error(err, "unable to add the placement API server")
 		os.Exit(1)
@@ -156,9 +203,15 @@ func main() {
 		log.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
+	if labeler != nil {
+		if err := mgr.AddReadyzCheck("active-label", labeler.Ready); err != nil {
+			log.Error(err, "unable to set up ready check")
+			os.Exit(1)
+		}
+	}
 
 	log.Info("starting sandbox-scheduler",
-		"placementAPI", schedulerAddr, "refreshInterval", refreshInterval, "staleAfter", staleAfter)
+		"placementAPI", schedulerAddr, "refreshInterval", refreshInterval, "staleAfter", staleAfter, "reservationGrace", reservationGrace)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "manager exited with error")
 		os.Exit(1)
@@ -235,10 +288,15 @@ func (s *httpServer) Start(ctx context.Context) error {
 	}
 }
 
-// NeedLeaderElection reports false: the placement API is a read over local
-// cache, so every replica can serve it. Restricting it to the leader would add
-// a hop and a single point of failure for no benefit.
+// NeedLeaderElection reports false: every replica listens, so a new leader
+// serves the moment it is elected. Standbys answer GET /providers and refuse
+// placement; see scheduler.Service.Active.
 func (s *httpServer) NeedLeaderElection() bool { return false }
+
+// everyReplica runs a runnable on every replica rather than only the leader.
+type everyReplica struct{ manager.Runnable }
+
+func (everyReplica) NeedLeaderElection() bool { return false }
 
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {

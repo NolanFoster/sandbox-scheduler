@@ -412,3 +412,95 @@ func TestProvidersOmitEndpointWhenUnset(t *testing.T) {
 		t.Fatalf("endpoint should be omitted entirely:\n%s", w.Body.String())
 	}
 }
+
+func providers(t *testing.T, h http.Handler) map[string]scheduler.ProviderStatus {
+	t.Helper()
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/providers", nil))
+	var out []scheduler.ProviderStatus
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unparseable body: %v", err)
+	}
+	byName := map[string]scheduler.ProviderStatus{}
+	for _, p := range out {
+		byName[p.Provider] = p
+	}
+	return byName
+}
+
+func TestABurstSpillsOnceTheCheapWarmPoolIsReserved(t *testing.T) {
+	// Every request in this burst sees the same poll. Without reservations
+	// all of them would land on civo, the cheaper provider, and all but 20
+	// would cold-start while gke's warm pool sat idle.
+	h := newServiceWithConfig(t,
+		map[string]registry.Report{
+			"civo": {WarmCapacity: 20},
+			"gke":  {WarmCapacity: 200},
+		},
+		map[string]registry.ProviderConfig{
+			"civo": {CostPerHour: 1},
+			"gke":  {CostPerHour: 4},
+		})
+
+	placed := map[string]int{}
+	for i := 0; i < 1000; i++ {
+		w, resp, _ := post(t, h, `{}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d: status %d, body %s", i, w.Code, w.Body)
+		}
+		placed[resp.Provider]++
+	}
+
+	// civo keeps winning down to 3 warm (825 against gke's 800); below that
+	// gke's full warm pool outscores civo's cheaper price. Once gke is down to
+	// 2, cost decides again and the rest go to civo, mostly cold: 218 warm
+	// starts where there would have been 20.
+	if placed["civo"] != 802 || placed["gke"] != 198 {
+		t.Fatalf("placed %v, want civo:802 gke:198", placed)
+	}
+	got := providers(t, h)
+	if got["civo"].Reserved != 20 || got["gke"].Reserved != 198 {
+		t.Fatalf("reserved civo=%d gke=%d, want 20 and 198", got["civo"].Reserved, got["gke"].Reserved)
+	}
+	if got["civo"].WarmCapacity != 20 {
+		t.Fatalf("warmCapacity %d; /providers should show the raw report", got["civo"].WarmCapacity)
+	}
+}
+
+func TestColdPlacementsReserveNothing(t *testing.T) {
+	// A cold placement takes nothing from the pool, so it must not eat into
+	// capacity the next poll reports.
+	h := newService(t, map[string]registry.Report{"civo": {WarmCapacity: 0}})
+	for i := 0; i < 3; i++ {
+		post(t, h, `{}`)
+	}
+	if got := providers(t, h)["civo"]; got.Reserved != 0 {
+		t.Fatalf("%d reservations from cold placements", got.Reserved)
+	}
+}
+
+func TestStandbyRefusesPlacementButServesProviders(t *testing.T) {
+	// A standby placing against its own empty reservations would undo the
+	// point of having one replica decide.
+	reg := registry.New(registry.Options{})
+	reg.Report("civo", registry.Report{WarmCapacity: 3})
+	active := false
+	h := (&scheduler.Service{
+		Registry: reg,
+		Policies: &scheduler.PolicyList{},
+		Active:   func() bool { return active },
+	}).Handler()
+
+	w, _, errResp := post(t, h, `{}`)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(errResp.Error, "standby") {
+		t.Fatalf("standby: status %d, error %q; want 503 naming the standby", w.Code, errResp.Error)
+	}
+	if got := providers(t, h)["civo"]; got.WarmCapacity != 3 || got.Reserved != 0 {
+		t.Fatalf("standby should still report capacity, and must not have reserved: %+v", got)
+	}
+
+	active = true
+	if w, resp, _ := post(t, h, `{}`); w.Code != http.StatusOK || resp.Provider != "civo" {
+		t.Fatalf("leader: status %d, provider %q", w.Code, resp.Provider)
+	}
+}

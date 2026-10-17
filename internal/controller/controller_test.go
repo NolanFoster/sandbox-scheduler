@@ -438,3 +438,38 @@ func TestDeletedPolicyReconcilesCleanly(t *testing.T) {
 		t.Fatalf("reconciling a missing policy should not error: %v", err)
 	}
 }
+
+func TestStandbyFillsTheRegistryButLeavesStatusToTheLeader(t *testing.T) {
+	// A standby needs a warm registry to take over from, but two replicas
+	// writing status would overwrite each other.
+	reg := registry.New(registry.Options{})
+	c := newClient(t, provider("civo", func(p *v1alpha1.SandboxProvider) {
+		p.Spec.Attributes = map[string]string{"runtime": "gvisor"}
+	}))
+	r := &controller.SandboxProviderReconciler{
+		Client:          c,
+		Registry:        reg,
+		SecretNamespace: secretNS,
+		StatusInterval:  time.Second,
+		WriteStatus:     func() bool { return false },
+	}
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "civo"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Fatal("a standby should keep reconciling, to stay current")
+	}
+	snap := reg.Snapshot()
+	if len(snap) != 1 || snap[0].Attr("runtime") != "gvisor" {
+		t.Fatalf("standby registry not filled from the spec: %+v", snap)
+	}
+
+	var p v1alpha1.SandboxProvider
+	_ = c.Get(context.Background(), types.NamespacedName{Name: "civo"}, &p)
+	if len(p.Status.Conditions) != 0 {
+		t.Fatalf("standby wrote status: %+v", p.Status.Conditions)
+	}
+}

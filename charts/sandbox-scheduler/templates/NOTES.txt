@@ -28,9 +28,10 @@ Ask for a placement:
 
 Without a SandboxPlacementPolicy the default applies: cheapest provider with
 warm capacity, spilling when it has none.
-{{- if and (gt (int .Values.replicaCount) 1) (not .Values.leaderElection) }}
+{{- if .Values.leaderElection }}
 
-WARNING: replicaCount is {{ .Values.replicaCount }} but leaderElection is off, so every
-replica runs the controllers and they will contend on status writes. Set
-leaderElection=true. The placement API is served by every replica either way.
+Placement is served by the elected leader only; the other replicas are warm
+standbys. The leader is the pod labeled placement.agents.x-k8s.io/active=true:
+
+  kubectl get pods -n {{ .Release.Namespace }} -l placement.agents.x-k8s.io/active=true
 {{- end }}

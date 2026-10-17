@@ -464,3 +464,99 @@ func TestConcurrentSnapshotAndRefreshAreSafe(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+func TestReserveIsSubtractedFromSnapshotCapacity(t *testing.T) {
+	// Without this, every placement between two polls reads the same capacity
+	// and a burst piles onto whichever provider looked best at the last poll.
+	clk := newClock()
+	r := registry.New(registry.Options{Now: clk.now})
+	r.Report("civo", registry.Report{WarmCapacity: 2})
+
+	r.Reserve("civo")
+	if got := r.Snapshot()[0].WarmCapacity; got != 1 {
+		t.Fatalf("capacity %d after one reservation, want 1", got)
+	}
+
+	r.Reserve("civo")
+	r.Reserve("civo")
+	if got := r.Snapshot()[0].WarmCapacity; got != 0 {
+		t.Fatalf("capacity %d; reservations past the report must floor at 0", got)
+	}
+
+	st := r.Statuses()[0]
+	if st.Report.WarmCapacity != 2 || st.Reserved != 3 {
+		t.Fatalf("statuses should show the raw report and the reservations separately: %+v", st)
+	}
+}
+
+func TestPollClearsReservationsItAccountsFor(t *testing.T) {
+	clk := newClock()
+	r := registry.New(registry.Options{ReservationGrace: 5 * time.Second, Now: clk.now})
+	src := &fakeSource{id: "civo"}
+	src.set(registry.Report{WarmCapacity: 5}, nil)
+	r.AddSource(src)
+	r.Refresh(context.Background())
+
+	r.Reserve("civo")
+	r.Reserve("civo")
+
+	// A poll this soon after the claims may not see them yet: both stay.
+	clk.advance(2 * time.Second)
+	r.Refresh(context.Background())
+	if got := r.Snapshot()[0].WarmCapacity; got != 3 {
+		t.Fatalf("capacity %d; reservations within the grace period must survive a poll", got)
+	}
+
+	// One that started well after them has seen the claims in the report.
+	clk.advance(10 * time.Second)
+	src.set(registry.Report{WarmCapacity: 3}, nil)
+	r.Refresh(context.Background())
+	if got := r.Snapshot()[0].WarmCapacity; got != 3 {
+		t.Fatalf("capacity %d; a later poll should replace the reservations, not add to them", got)
+	}
+	if st := r.Statuses()[0]; st.Reserved != 0 {
+		t.Fatalf("%d reservations left after a poll that accounts for them", st.Reserved)
+	}
+}
+
+func TestFailedPollKeepsReservations(t *testing.T) {
+	// The claims are most likely real; dropping their reservations would let
+	// the stale report overstate capacity for as long as the provider is down.
+	clk := newClock()
+	r := registry.New(registry.Options{Now: clk.now})
+	src := &fakeSource{id: "civo"}
+	src.set(registry.Report{WarmCapacity: 4}, nil)
+	r.AddSource(src)
+	r.Refresh(context.Background())
+
+	r.Reserve("civo")
+	clk.advance(time.Minute)
+	src.set(registry.Report{}, errors.New("connection refused"))
+	r.Refresh(context.Background())
+
+	if got := r.Snapshot()[0].WarmCapacity; got != 3 {
+		t.Fatalf("capacity %d; a failed poll must not clear reservations", got)
+	}
+}
+
+func TestPushReportClearsReservations(t *testing.T) {
+	clk := newClock()
+	r := registry.New(registry.Options{ReservationGrace: 5 * time.Second, Now: clk.now})
+	r.Report("hosted", registry.Report{WarmCapacity: 4})
+	r.Reserve("hosted")
+
+	clk.advance(10 * time.Second)
+	r.Report("hosted", registry.Report{WarmCapacity: 3})
+	if got := r.Snapshot()[0].WarmCapacity; got != 3 {
+		t.Fatalf("capacity %d; a pushed report should replace older reservations", got)
+	}
+}
+
+func TestReserveOnAnUnknownProviderIsANoOp(t *testing.T) {
+	// A provider removed between snapshot and reservation must not come back.
+	r := registry.New(registry.Options{})
+	r.Reserve("gone")
+	if got := r.Snapshot(); len(got) != 0 {
+		t.Fatalf("reserving resurrected a provider: %+v", got)
+	}
+}

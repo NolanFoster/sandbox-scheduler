@@ -107,6 +107,12 @@ type Service struct {
 	// reconnaissance for anyone deciding where to aim, so anything exposing
 	// this beyond the cluster must set a token.
 	Token string
+
+	// Active, when set, reports whether this replica may place. Placement
+	// reserves capacity in this process's memory, which is only exact while
+	// one replica makes every decision, so a standby refuses rather than
+	// placing against reservations it cannot see. Nil means always active.
+	Active func() bool
 }
 
 // Handler returns the HTTP handler.
@@ -155,6 +161,17 @@ func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
 	// problem; what this defends is the claim that placement itself reads local
 	// memory and stays out of the API server.
 	start := time.Now()
+
+	if s.Active != nil && !s.Active() {
+		// Normally unreachable: the placement Service only selects the
+		// leader. This covers a request that arrives during a handover, or
+		// one sent to a pod directly.
+		metrics.RecordFailure("standby", nil, "", 0)
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error: "this replica is a standby; placement is served by the elected leader",
+		})
+		return
+	}
 
 	var req Request
 	if r.ContentLength != 0 {
@@ -217,6 +234,16 @@ func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
 
 	metrics.RecordDecision(policy.Name, decision, candidates, time.Since(start))
 
+	// Count the warm sandbox this placement will take, so the requests behind
+	// it in a burst see what is left rather than what the last poll saw. A
+	// cold placement takes nothing from the pool and reserves nothing.
+	for _, c := range candidates {
+		if c.Provider == decision.Provider && c.WarmCapacity > 0 {
+			s.Registry.Reserve(decision.Provider)
+			break
+		}
+	}
+
 	resp := Response{
 		Provider:    decision.Provider,
 		Score:       decision.Score,
@@ -249,11 +276,14 @@ type ProviderStatus struct {
 	// Omitted when no endpoint lookup is configured.
 	Endpoint string `json:"endpoint,omitempty"`
 
-	Reachable    bool   `json:"reachable"`
-	Stale        bool   `json:"stale"`
-	WarmCapacity int    `json:"warmCapacity"`
-	AgeSeconds   int64  `json:"ageSeconds"`
-	LastError    string `json:"lastError,omitempty"`
+	Reachable    bool `json:"reachable"`
+	Stale        bool `json:"stale"`
+	WarmCapacity int  `json:"warmCapacity"`
+	// Reserved is how many placements since the last poll are being
+	// subtracted from WarmCapacity when scheduling.
+	Reserved   int    `json:"reserved"`
+	AgeSeconds int64  `json:"ageSeconds"`
+	LastError  string `json:"lastError,omitempty"`
 }
 
 // handleProviders exposes what the scheduler currently believes, which is the
@@ -267,6 +297,7 @@ func (s *Service) handleProviders(w http.ResponseWriter, _ *http.Request) {
 			Reachable:    st.Reachable,
 			Stale:        st.Stale,
 			WarmCapacity: st.Report.WarmCapacity,
+			Reserved:     st.Reserved,
 			AgeSeconds:   int64(st.Age / time.Second),
 		}
 		if s.Endpoints != nil {

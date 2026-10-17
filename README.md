@@ -71,6 +71,26 @@ provider never leaves the snapshot** (it is reported unreachable with its last
 known capacity, so policy decides; dropping it makes "why wasn't civo
 considered?" unanswerable).
 
+A cache has one weakness under a burst: every request between two polls reads
+the same capacity and reaches the same answer, so a thousand requests in a
+second all land on the provider that looked best at the last poll, long after
+its warm pool is drained. Each warm placement therefore **reserves** a
+sandbox, subtracted from that provider's capacity until a poll that started
+after it (plus `--reservation-grace`, default 5s, for the claim to show up)
+succeeds. The error this can make is counting a claim twice for one poll,
+which spills placements early rather than piling them onto an empty pool.
+
+Reservations live in the deciding replica's memory, so they are only exact
+while one replica makes every decision. With `--leader-elect`, the leader
+alone serves placement: it labels its own pod `placement.agents.x-k8s.io/active=true`,
+and the chart's placement Service selects on that label. Standbys keep their
+registry polled and current, so a new leader places correctly from its first
+request, and refuse placement with a 503 if one reaches them directly. This
+costs no throughput worth having — one replica decides in tens of
+microseconds, orders of magnitude faster than any cluster can claim sandboxes
+— and a handover takes seconds on a graceful shutdown, or the 15s lease on a
+crash.
+
 ### Every decision explains itself
 
 A scheduler that says `gke` and nothing else is unoperable — you cannot tell a
@@ -160,6 +180,18 @@ operator wrote down, and nothing would look wrong.
 helm install sandbox-scheduler charts/sandbox-scheduler \
   --namespace sandbox-scheduler --create-namespace
 ```
+
+**Upgrading from a release without leader-only placement** (0.1.0 and
+earlier): expect the placement API — `/schedule` and `/providers` — to be
+unreachable for up to about a minute, once. The new Service selects only the
+pod labeled `placement.agents.x-k8s.io/active=true`, which the old pods never
+carry, so it has no endpoints until the first upgraded pod has started, been
+elected and labeled itself. If the old release ran with `leaderElection=true`,
+add up to the 15s lease, which the old binary does not release on shutdown.
+Callers should retry through it. Later upgrades hand over between labeled
+replicas in a couple of seconds. The chart also now refuses
+`replicaCount > 1` without `leaderElection=true`, and serves metrics from a
+separate `<release>-metrics` Service.
 
 Or run it locally against whatever cluster `kubectl` points at:
 
