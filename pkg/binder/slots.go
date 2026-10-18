@@ -232,7 +232,7 @@ func (c *lookupCoalescer) flush(attemptTimeout time.Duration) {
 		return
 	}
 	delay := res.DelayFrom(now)
-	if delay > attemptTimeout {
+	if delay >= attemptTimeout {
 		res.CancelAt(now)
 		failBatch(provider.Busy(delay, errors.New("lookup rate limit wait exceeds deadline")))
 		return
@@ -241,6 +241,7 @@ func (c *lookupCoalescer) flush(attemptTimeout time.Duration) {
 		timer := time.NewTimer(delay)
 		<-timer.C
 	}
+	remainingTimeout := attemptTimeout - delay
 
 	// Track detached attempt for graceful shutdown and bound concurrency via
 	// the provider's slotLimiter just like ordinary Lookup calls.
@@ -264,7 +265,7 @@ func (c *lookupCoalescer) flush(attemptTimeout time.Duration) {
 	for i := range batch {
 		reqs[i] = batch[i].req
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), remainingTimeout)
 	defer cancel()
 
 	var results []provider.LookupResult

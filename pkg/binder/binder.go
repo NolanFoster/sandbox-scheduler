@@ -1379,9 +1379,8 @@ func (b *Binder) attemptProvider(
 	case provider.KindUnknownOutcome:
 		// Outcome is unknown: keep the warm reservation and pin to this
 		// provider. Probe Lookup and retry within the per-provider retry
-		// budget; never spill.
-		res, berr := b.recoverUnknownOutcome(reqCtx, t, decision, policy, claimReq, warmReserved, reqDeadline, err)
-		return res, berr, attemptDone
+		// budget; never spill unless Lookup proves nothing was created.
+		return b.recoverUnknownOutcome(reqCtx, t, decision, policy, req, claimReq, warmReserved, reqDeadline, err, true)
 
 	case provider.KindNoCapacity:
 		// Provider confirmed it has no capacity for this template. Keep the
@@ -1437,8 +1436,7 @@ func (b *Binder) attemptProvider(
 		}, attemptSpill
 
 	default:
-		res, berr := b.recoverUnknownOutcome(reqCtx, t, decision, policy, claimReq, warmReserved, reqDeadline, err)
-		return res, berr, attemptDone
+		return b.recoverUnknownOutcome(reqCtx, t, decision, policy, req, claimReq, warmReserved, reqDeadline, err, true)
 	}
 }
 
@@ -1609,8 +1607,7 @@ func (b *Binder) retryPinnedKeyBusy(
 				Providers: []string{t.id},
 			}, attemptDone
 		default:
-			res, berr := b.recoverUnknownOutcome(reqCtx, t, decision, policy, claimReq, retryWarm, reqDeadline, err)
-			return res, berr, attemptDone
+			return b.recoverUnknownOutcome(reqCtx, t, decision, policy, req, claimReq, retryWarm, reqDeadline, err, false)
 		}
 	}
 	return nil, &Error{
@@ -1627,14 +1624,20 @@ func (b *Binder) recoverUnknownOutcome(
 	t *target,
 	decision *framework.Decision,
 	policy *v1alpha1.SandboxPlacementPolicy,
+	req Request,
 	claimReq provider.ClaimRequest,
 	warmReserved bool,
 	reqDeadline time.Time,
 	initialErr error,
-) (*Result, *Error) {
+	allowSpill bool,
+) (*Result, *Error, attemptAction) {
 	base := 100 * time.Millisecond
 	capBackoff := 2 * time.Second
 	lastErr := initialErr
+	spillOrDone := attemptDone
+	if allowSpill {
+		spillOrDone = attemptSpill
+	}
 
 	for step := 0; b.now().Before(reqDeadline) && reqCtx.Err() == nil; step++ {
 		if !t.retryBudget.AllowN(b.now(), 1) {
@@ -1656,6 +1659,24 @@ func (b *Binder) recoverUnknownOutcome(
 			break
 		}
 
+		// Recovery Lookups must also respect the provider's lookupRate bound.
+		now := b.now()
+		lres := t.lookupRate.ReserveN(now, 1)
+		if !lres.OK() {
+			break
+		}
+		if ldelay := lres.DelayFrom(now); ldelay > 0 {
+			lwake := now.Add(ldelay)
+			if !lwake.Before(reqDeadline) {
+				lres.CancelAt(now)
+				break
+			}
+			if !b.sleepUntil(reqCtx, lwake) {
+				lres.CancelAt(b.now())
+				break
+			}
+		}
+
 		// Probe Lookup on the pinned provider first.
 		h, lerr := b.callLookupNoSlot(reqCtx, t, claimReq, reqDeadline)
 		if lerr == nil {
@@ -1667,15 +1688,18 @@ func (b *Binder) recoverUnknownOutcome(
 				Policy:      policy.Name,
 				Score:       decision.Score,
 				Explanation: decision.Explain(),
-			}, nil
+			}, nil, attemptDone
 		}
 		if provider.KindOf(lerr) == provider.KindKeyConflict {
+			if warmReserved {
+				b.reg.ReleaseReservation(t.id)
+			}
 			return nil, &Error{
 				Status:    409,
 				Reason:    ReasonSpecMismatch,
 				Message:   lerr.Error(),
 				Providers: []string{t.id},
-			}
+			}, attemptDone
 		}
 		if errors.Is(lerr, provider.ErrNotFound) {
 			// Confirmed not created: retry Claim on this same provider within
@@ -1693,16 +1717,75 @@ func (b *Binder) recoverUnknownOutcome(
 					Policy:      policy.Name,
 					Score:       decision.Score,
 					Explanation: decision.Explain(),
-				}, nil
+				}, nil, attemptDone
 			}
 			lastErr = cerr
-			if provider.KindOf(cerr) == provider.KindKeyConflict {
+			switch provider.KindOf(cerr) {
+			case provider.KindKeyConflict:
+				if warmReserved {
+					b.reg.ReleaseReservation(t.id)
+				}
 				return nil, &Error{
 					Status:    409,
 					Reason:    ReasonSpecMismatch,
 					Message:   cerr.Error(),
 					Providers: []string{t.id},
+				}, attemptDone
+			case provider.KindKeyBusy:
+				if warmReserved {
+					b.reg.ReleaseReservation(t.id)
 				}
+				return b.retryPinnedKeyBusy(reqCtx, t, decision, policy, req, claimReq, reqDeadline, cerr)
+			case provider.KindNoCapacity:
+				b.recordRefusal(t.id, req.Template, b.now())
+				return nil, &Error{
+					Status:    409,
+					Reason:    ReasonNoCapacity,
+					Message:   cerr.Error(),
+					Providers: []string{t.id},
+				}, spillOrDone
+			case provider.KindBusy:
+				if warmReserved {
+					b.reg.ReleaseReservation(t.id)
+				}
+				bw := provider.RetryAfterOf(cerr)
+				if bw <= 0 {
+					bw = b.refusalTTL
+				}
+				b.recordCooldown(t.id, b.now().Add(bw))
+				retryWait := bw
+				if !allowSpill {
+					retryWait = b.jitterDelay(bw)
+				}
+				return nil, &Error{
+					Status:     429,
+					Reason:     ReasonBusy,
+					Message:    cerr.Error(),
+					Providers:  []string{t.id},
+					RetryAfter: retryWait,
+				}, spillOrDone
+			case provider.KindUnavailable:
+				if warmReserved {
+					b.reg.ReleaseReservation(t.id)
+				}
+				t.health.recordUnavailable(b.now(), cerr)
+				return nil, &Error{
+					Status:    503,
+					Reason:    ReasonUnavailable,
+					Message:   cerr.Error(),
+					Providers: []string{t.id},
+				}, spillOrDone
+			case provider.KindRejected:
+				if warmReserved {
+					b.reg.ReleaseReservation(t.id)
+				}
+				t.health.recordRejected(cerr)
+				return nil, &Error{
+					Status:    422,
+					Reason:    ReasonRejected,
+					Message:   cerr.Error(),
+					Providers: []string{t.id},
+				}, spillOrDone
 			}
 		} else {
 			lastErr = lerr
@@ -1714,7 +1797,7 @@ func (b *Binder) recoverUnknownOutcome(
 		Reason:    ReasonUnknownOutcome,
 		Message:   fmt.Sprintf("claim outcome on provider %q is unknown: %v", t.id, lastErr),
 		Providers: []string{t.id},
-	}
+	}, attemptDone
 }
 
 func (b *Binder) callLookupNoSlot(

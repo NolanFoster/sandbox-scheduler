@@ -681,3 +681,38 @@ func TestIneligibleOverRateProviderReturnsNoCapacityNotRateLimited(t *testing.T)
 		t.Fatalf("expected 409 NoCapacity for WarmOnly request on cold over-rate provider, got %+v", berr)
 	}
 }
+
+func TestUnknownOutcomeConfirmedNotFoundThenNoCapacitySpills(t *testing.T) {
+	b, reg := newTestBinder(t, binder.Options{
+		RandFloat64: func() float64 { return 0.01 },
+	})
+	reg.Report("civo", registry.Report{WarmCapacity: 1})
+	reg.Report("gke", registry.Report{WarmCapacity: 1})
+	reg.SetConfig("civo", registry.ProviderConfig{CostPerHour: 1})
+	reg.SetConfig("gke", registry.ProviderConfig{CostPerHour: 4})
+
+	var civoClaims atomic.Int32
+	civoBinder := &scriptBinder{
+		claimFn: func(context.Context, provider.ClaimRequest) (provider.Handle, error) {
+			if civoClaims.Add(1) == 1 {
+				return provider.Handle{}, errors.New("EOF after write")
+			}
+			return provider.Handle{}, provider.NoCapacity(errors.New("pool empty on retry"))
+		},
+		lookupFn: func(context.Context, provider.ClaimRequest) (provider.Handle, error) {
+			return provider.Handle{}, provider.ErrNotFound
+		},
+	}
+	gkeFake := adaptertest.NewFake("gke", 10, false)
+
+	b.SetTarget("civo", civoBinder.asProvider(false), binder.TargetConfig{Enabled: true})
+	b.SetTarget("gke", gkeFake.Provider(false), binder.TargetConfig{Enabled: true})
+
+	res, berr := b.Bind(context.Background(), nil, binder.Request{Key: "unknown-then-nocap"})
+	if berr != nil {
+		t.Fatalf("expected spill to gke after Lookup ErrNotFound + NoCapacity, got %+v", berr)
+	}
+	if res.Handle.Provider != "gke" {
+		t.Fatalf("expected provider gke, got %q", res.Handle.Provider)
+	}
+}
