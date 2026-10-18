@@ -154,11 +154,30 @@ func (r *SandboxProviderReconciler) sync(ctx context.Context, p *v1alpha1.Sandbo
 			&readiness{metav1.ConditionFalse, ReasonUnknownAdapter, msg}
 	}
 
+	claimsEnabled := p.Spec.Claims != nil && p.Spec.Claims.Enabled
+	if !claimsEnabled && r.Binder != nil {
+		r.Binder.RemoveTarget(p.Name)
+	}
+
 	creds, err := r.resolveCredentials(ctx, p)
 	if err != nil {
 		// Keep polling with what we had rather than dropping the provider: a
 		// Secret that is briefly unreadable should not evacuate a cluster.
-		return readiness{metav1.ConditionFalse, ReasonCredentials, err.Error()}, nil
+		var claiming *readiness
+		if !claimsEnabled {
+			claiming = &readiness{
+				status:  metav1.ConditionFalse,
+				reason:  ReasonClaimsDisabled,
+				message: "claims are not enabled on this provider (set spec.claims.enabled=true)",
+			}
+		} else if r.Binder == nil {
+			claiming = &readiness{
+				status:  metav1.ConditionFalse,
+				reason:  ReasonClaimsDisabled,
+				message: "sandbox claims are disabled on the scheduler (start with --enable-claims)",
+			}
+		}
+		return readiness{metav1.ConditionFalse, ReasonCredentials, err.Error()}, claiming
 	}
 
 	templates := templateMap(p.Spec.Templates)

@@ -1204,7 +1204,7 @@ func (b *Binder) claimLoop(
 				}
 			}
 
-			if len(overRate) > 0 && len(tried) == 0 {
+			if len(overRate) > 0 {
 				earliest := time.Second
 				first := true
 				names := make([]string, 0, len(overRate))
@@ -1320,7 +1320,7 @@ func (b *Binder) claimLoop(
 		}
 	}
 
-	if len(cooldownProviders) > 0 && len(tried) == 0 {
+	if len(cooldownProviders) > 0 {
 		names := make([]string, 0, len(cooldownProviders))
 		for p := range cooldownProviders {
 			names = append(names, p)
@@ -1388,17 +1388,18 @@ func (b *Binder) attemptProvider(
 
 	chosen := t.id
 	hadWarm := warmCandidate(candidates, chosen)
-	warmReserved := false
+	var warmTicket registry.ReservationTicket
 
 	// Slot is acquired before reserving capacity so refusals that never reach
 	// a provider do not drain its ledger.
 	if !t.cfg.Elastic && hadWarm {
-		if !b.reg.TryReserveWarm(chosen) {
+		ticket, ok := b.reg.TryReserveWarmTicket(chosen)
+		if !ok {
 			// Another concurrent request took the last warm sandbox on this
 			// provider; re-run scheduling against the updated ledger.
 			return nil, nil, attemptRetryDecision
 		}
-		warmReserved = true
+		warmTicket = ticket
 	} else {
 		now := b.now()
 		if !t.claimRate.AllowN(now, 1) {
@@ -1413,7 +1414,7 @@ func (b *Binder) attemptProvider(
 		return &Result{
 			Handle:      h,
 			Replay:      replay,
-			Warm:        warmReserved,
+			Warm:        warmTicket.Valid(),
 			Policy:      policy.Name,
 			Score:       decision.Score,
 			Explanation: decision.Explain(),
@@ -1423,9 +1424,7 @@ func (b *Binder) attemptProvider(
 	kind := provider.KindOf(err)
 	switch kind {
 	case provider.KindKeyConflict:
-		if warmReserved {
-			b.reg.ReleaseReservation(chosen)
-		}
+		b.reg.ReleaseReservationTicket(warmTicket)
 		return nil, &Error{
 			Status:    409,
 			Reason:    ReasonSpecMismatch,
@@ -1437,16 +1436,14 @@ func (b *Binder) attemptProvider(
 		// The key's previous sandbox is still being deleted on this provider.
 		// Pin here and retry within reqDeadline; never spill, or a second
 		// sandbox would be created while the first still exists.
-		if warmReserved {
-			b.reg.ReleaseReservation(chosen)
-		}
+		b.reg.ReleaseReservationTicket(warmTicket)
 		return b.retryPinnedKeyBusy(reqCtx, t, decision, policy, req, claimReq, reqDeadline, err)
 
 	case provider.KindUnknownOutcome:
 		// Outcome is unknown: keep the warm reservation and pin to this
 		// provider. Probe Lookup and retry within the per-provider retry
 		// budget; never spill unless Lookup proves nothing was created.
-		return b.recoverUnknownOutcome(reqCtx, t, decision, policy, req, claimReq, warmReserved, reqDeadline, err, true)
+		return b.recoverUnknownOutcome(reqCtx, t, decision, policy, req, claimReq, warmTicket, reqDeadline, err, true)
 
 	case provider.KindNoCapacity:
 		// Provider confirmed it has no capacity for this template. Keep the
@@ -1461,9 +1458,7 @@ func (b *Binder) attemptProvider(
 		}, attemptSpill
 
 	case provider.KindBusy:
-		if warmReserved {
-			b.reg.ReleaseReservation(chosen)
-		}
+		b.reg.ReleaseReservationTicket(warmTicket)
 		wait := provider.RetryAfterOf(err)
 		if wait <= 0 {
 			wait = b.refusalTTL
@@ -1478,9 +1473,7 @@ func (b *Binder) attemptProvider(
 		}, attemptSpill
 
 	case provider.KindUnavailable:
-		if warmReserved {
-			b.reg.ReleaseReservation(chosen)
-		}
+		b.reg.ReleaseReservationTicket(warmTicket)
 		t.health.recordUnavailable(b.now(), err)
 		return nil, &Error{
 			Status:    503,
@@ -1490,9 +1483,7 @@ func (b *Binder) attemptProvider(
 		}, attemptSpill
 
 	case provider.KindRejected:
-		if warmReserved {
-			b.reg.ReleaseReservation(chosen)
-		}
+		b.reg.ReleaseReservationTicket(warmTicket)
 		t.health.recordRejected(err)
 		return nil, &Error{
 			Status:    422,
@@ -1502,7 +1493,7 @@ func (b *Binder) attemptProvider(
 		}, attemptSpill
 
 	default:
-		return b.recoverUnknownOutcome(reqCtx, t, decision, policy, req, claimReq, warmReserved, reqDeadline, err, true)
+		return b.recoverUnknownOutcome(reqCtx, t, decision, policy, req, claimReq, warmTicket, reqDeadline, err, true)
 	}
 }
 
@@ -1571,10 +1562,11 @@ func (b *Binder) retryPinnedKeyBusy(
 
 		// Reacquire warm capacity (or account a cold placement) for this retry
 		// attempt so the ledger stays accurate and warmOnly is enforced.
-		retryWarm := false
-		if !t.cfg.Elastic && b.reg.TryReserveWarm(t.id) {
-			retryWarm = true
-		} else {
+		var retryTicket registry.ReservationTicket
+		if !t.cfg.Elastic {
+			retryTicket, _ = b.reg.TryReserveWarmTicket(t.id)
+		}
+		if !retryTicket.Valid() {
 			if requiresWarm {
 				return nil, &Error{
 					Status:    409,
@@ -1602,7 +1594,7 @@ func (b *Binder) retryPinnedKeyBusy(
 			return &Result{
 				Handle:      h,
 				Replay:      replay,
-				Warm:        retryWarm,
+				Warm:        retryTicket.Valid(),
 				Policy:      policy.Name,
 				Score:       decision.Score,
 				Explanation: decision.Explain(),
@@ -1611,15 +1603,11 @@ func (b *Binder) retryPinnedKeyBusy(
 
 		switch provider.KindOf(err) {
 		case provider.KindKeyBusy:
-			if retryWarm {
-				b.reg.ReleaseReservation(t.id)
-			}
+			b.reg.ReleaseReservationTicket(retryTicket)
 			lastErr = err
 			continue
 		case provider.KindKeyConflict:
-			if retryWarm {
-				b.reg.ReleaseReservation(t.id)
-			}
+			b.reg.ReleaseReservationTicket(retryTicket)
 			return nil, &Error{
 				Status:    409,
 				Reason:    ReasonSpecMismatch,
@@ -1635,9 +1623,7 @@ func (b *Binder) retryPinnedKeyBusy(
 				Providers: []string{t.id},
 			}, attemptDone
 		case provider.KindBusy:
-			if retryWarm {
-				b.reg.ReleaseReservation(t.id)
-			}
+			b.reg.ReleaseReservationTicket(retryTicket)
 			bw := provider.RetryAfterOf(err)
 			if bw <= 0 {
 				bw = b.refusalTTL
@@ -1651,9 +1637,7 @@ func (b *Binder) retryPinnedKeyBusy(
 				RetryAfter: b.jitterDelay(bw),
 			}, attemptDone
 		case provider.KindUnavailable:
-			if retryWarm {
-				b.reg.ReleaseReservation(t.id)
-			}
+			b.reg.ReleaseReservationTicket(retryTicket)
 			t.health.recordUnavailable(b.now(), err)
 			return nil, &Error{
 				Status:    503,
@@ -1662,9 +1646,7 @@ func (b *Binder) retryPinnedKeyBusy(
 				Providers: []string{t.id},
 			}, attemptDone
 		case provider.KindRejected:
-			if retryWarm {
-				b.reg.ReleaseReservation(t.id)
-			}
+			b.reg.ReleaseReservationTicket(retryTicket)
 			t.health.recordRejected(err)
 			return nil, &Error{
 				Status:    422,
@@ -1673,7 +1655,7 @@ func (b *Binder) retryPinnedKeyBusy(
 				Providers: []string{t.id},
 			}, attemptDone
 		default:
-			return b.recoverUnknownOutcome(reqCtx, t, decision, policy, req, claimReq, retryWarm, reqDeadline, err, false)
+			return b.recoverUnknownOutcome(reqCtx, t, decision, policy, req, claimReq, retryTicket, reqDeadline, err, false)
 		}
 	}
 	return nil, &Error{
@@ -1692,7 +1674,7 @@ func (b *Binder) recoverUnknownOutcome(
 	policy *v1alpha1.SandboxPlacementPolicy,
 	req Request,
 	claimReq provider.ClaimRequest,
-	warmReserved bool,
+	warmTicket registry.ReservationTicket,
 	reqDeadline time.Time,
 	initialErr error,
 	allowSpill bool,
@@ -1750,16 +1732,14 @@ func (b *Binder) recoverUnknownOutcome(
 			return &Result{
 				Handle:      h,
 				Replay:      true,
-				Warm:        warmReserved,
+				Warm:        warmTicket.Valid(),
 				Policy:      policy.Name,
 				Score:       decision.Score,
 				Explanation: decision.Explain(),
 			}, nil, attemptDone
 		}
 		if provider.KindOf(lerr) == provider.KindKeyConflict {
-			if warmReserved {
-				b.reg.ReleaseReservation(t.id)
-			}
+			b.reg.ReleaseReservationTicket(warmTicket)
 			return nil, &Error{
 				Status:    409,
 				Reason:    ReasonSpecMismatch,
@@ -1769,9 +1749,28 @@ func (b *Binder) recoverUnknownOutcome(
 		}
 		if errors.Is(lerr, provider.ErrNotFound) {
 			// Confirmed not created: retry Claim on this same provider within
-			// the deadline.
+			// the deadline. Cold cluster claims and all elastic claims must
+			// also respect the provider's claimRate bound.
 			if !b.now().Before(reqDeadline) || reqCtx.Err() != nil {
 				break
+			}
+			if t.cfg.Elastic || !warmTicket.Valid() {
+				cnow := b.now()
+				cres := t.claimRate.ReserveN(cnow, 1)
+				if !cres.OK() {
+					break
+				}
+				if cdelay := cres.DelayFrom(cnow); cdelay > 0 {
+					cwake := cnow.Add(cdelay)
+					if !cwake.Before(reqDeadline) {
+						cres.CancelAt(cnow)
+						break
+					}
+					if !b.sleepUntil(reqCtx, cwake) {
+						cres.CancelAt(b.now())
+						break
+					}
+				}
 			}
 			ch, _, cerr := b.invokeClaim(reqCtx, t, claimReq, reqDeadline)
 			if cerr == nil {
@@ -1779,7 +1778,7 @@ func (b *Binder) recoverUnknownOutcome(
 				return &Result{
 					Handle:      ch,
 					Replay:      false,
-					Warm:        warmReserved,
+					Warm:        warmTicket.Valid(),
 					Policy:      policy.Name,
 					Score:       decision.Score,
 					Explanation: decision.Explain(),
@@ -1788,9 +1787,7 @@ func (b *Binder) recoverUnknownOutcome(
 			lastErr = cerr
 			switch provider.KindOf(cerr) {
 			case provider.KindKeyConflict:
-				if warmReserved {
-					b.reg.ReleaseReservation(t.id)
-				}
+				b.reg.ReleaseReservationTicket(warmTicket)
 				return nil, &Error{
 					Status:    409,
 					Reason:    ReasonSpecMismatch,
@@ -1798,9 +1795,7 @@ func (b *Binder) recoverUnknownOutcome(
 					Providers: []string{t.id},
 				}, attemptDone
 			case provider.KindKeyBusy:
-				if warmReserved {
-					b.reg.ReleaseReservation(t.id)
-				}
+				b.reg.ReleaseReservationTicket(warmTicket)
 				return b.retryPinnedKeyBusy(reqCtx, t, decision, policy, req, claimReq, reqDeadline, cerr)
 			case provider.KindNoCapacity:
 				b.recordRefusal(t.id, req.Template, b.now())
@@ -1811,9 +1806,7 @@ func (b *Binder) recoverUnknownOutcome(
 					Providers: []string{t.id},
 				}, spillOrDone
 			case provider.KindBusy:
-				if warmReserved {
-					b.reg.ReleaseReservation(t.id)
-				}
+				b.reg.ReleaseReservationTicket(warmTicket)
 				bw := provider.RetryAfterOf(cerr)
 				if bw <= 0 {
 					bw = b.refusalTTL
@@ -1831,9 +1824,7 @@ func (b *Binder) recoverUnknownOutcome(
 					RetryAfter: retryWait,
 				}, spillOrDone
 			case provider.KindUnavailable:
-				if warmReserved {
-					b.reg.ReleaseReservation(t.id)
-				}
+				b.reg.ReleaseReservationTicket(warmTicket)
 				t.health.recordUnavailable(b.now(), cerr)
 				return nil, &Error{
 					Status:    503,
@@ -1842,9 +1833,7 @@ func (b *Binder) recoverUnknownOutcome(
 					Providers: []string{t.id},
 				}, spillOrDone
 			case provider.KindRejected:
-				if warmReserved {
-					b.reg.ReleaseReservation(t.id)
-				}
+				b.reg.ReleaseReservationTicket(warmTicket)
 				t.health.recordRejected(cerr)
 				return nil, &Error{
 					Status:    422,

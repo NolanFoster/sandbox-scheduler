@@ -392,13 +392,49 @@ func (r *Registry) Report(providerID string, rep Report) {
 // The error this can make is double counting a claim the report already
 // reflects, for at most one poll. That shows a provider emptier than it is,
 // which spills placements early rather than piling them onto a drained pool.
+// ReservationTicket identifies the provider and one-second bucket of a warm
+// reservation so releasing a failed claim removes the exact bucket that the
+// attempt reserved rather than a newer concurrent reservation.
+type ReservationTicket struct {
+	providerID string
+	sec        uint32
+	valid      bool
+}
+
+// Valid reports whether the ticket represents an active warm reservation.
+func (t ReservationTicket) Valid() bool { return t.valid }
+
 func (r *Registry) TryReserveWarm(providerID string) bool {
+	_, ok := r.TryReserveWarmTicket(providerID)
+	return ok
+}
+
+// TryReserveWarmTicket reserves one warm sandbox on providerID and returns a
+// ticket bound to the reservation's timestamp bucket.
+func (r *Registry) TryReserveWarmTicket(providerID string) (ReservationTicket, bool) {
 	l, ok := (*r.ledgers.Load())[providerID]
 	if !ok {
 		// Removed since the snapshot was taken; nothing left to claim.
+		return ReservationTicket{}, false
+	}
+	sec, ok := l.tryReserve(r.now())
+	if !ok {
+		return ReservationTicket{}, false
+	}
+	return ReservationTicket{providerID: providerID, sec: sec, valid: true}, true
+}
+
+// ReleaseReservationTicket undoes the specific warm reservation represented by
+// ticket if it has not yet been cleared by a capacity poll.
+func (r *Registry) ReleaseReservationTicket(ticket ReservationTicket) bool {
+	if !ticket.valid {
 		return false
 	}
-	return l.tryReserve(r.now())
+	l, ok := (*r.ledgers.Load())[ticket.providerID]
+	if !ok {
+		return false
+	}
+	return l.releaseAt(ticket.sec)
 }
 
 // ReleaseReservation undoes one warm reservation for providerID when a claim
