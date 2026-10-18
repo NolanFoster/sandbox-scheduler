@@ -471,7 +471,7 @@ func (b *Binder) finishAttempt() {
 
 // Bind places and claims a sandbox, spilling across candidates on confirmed
 // refusals while preserving single-sandbox-per-key idempotency.
-func (b *Binder) Bind(ctx context.Context, policy *v1alpha1.SandboxPlacementPolicy, req Request) (*Result, *Error) {
+func (b *Binder) Bind(ctx context.Context, policy *v1alpha1.SandboxPlacementPolicy, req Request) (retRes *Result, retErr *Error) {
 	// Global cap covers active flights and waiters alike so a burst parks at
 	// most globalMaxInFlight goroutines.
 	cur := b.inFlight.Add(1)
@@ -540,6 +540,8 @@ func (b *Binder) Bind(ctx context.Context, policy *v1alpha1.SandboxPlacementPoli
 				Message:   fmt.Sprintf("panic in claim flight: %v", r),
 				Providers: []string{},
 			}
+			retRes = nil
+			retErr = fl.err
 		}
 		b.flightsMu.Lock()
 		delete(b.flights, req.Key)
@@ -1005,17 +1007,19 @@ func (b *Binder) claimLoop(
 	reqDeadline time.Time,
 ) (*Result, *Error) {
 	var (
-		tried            = map[string]bool{}
-		slotsFull        = map[string]*slotLimiter{}
-		overRate         = map[string]time.Duration{}
-		spills           = 0
-		waitedForSlot    = false
-		rejectedCount    = 0
-		unavailableCount = 0
-		busyCount        = 0
-		maxBusyWait      time.Duration
-		lastErr          error
-		lastExplanation  string
+		tried             = map[string]bool{}
+		slotsFull         = map[string]*slotLimiter{}
+		overRate          = map[string]time.Duration{}
+		cooldownProviders = map[string]time.Duration{}
+		maxCooldownWait   time.Duration
+		spills            = 0
+		waitedForSlot     = false
+		rejectedCount     = 0
+		unavailableCount  = 0
+		busyCount         = 0
+		maxBusyWait       time.Duration
+		lastErr           error
+		lastExplanation   string
 	)
 
 	for spills < b.maxSpill && b.now().Before(reqDeadline) {
@@ -1074,9 +1078,9 @@ func (b *Binder) claimLoop(
 			// let profile.Schedule reject it and record the filter explanation.
 			if passesHardFilters(reqCtx, filterProfile.Filters, schedReq, &c) {
 				if wait := b.cooldownRemaining(c.Provider, now); wait > 0 {
-					busyCount++
-					if wait > maxBusyWait {
-						maxBusyWait = wait
+					cooldownProviders[c.Provider] = wait
+					if wait > maxCooldownWait {
+						maxCooldownWait = wait
 					}
 					continue
 				}
@@ -1259,13 +1263,18 @@ func (b *Binder) claimLoop(
 		}
 	}
 
-	if busyCount > 0 && len(tried) == 0 {
+	if len(cooldownProviders) > 0 && len(tried) == 0 {
+		names := make([]string, 0, len(cooldownProviders))
+		for p := range cooldownProviders {
+			names = append(names, p)
+		}
+		sort.Strings(names)
 		return nil, &Error{
 			Status:     429,
 			Reason:     ReasonBusy,
 			Message:    "viable providers are in rate-limit cooldown",
-			Providers:  []string{},
-			RetryAfter: b.jitterDelay(maxBusyWait),
+			Providers:  names,
+			RetryAfter: b.jitterDelay(maxCooldownWait),
 		}
 	}
 
@@ -1489,7 +1498,7 @@ func (b *Binder) retryPinnedKeyBusy(
 	initialErr error,
 ) (*Result, *Error, attemptAction) {
 	lastErr := initialErr
-	requiresWarm := req.WarmOnly || policyHasFilterName(policy, "WarmOnly")
+	requiresWarm := req.WarmOnly
 	for b.now().Before(reqDeadline) && reqCtx.Err() == nil {
 		wait := provider.RetryAfterOf(lastErr)
 		if wait <= 0 {
@@ -1970,22 +1979,10 @@ func (b *Binder) passesJoinerConstraints(
 	if req.PinProvider != "" && req.PinProvider != providerID {
 		return false
 	}
-	if (req.WarmOnly || policyHasFilterName(policy, "WarmOnly")) && !wasWarm {
+	if req.WarmOnly && !wasWarm {
 		return false
 	}
 	return b.passesCandidateFilters(providerID, policy, req)
-}
-
-func policyHasFilterName(policy *v1alpha1.SandboxPlacementPolicy, name string) bool {
-	if policy == nil {
-		return false
-	}
-	for _, f := range policy.Spec.Filters {
-		if f == name {
-			return true
-		}
-	}
-	return false
 }
 
 func (b *Binder) recordRefusal(providerID, template string, now time.Time) {

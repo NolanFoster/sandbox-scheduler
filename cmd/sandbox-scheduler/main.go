@@ -172,8 +172,17 @@ func main() {
 		ColdStartWindow:  coldStartWindow,
 	})
 
-	resolvedClusterID := resolveClusterID(mgr.GetAPIReader(), clusterID)
-	ownerID := provider.OwnerID(releaseName, envOr("POD_NAMESPACE", secretNamespace), resolvedClusterID)
+	var ownerID string
+	if enableClaims {
+		resolvedClusterID, err := resolveClusterID(mgr.GetAPIReader(), clusterID)
+		if err != nil {
+			log.Error(err, "unable to resolve cluster ID for sandbox claims; set --cluster-id or grant get on namespace kube-system")
+			os.Exit(1)
+		}
+		ownerID = provider.OwnerID(releaseName, envOr("POD_NAMESPACE", secretNamespace), resolvedClusterID)
+	} else {
+		ownerID = provider.OwnerID(releaseName, envOr("POD_NAMESPACE", secretNamespace), clusterID)
+	}
 
 	claimBinder := binder.New(binder.Options{
 		Registry:          reg,
@@ -313,20 +322,23 @@ func main() {
 	}
 }
 
-func resolveClusterID(reader client.Reader, explicit string) string {
+func resolveClusterID(reader client.Reader, explicit string) (string, error) {
 	if explicit != "" {
-		return explicit
+		return explicit, nil
 	}
 	if reader == nil {
-		return "sandbox-scheduler"
+		return "", errors.New("API reader is nil and --cluster-id is unset")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var ns corev1.Namespace
-	if err := reader.Get(ctx, types.NamespacedName{Name: "kube-system"}, &ns); err == nil && string(ns.UID) != "" {
-		return string(ns.UID)
+	if err := reader.Get(ctx, types.NamespacedName{Name: "kube-system"}, &ns); err != nil {
+		return "", fmt.Errorf("getting kube-system namespace UID: %w", err)
 	}
-	return "sandbox-scheduler"
+	if string(ns.UID) == "" {
+		return "", errors.New("kube-system namespace has empty UID")
+	}
+	return string(ns.UID), nil
 }
 
 // cachedPolicies reads policies from the manager's informer cache.
