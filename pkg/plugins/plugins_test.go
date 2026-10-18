@@ -249,6 +249,48 @@ func TestAffinityLosesToASubstantiallyBetterOption(t *testing.T) {
 	}
 }
 
+func TestTemplateAvailableAndWarmOnlyFilters(t *testing.T) {
+	tf := plugins.TemplateAvailable{}
+	cand := &framework.Candidate{
+		Provider:  "civo",
+		Templates: map[string]string{"python-3.12": "py-pool"},
+	}
+	if ok, _ := tf.Filter(ctx, &framework.Request{}, cand); !ok {
+		t.Fatal("empty template request must pass TemplateAvailable")
+	}
+	if ok, _ := tf.Filter(ctx, &framework.Request{Template: "python-3.12"}, cand); !ok {
+		t.Fatal("declared template must pass TemplateAvailable")
+	}
+	if ok, reason := tf.Filter(ctx, &framework.Request{Template: "gpu-large"}, cand); ok || !contains(reason, "gpu-large") {
+		t.Fatalf("missing template should fail with reason naming it, got ok=%v reason=%q", ok, reason)
+	}
+
+	wf := plugins.WarmOnly{}
+	if ok, _ := wf.Filter(ctx, &framework.Request{WarmOnly: false}, &framework.Candidate{WarmCapacity: 0}); !ok {
+		t.Fatal("WarmOnly=false must allow cold candidates")
+	}
+	if ok, _ := wf.Filter(ctx, &framework.Request{WarmOnly: true}, &framework.Candidate{WarmCapacity: 1}); !ok {
+		t.Fatal("WarmOnly=true must allow warm candidates")
+	}
+	if ok, _ := wf.Filter(ctx, &framework.Request{WarmOnly: true}, &framework.Candidate{WarmCapacity: 0}); ok {
+		t.Fatal("WarmOnly=true must reject cold candidates")
+	}
+}
+
+func TestWarmCapacityElasticScoring(t *testing.T) {
+	s := plugins.WarmCapacity{}
+	// Default elastic score is 20 of 100 when WarmCapacity is 0.
+	if got := s.Score(ctx, &framework.Request{}, &framework.Candidate{Elastic: true}); got != 20 {
+		t.Fatalf("elastic candidate with default score = %d, want 20", got)
+	}
+	if got := s.Score(ctx, &framework.Request{}, &framework.Candidate{Elastic: true, ElasticWarmScore: 35}); got != 35 {
+		t.Fatalf("elastic candidate with custom score = %d, want 35", got)
+	}
+	if got := s.Score(ctx, &framework.Request{}, &framework.Candidate{Elastic: true, ElasticWarmScore: -1}); got != 0 {
+		t.Fatalf("elastic candidate with explicit 0 score = %d, want 0", got)
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(sub) == 0 || (len(s) >= len(sub) && indexOf(s, sub) >= 0)
 }

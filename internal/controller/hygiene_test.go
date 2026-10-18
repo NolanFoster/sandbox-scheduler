@@ -16,6 +16,7 @@ import (
 	"github.com/NolanFoster/sandbox-scheduler/api/v1alpha1"
 	"github.com/NolanFoster/sandbox-scheduler/internal/controller"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/adapter"
+	provpkg "github.com/NolanFoster/sandbox-scheduler/pkg/provider"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/registry"
 )
 
@@ -29,7 +30,7 @@ var counting = struct {
 }{built: map[string]int{}, fetches: map[string]*atomic.Int64{}}
 
 func init() {
-	adapter.Register(countingAdapter, func(cfg adapter.Config) (registry.Source, error) {
+	adapter.Register(countingAdapter, func(cfg adapter.Config) (provpkg.Provider, error) {
 		counting.mu.Lock()
 		defer counting.mu.Unlock()
 		counting.built[cfg.ProviderID]++
@@ -38,7 +39,7 @@ func init() {
 			n = &atomic.Int64{}
 			counting.fetches[cfg.ProviderID] = n
 		}
-		return &countingSource{id: cfg.ProviderID, fetches: n}, nil
+		return provpkg.Provider{Source: &countingSource{id: cfg.ProviderID, fetches: n}}, nil
 	})
 }
 

@@ -930,3 +930,71 @@ func TestAFetchByARemovedAndReaddedSourceIsIgnored(t *testing.T) {
 		t.Fatalf("capacity %d; a fetch from before the removal was recorded", got)
 	}
 }
+
+func TestReleaseReservationRestoresWarmCapacityUnlessClearedByPoll(t *testing.T) {
+	clk := newClock()
+	r := registry.New(registry.Options{ReservationGrace: 5 * time.Second, Now: clk.now})
+	r.Report("civo", registry.Report{WarmCapacity: 3})
+
+	if !r.TryReserveWarm("civo") || !r.TryReserveWarm("civo") {
+		t.Fatal("expected two warm reservations to succeed")
+	}
+	if got := r.Snapshot()[0].WarmCapacity; got != 1 {
+		t.Fatalf("WarmCapacity = %d, want 1", got)
+	}
+
+	// Releasing one reservation restores one warm slot.
+	if !r.ReleaseReservation("civo") {
+		t.Fatal("expected ReleaseReservation to undo one active reservation")
+	}
+	if got := r.Snapshot()[0].WarmCapacity; got != 2 {
+		t.Fatalf("WarmCapacity after release = %d, want 2", got)
+	}
+
+	// Once a poll after the grace period clears the remaining reservation, a
+	// late ReleaseReservation must be a no-op and never drive Reserved below 0.
+	clk.advance(10 * time.Second)
+	r.Report("civo", registry.Report{WarmCapacity: 2})
+	if r.ReleaseReservation("civo") {
+		t.Fatal("ReleaseReservation after poll cleared the bucket should return false")
+	}
+	st := r.Statuses()[0]
+	if st.Reserved != 0 || r.Snapshot()[0].WarmCapacity != 2 {
+		t.Fatalf("after post-poll release: Reserved=%d WarmCapacity=%d, want 0 and 2",
+			st.Reserved, r.Snapshot()[0].WarmCapacity)
+	}
+}
+
+func TestReleaseReservationConcurrentInterleavingNeverUnderflows(t *testing.T) {
+	clk := newClock()
+	r := registry.New(registry.Options{ReservationGrace: 2 * time.Second, Now: clk.now})
+	r.Report("civo", registry.Report{WarmCapacity: 50})
+
+	var wg sync.WaitGroup
+	for g := 0; g < 16; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				if r.TryReserveWarm("civo") && i%2 == 0 {
+					r.ReleaseReservation("civo")
+				}
+				if id == 0 && i%10 == 0 {
+					clk.advance(time.Second)
+					r.Report("civo", registry.Report{WarmCapacity: 50})
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	clk.advance(10 * time.Second)
+	r.Report("civo", registry.Report{WarmCapacity: 50})
+	st := r.Statuses()[0]
+	if st.Reserved != 0 {
+		t.Fatalf("Reserved = %d after settling poll, want 0", st.Reserved)
+	}
+	if got := r.Snapshot()[0].WarmCapacity; got != 50 {
+		t.Fatalf("WarmCapacity = %d after settling poll, want 50", got)
+	}
+}

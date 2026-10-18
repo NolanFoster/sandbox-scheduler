@@ -2,12 +2,13 @@
 // providers.
 //
 // It runs two things in one process: a controller-runtime manager reconciling
-// the placement API, and an HTTP server answering placement questions.
+// the placement API, and an HTTP server answering placement and claim
+// requests.
 //
 // With --leader-elect, every replica keeps a warm registry but only the leader
-// serves placement: reservations live in the deciding replica's memory, so
-// they are only exact while one replica makes every decision. See
-// internal/leader.
+// serves placement and claims: reservations and per-key singleflight state
+// live in the deciding replica's memory, so they are only exact while one
+// replica makes every decision. See internal/leader.
 //
 // They share state through the manager's informer cache rather than through
 // copies. A List against that cache is a memory read, so the HTTP path stays
@@ -22,6 +23,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -40,7 +42,9 @@ import (
 	"github.com/NolanFoster/sandbox-scheduler/internal/controller"
 	"github.com/NolanFoster/sandbox-scheduler/internal/leader"
 	_ "github.com/NolanFoster/sandbox-scheduler/pkg/adapter/agentsandbox"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/binder"
 	schedmetrics "github.com/NolanFoster/sandbox-scheduler/pkg/metrics"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/provider"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/registry"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/scheduler"
 )
@@ -60,15 +64,25 @@ func utilRuntimeMust(err error) {
 
 func main() {
 	var (
-		metricsAddr      string
-		probeAddr        string
-		schedulerAddr    string
-		secretNamespace  string
-		refreshInterval  time.Duration
-		staleAfter       time.Duration
-		reservationGrace time.Duration
-		coldStartWindow  time.Duration
-		leaderElection   bool
+		metricsAddr       string
+		probeAddr         string
+		schedulerAddr     string
+		secretNamespace   string
+		refreshInterval   time.Duration
+		staleAfter        time.Duration
+		reservationGrace  time.Duration
+		coldStartWindow   time.Duration
+		leaderElection    bool
+		enableClaims      bool
+		claimTimeout      time.Duration
+		claimMaxInFlight  int
+		claimQueueTimeout time.Duration
+		claimMaxTTL       time.Duration
+		maxSpill          int
+		maxJoinersPerKey  int
+		refusalTTL        time.Duration
+		clusterID         string
+		releaseName       string
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address for the metrics endpoint.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address for health and readiness probes.")
@@ -92,6 +106,26 @@ func main() {
 		"Elect a leader. Required with more than one replica: only the leader serves placement and "+
 			"writes status, while the others keep a warm registry to take over from. Set POD_NAME so "+
 			"the leader can label its own pod for the placement Service to select.")
+	flag.BoolVar(&enableClaims, "enable-claims", false,
+		"Enable scheduler-managed sandbox claims on POST/DELETE /api/v1alpha1/sandboxes.")
+	flag.DurationVar(&claimTimeout, "claim-timeout", binder.DefaultClaimTimeout,
+		"Default end-to-end request deadline for a sandbox claim.")
+	flag.IntVar(&claimMaxInFlight, "claim-max-inflight", binder.DefaultGlobalMaxInFlight,
+		"Global maximum concurrent sandbox claim requests (including joiners).")
+	flag.DurationVar(&claimQueueTimeout, "claim-queue-timeout", binder.DefaultQueueTimeout,
+		"How long to wait for a provider in-flight slot to open when all viable providers are full.")
+	flag.DurationVar(&claimMaxTTL, "claim-max-ttl", binder.DefaultMaxTTL,
+		"Maximum sandbox TTL permitted on a claim request.")
+	flag.IntVar(&maxSpill, "max-spill", binder.DefaultMaxSpill,
+		"Maximum number of providers tried per claim request.")
+	flag.IntVar(&maxJoinersPerKey, "max-joiners-per-key", binder.DefaultMaxJoinersPerKey,
+		"Maximum concurrent requests that may join an in-flight claim for the same key.")
+	flag.DurationVar(&refusalTTL, "refusal-ttl", binder.DefaultRefusalTTL,
+		"How long a provider's NoCapacity refusal for a template suppresses further claims for that template.")
+	flag.StringVar(&clusterID, "cluster-id", "",
+		"Cluster identifier used to scope sandbox owner labels; defaults to the kube-system Namespace UID when unset.")
+	flag.StringVar(&releaseName, "release-name", envOr("RELEASE_NAME", "sandbox-scheduler"),
+		"Helm release / deployment fullname used to scope sandbox owner labels.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -123,10 +157,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	var (
+		claimBinder *binder.Binder
+		electOnce   sync.Once
+	)
+	recordElected := func() {
+		if leaderElection && claimBinder != nil {
+			electOnce.Do(claimBinder.NotifyElected)
+		}
+	}
+
 	// True from election onward; always true when leader election is off.
+	// Calls recordElected synchronously before returning true so no request
+	// can observe an active leader before the lease-handover hold-off window
+	// has been armed.
 	elected := func() bool {
 		select {
 		case <-mgr.Elected():
+			recordElected()
 			return true
 		default:
 			return false
@@ -139,6 +187,26 @@ func main() {
 		ColdStartWindow:  coldStartWindow,
 	})
 
+	if enableClaims {
+		resolvedClusterID, err := resolveClusterID(mgr.GetAPIReader(), clusterID)
+		if err != nil {
+			log.Error(err, "unable to resolve cluster ID for sandbox claims; set --cluster-id or grant get on namespace kube-system")
+			os.Exit(1)
+		}
+		ownerID := provider.OwnerID(releaseName, envOr("POD_NAMESPACE", secretNamespace), resolvedClusterID)
+		claimBinder = binder.New(binder.Options{
+			Registry:          reg,
+			Owner:             ownerID,
+			ClaimTimeout:      claimTimeout,
+			QueueTimeout:      claimQueueTimeout,
+			RefusalTTL:        refusalTTL,
+			MaxTTL:            claimMaxTTL,
+			MaxSpill:          maxSpill,
+			GlobalMaxInFlight: claimMaxInFlight,
+			MaxJoinersPerKey:  maxJoinersPerKey,
+		})
+	}
+
 	// Provider gauges are collected at scrape time, so they always reflect what
 	// the scheduler believes right now rather than what a timer last copied.
 	if err := schedmetrics.RegisterRegistryCollector(reg); err != nil {
@@ -149,6 +217,7 @@ func main() {
 	if err := (&controller.SandboxProviderReconciler{
 		Client:          mgr.GetClient(),
 		Registry:        reg,
+		Binder:          claimBinder,
 		SecretNamespace: secretNamespace,
 		WriteStatus:     elected,
 	}).SetupWithManager(mgr); err != nil {
@@ -172,10 +241,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Token comes from the environment rather than a flag: a flag lands in the
+	// Tokens come from the environment rather than flags: a flag lands in the
 	// process table and in `kubectl describe pod` output for anyone with read
 	// access to the namespace.
 	apiToken := os.Getenv("PLACEMENT_API_TOKEN")
+	claimToken := os.Getenv("PLACEMENT_CLAIM_TOKEN")
 	if apiToken == "" {
 		log.Info("placement API is UNAUTHENTICATED; set PLACEMENT_API_TOKEN before " +
 			"exposing it outside the cluster — GET /providers discloses provider " +
@@ -183,14 +253,30 @@ func main() {
 	}
 
 	svc := &scheduler.Service{
-		Registry:  reg,
-		Policies:  &cachedPolicies{client: mgr.GetClient()},
-		Endpoints: endpointLookup(mgr.GetClient()),
-		Token:     apiToken,
+		Registry:      reg,
+		Policies:      &cachedPolicies{client: mgr.GetClient()},
+		Endpoints:     endpointLookup(mgr.GetClient()),
+		Binder:        claimBinder,
+		ClaimsEnabled: enableClaims,
+		Token:         apiToken,
+		ClaimToken:    claimToken,
 	}
 	var labeler *leader.PodLabeler
 	if leaderElection {
 		svc.Active = elected
+		if claimBinder != nil {
+			if err := mgr.Add(everyReplica{manager.RunnableFunc(func(ctx context.Context) error {
+				select {
+				case <-mgr.Elected():
+					recordElected()
+				case <-ctx.Done():
+				}
+				return nil
+			})}); err != nil {
+				log.Error(err, "unable to add leader election hold-off hook")
+				os.Exit(1)
+			}
+		}
 		if podName := os.Getenv("POD_NAME"); podName != "" {
 			labeler = &leader.PodLabeler{
 				Client:    mgr.GetClient(),
@@ -208,7 +294,18 @@ func main() {
 				"refuse placement requests routed to them")
 		}
 	}
-	if err := mgr.Add(&httpServer{addr: schedulerAddr, handler: svc.Handler(), log: ctrl.Log.WithName("placement-api")}); err != nil {
+
+	shutdownTimeout := 10 * time.Second
+	if enableClaims && claimTimeout+5*time.Second > shutdownTimeout {
+		shutdownTimeout = claimTimeout + 5*time.Second
+	}
+	if err := mgr.Add(&httpServer{
+		addr:            schedulerAddr,
+		handler:         svc.Handler(),
+		binder:          claimBinder,
+		shutdownTimeout: shutdownTimeout,
+		log:             ctrl.Log.WithName("placement-api"),
+	}); err != nil {
 		log.Error(err, "unable to add the placement API server")
 		os.Exit(1)
 	}
@@ -229,12 +326,32 @@ func main() {
 	}
 
 	log.Info("starting sandbox-scheduler",
-		"placementAPI", schedulerAddr, "refreshInterval", refreshInterval, "staleAfter", staleAfter, "reservationGrace", reservationGrace,
-		"coldStartWindow", coldStartWindow)
+		"placementAPI", schedulerAddr, "enableClaims", enableClaims,
+		"refreshInterval", refreshInterval, "staleAfter", staleAfter,
+		"reservationGrace", reservationGrace, "coldStartWindow", coldStartWindow)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "manager exited with error")
 		os.Exit(1)
 	}
+}
+
+func resolveClusterID(reader client.Reader, explicit string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	if reader == nil {
+		return "", errors.New("API reader is nil and --cluster-id is unset")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var ns corev1.Namespace
+	if err := reader.Get(ctx, types.NamespacedName{Name: "kube-system"}, &ns); err != nil {
+		return "", fmt.Errorf("getting kube-system namespace UID: %w", err)
+	}
+	if string(ns.UID) == "" {
+		return "", errors.New("kube-system namespace has empty UID")
+	}
+	return string(ns.UID), nil
 }
 
 // cachedPolicies reads policies from the manager's informer cache.
@@ -260,9 +377,9 @@ func (c *cachedPolicies) Policies() []v1alpha1.SandboxPlacementPolicy {
 // endpointLookup resolves a provider name to its endpoint, so a caller can act
 // on a decision without keeping its own copy of the provider registry.
 func endpointLookup(c client.Client) scheduler.EndpointLookup {
-	return func(provider string) string {
+	return func(providerName string) string {
 		var p v1alpha1.SandboxProvider
-		if err := c.Get(context.Background(), types.NamespacedName{Name: provider}, &p); err != nil {
+		if err := c.Get(context.Background(), types.NamespacedName{Name: providerName}, &p); err != nil {
 			return ""
 		}
 		return p.Spec.Endpoint
@@ -272,9 +389,11 @@ func endpointLookup(c client.Client) scheduler.EndpointLookup {
 // httpServer runs the placement API under the manager's lifecycle so it shuts
 // down with everything else rather than being killed mid-request.
 type httpServer struct {
-	addr    string
-	handler http.Handler
-	log     logrLogger
+	addr            string
+	handler         http.Handler
+	binder          *binder.Binder
+	shutdownTimeout time.Duration
+	log             logrLogger
 }
 
 type logrLogger interface {
@@ -301,9 +420,17 @@ func (s *httpServer) Start(ctx context.Context) error {
 	case err := <-errCh:
 		return fmt.Errorf("placement API: %w", err)
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		timeout := s.shutdownTimeout
+		if timeout <= 0 {
+			timeout = 10 * time.Second
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		srvErr := srv.Shutdown(shutdownCtx)
+		if s.binder != nil {
+			_ = s.binder.Shutdown(shutdownCtx)
+		}
+		return srvErr
 	}
 }
 

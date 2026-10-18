@@ -20,6 +20,8 @@ import (
 var knownFilters = map[string]func() framework.Filter{
 	"RequiredAttributes": func() framework.Filter { return plugins.RequiredAttributes{} },
 	"Reachable":          func() framework.Filter { return plugins.Reachable{} },
+	"TemplateAvailable":  func() framework.Filter { return plugins.TemplateAvailable{} },
+	"WarmOnly":           func() framework.Filter { return plugins.WarmOnly{} },
 }
 
 // knownScorers maps API names to implementations.
@@ -187,10 +189,23 @@ func (p *SandboxProvider) ProviderCandidate(reachable bool) framework.Candidate 
 	if p.Spec.CostPerHour != nil {
 		c.CostPerHour = p.Spec.CostPerHour.AsApproximateFloat64()
 	}
+	if p.Spec.Claims != nil && p.Spec.Claims.ElasticWarmScore != nil {
+		if *p.Spec.Claims.ElasticWarmScore <= 0 {
+			c.ElasticWarmScore = -1
+		} else {
+			c.ElasticWarmScore = int(*p.Spec.Claims.ElasticWarmScore)
+		}
+	}
 	if len(p.Spec.Attributes) > 0 {
 		c.Attributes = make(map[string]string, len(p.Spec.Attributes))
 		for k, v := range p.Spec.Attributes {
 			c.Attributes[k] = v
+		}
+	}
+	if len(p.Spec.Templates) > 0 {
+		c.Templates = make(map[string]string, len(p.Spec.Templates))
+		for _, tm := range p.Spec.Templates {
+			c.Templates[tm.Name] = tm.Ref
 		}
 	}
 	return c

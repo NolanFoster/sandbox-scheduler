@@ -38,6 +38,11 @@ type ledger struct {
 	// overstate capacity.
 	carry atomic.Uint64
 
+	// clearedSec is the latest cutoff second passed to clearBefore, so a late
+	// release of an older reservation that a poll has already cleared does not
+	// steal a newer reservation from carry.
+	clearedSec atomic.Uint32
+
 	// cold holds each cold placement under the second it was made. Unlike a
 	// reservation, nothing a provider reports says when a cold start is done,
 	// so these simply age out of the window; see Options.ColdStartWindow.
@@ -114,6 +119,50 @@ func (r *ring) sumSince(since uint32) int {
 	return n
 }
 
+// takeAt decrements one count from the bucket for sec if it still holds
+// reservations for that exact second.
+func (r *ring) takeAt(sec uint32) bool {
+	b := &r.buckets[sec&r.mask]
+	for {
+		old := b.Load()
+		e, c := unpack(old)
+		if c == 0 || e != sec {
+			return false
+		}
+		var next uint64
+		if c > 1 {
+			next = pack(e, c-1)
+		}
+		if b.CompareAndSwap(old, next) {
+			return true
+		}
+	}
+}
+
+// takeOne decrements one count from the most recent non-empty bucket at or
+// before sec, returning true only if a count was removed by compare-and-swap.
+func (r *ring) takeOne(sec uint32) bool {
+	for step := uint32(0); step <= r.mask; step++ {
+		idx := (sec - step) & r.mask
+		b := &r.buckets[idx]
+		for {
+			old := b.Load()
+			e, c := unpack(old)
+			if c == 0 {
+				break
+			}
+			var next uint64
+			if c > 1 {
+				next = pack(e, c-1)
+			}
+			if b.CompareAndSwap(old, next) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // epoch is the one-second bucket t falls in. Seconds since the Unix epoch fit
 // in 32 bits until 2106.
 func epoch(t time.Time) uint32 { return uint32(t.Unix()) }
@@ -148,20 +197,73 @@ func (l *ledger) reserved() int {
 	return int(out)
 }
 
-// tryReserve claims one warm sandbox if the report has any left unreserved.
-func (l *ledger) tryReserve(now time.Time) bool {
+// tryReserve claims one warm sandbox if the report has any left unreserved,
+// returning the one-second epoch bucket the reservation was recorded in.
+func (l *ledger) tryReserve(now time.Time) (uint32, bool) {
 	for {
 		old := l.state.Load()
 		warm, out := unpack(old)
 		if out >= warm {
-			return false
+			return 0, false
 		}
 		if l.state.CompareAndSwap(old, pack(warm, out+1)) {
 			break
 		}
 	}
-	l.record(epoch(now))
-	return true
+	sec := epoch(now)
+	l.record(sec)
+	return sec, true
+}
+
+// releaseAt undoes one warm reservation recorded at sec. It decrements the
+// state word only if it first removed the reservation's count from its ring
+// bucket (or from carry if the ring slot wrapped before being cleared by a
+// poll). If a poll already cleared sec, releaseAt does nothing.
+func (l *ledger) releaseAt(sec uint32) bool {
+	if !l.reservations.takeAt(sec) {
+		if sec < l.clearedSec.Load() || !l.takeFromCarryAt(sec) {
+			return false
+		}
+	}
+	return l.decrementState()
+}
+
+// release undoes the most recent warm reservation at or before now.
+func (l *ledger) release(now time.Time) bool {
+	if !l.reservations.takeOne(epoch(now)) && !l.takeFromCarryAt(0) {
+		return false
+	}
+	return l.decrementState()
+}
+
+func (l *ledger) decrementState() bool {
+	for {
+		old := l.state.Load()
+		warm, out := unpack(old)
+		if out == 0 {
+			return false
+		}
+		if l.state.CompareAndSwap(old, pack(warm, out-1)) {
+			return true
+		}
+	}
+}
+
+func (l *ledger) takeFromCarryAt(minSec uint32) bool {
+	for {
+		old := l.carry.Load()
+		e, c := unpack(old)
+		if c == 0 || e < minSec {
+			return false
+		}
+		var next uint64
+		if c > 1 {
+			next = pack(e, c-1)
+		}
+		if l.carry.CompareAndSwap(old, next) {
+			return true
+		}
+	}
 }
 
 // record counts one reservation in the bucket for sec, carrying whatever the
@@ -200,6 +302,12 @@ func (l *ledger) addCarry(sec, n uint32) {
 // straddling is kept until the next poll.
 func (l *ledger) clearBefore(cutoff time.Time) {
 	sec := epoch(cutoff)
+	for {
+		old := l.clearedSec.Load()
+		if sec <= old || l.clearedSec.CompareAndSwap(old, sec) {
+			break
+		}
+	}
 	var freed uint32
 	drop := func(w *atomic.Uint64) {
 		for {

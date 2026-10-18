@@ -12,6 +12,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/NolanFoster/sandbox-scheduler/api/v1alpha1"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/binder"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/provider/adaptertest"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/registry"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/scheduler"
 )
@@ -614,5 +616,146 @@ func TestStandbyRefusesPlacementButServesProviders(t *testing.T) {
 	active = true
 	if w, resp, _ := post(t, h, `{}`); w.Code != http.StatusOK || resp.Provider != "civo" {
 		t.Fatalf("leader: status %d, provider %q", w.Code, resp.Provider)
+	}
+}
+
+func TestClaimsDisabledReturns501(t *testing.T) {
+	h := newService(t, map[string]registry.Report{"civo": {WarmCapacity: 1}})
+	w := do(h, http.MethodPost, "/api/v1alpha1/sandboxes", "")
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("status %d, want 501", w.Code)
+	}
+	var errResp scheduler.ErrorResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &errResp)
+	if errResp.Reason != binder.ReasonClaimsDisabled {
+		t.Fatalf("reason %q, want %q", errResp.Reason, binder.ReasonClaimsDisabled)
+	}
+}
+
+func TestVersionedRoutesAndDeprecationHeaders(t *testing.T) {
+	h := newService(t, map[string]registry.Report{"civo": {WarmCapacity: 1}})
+
+	legacy := do(h, http.MethodGet, "/providers", "")
+	if legacy.Header().Get("Deprecation") != "true" || legacy.Header().Get("Sunset") != "v0.3.0" {
+		t.Fatalf("expected Deprecation and Sunset headers on /providers, got %v", legacy.Header())
+	}
+
+	versioned := do(h, http.MethodGet, "/api/v1alpha1/providers", "")
+	if versioned.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1alpha1/providers returned %d", versioned.Code)
+	}
+	if versioned.Header().Get("Deprecation") != "" {
+		t.Fatalf("unexpected Deprecation header on versioned route")
+	}
+}
+
+func TestClaimAndReleaseEndToEndWithSeparateClaimToken(t *testing.T) {
+	reg := registry.New(registry.Options{})
+	reg.Report("civo", registry.Report{WarmCapacity: 2})
+	b := binder.New(binder.Options{Registry: reg})
+	fake := adaptertest.NewFake("civo", 2, false)
+	b.SetTarget("civo", fake.Provider(false), binder.TargetConfig{Enabled: true})
+
+	svc := &scheduler.Service{
+		Registry:      reg,
+		Policies:      &scheduler.PolicyList{},
+		Binder:        b,
+		ClaimsEnabled: true,
+		Token:         "read-tok",
+		ClaimToken:    "claim-tok",
+	}
+	h := svc.Handler()
+
+	// Read token cannot call claim endpoint when ClaimToken is set.
+	r := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/sandboxes", strings.NewReader(`{"key":"sess-1","ttl":"10m"}`))
+	r.Header.Set("Authorization", "Bearer read-tok")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when using read token on claim endpoint, got %d", w.Code)
+	}
+
+	// Claim token succeeds with 201 Created.
+	r = httptest.NewRequest(http.MethodPost, "/api/v1alpha1/sandboxes", strings.NewReader(`{"key":"sess-1","ttlSeconds":600}`))
+	r.Header.Set("Authorization", "Bearer claim-tok")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("claim failed: %d %s", w.Code, w.Body.String())
+	}
+	var cResp scheduler.ClaimResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &cResp); err != nil {
+		t.Fatalf("decode ClaimResponse: %v", err)
+	}
+	if cResp.Provider != "civo" || cResp.ID == "" || !cResp.Warm || cResp.ExpiresAt == nil {
+		t.Fatalf("unexpected ClaimResponse: %+v", cResp)
+	}
+
+	// Retry replay returns 200 OK with the same sandbox ID.
+	r = httptest.NewRequest(http.MethodPost, "/api/v1alpha1/sandboxes", strings.NewReader(`{"key":"sess-1","ttlSeconds":600,"retry":true}`))
+	r.Header.Set("Authorization", "Bearer claim-tok")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("replay failed: %d %s", w.Code, w.Body.String())
+	}
+	var replayResp scheduler.ClaimResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &replayResp)
+	if !replayResp.Replay || replayResp.ID != cResp.ID {
+		t.Fatalf("unexpected replay response: %+v", replayResp)
+	}
+
+	// Delete succeeds with 204.
+	delReq := httptest.NewRequest(http.MethodDelete, "/api/v1alpha1/sandboxes/civo/"+cResp.ID, nil)
+	delReq.Header.Set("Authorization", "Bearer claim-tok")
+	delW := httptest.NewRecorder()
+	h.ServeHTTP(delW, delReq)
+	if delW.Code != http.StatusNoContent {
+		t.Fatalf("release failed: %d %s", delW.Code, delW.Body.String())
+	}
+}
+
+func TestClaimRejectsNonPositiveNumericTTLAndTimeout(t *testing.T) {
+	reg := registry.New(registry.Options{})
+	reg.Report("civo", registry.Report{WarmCapacity: 2})
+	b := binder.New(binder.Options{Registry: reg})
+	fake := adaptertest.NewFake("civo", 2, false)
+	b.SetTarget("civo", fake.Provider(false), binder.TargetConfig{Enabled: true})
+
+	svc := &scheduler.Service{
+		Registry:      reg,
+		Policies:      &scheduler.PolicyList{},
+		Binder:        b,
+		ClaimsEnabled: true,
+	}
+	h := svc.Handler()
+
+	for _, body := range []string{
+		`{"key":"k1","ttlSeconds":0}`,
+		`{"key":"k1","ttlSeconds":-10}`,
+		`{"key":"k1","timeoutSeconds":0}`,
+		`{"key":"k1","timeoutSeconds":-5}`,
+	} {
+		w := do(h, http.MethodPost, "/api/v1alpha1/sandboxes", body)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request for %s, got %d (%s)", body, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), `"providers":[]`) {
+			t.Fatalf("expected providers:[] in error body for %s, got %s", body, w.Body.String())
+		}
+	}
+}
+
+func TestProvidersIncludesTemplates(t *testing.T) {
+	h := newServiceWithConfig(t,
+		map[string]registry.Report{
+			"civo": {WarmCapacity: 3},
+		},
+		map[string]registry.ProviderConfig{
+			"civo": {Templates: map[string]string{"python": "py-pool"}},
+		})
+	got := providers(t, h)["civo"]
+	if got.Templates["python"] != "py-pool" {
+		t.Fatalf("expected templates[python]=py-pool in /providers, got %+v", got.Templates)
 	}
 }

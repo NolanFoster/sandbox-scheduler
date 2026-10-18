@@ -27,12 +27,15 @@ import (
 
 	"github.com/NolanFoster/sandbox-scheduler/api/v1alpha1"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/adapter"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/binder"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/provider"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/registry"
 )
 
 // Condition types and reasons on SandboxProvider.
 const (
-	ConditionReady = "Ready"
+	ConditionReady    = "Ready"
+	ConditionClaiming = "Claiming"
 
 	ReasonReporting      = "Reporting"
 	ReasonDisabled       = "Disabled"
@@ -42,6 +45,12 @@ const (
 	ReasonNoReport       = "NoReportYet"
 	ReasonStale          = "ReportStale"
 	ReasonFetchFailed    = "FetchFailed"
+
+	ReasonClaimCapable     = "ClaimCapable"
+	ReasonClaimsDisabled   = "ClaimsDisabled"
+	ReasonNotClaimCapable  = "AdapterPollOnly"
+	ReasonClaimCircuitOpen = "CircuitOpen"
+	ReasonClaimRejected    = "ClaimRejected"
 )
 
 // defaultStatusInterval is how often a healthy provider is re-reconciled to
@@ -50,8 +59,8 @@ const (
 // `kubectl get sandboxproviders` catches up.
 const defaultStatusInterval = 15 * time.Second
 
-// SandboxProviderReconciler keeps the capacity registry in step with the
-// SandboxProvider objects in the cluster.
+// SandboxProviderReconciler keeps the capacity registry and claim binder in
+// step with the SandboxProvider objects in the cluster.
 //
 // It owns registration, not polling. The registry polls on its own schedule so
 // that capacity freshness is independent of reconcile timing — a controller
@@ -59,6 +68,7 @@ const defaultStatusInterval = 15 * time.Second
 type SandboxProviderReconciler struct {
 	client.Client
 	Registry *registry.Registry
+	Binder   *binder.Binder
 
 	// SecretNamespace is where credentialsRef Secrets are read from.
 	// Providers are cluster-scoped, so the reference has no namespace of its
@@ -82,8 +92,9 @@ type SandboxProviderReconciler struct {
 	// registered source was built from. Most reconciles are status ticks that
 	// change nothing; rebuilding and re-registering the source on each would
 	// restart its polling schedule and discard whatever the adapter holds.
-	mu    sync.Mutex
-	built map[string][sha256.Size]byte
+	mu        sync.Mutex
+	built     map[string][sha256.Size]byte
+	providers map[string]provider.Provider
 }
 
 // readiness is the Ready condition a reconcile arrives at.
@@ -95,19 +106,21 @@ type readiness struct {
 
 // +kubebuilder:rbac:groups=placement.agents.x-k8s.io,resources=sandboxproviders,verbs=get;list;watch
 // +kubebuilder:rbac:groups=placement.agents.x-k8s.io,resources=sandboxproviders/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",namespace=sandbox-scheduler,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=namespaces,resourceNames=kube-system,verbs=get
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile brings one provider's registration and status up to date.
 func (r *SandboxProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	var provider v1alpha1.SandboxProvider
-	if err := r.Get(ctx, req.NamespacedName, &provider); err != nil {
+	var sp v1alpha1.SandboxProvider
+	if err := r.Get(ctx, req.NamespacedName, &sp); err != nil {
 		if apierrors.IsNotFound(err) {
-			// Deleted. Drop it from the registry so it stops being a candidate.
-			// No finalizer: the only state to clean up is in memory, and if the
-			// process dies first, startup rebuilds the registry from whatever
-			// providers still exist.
+			// Deleted. Drop it from the registry and binder so it stops being a
+			// candidate. No finalizer: the only state to clean up is in memory,
+			// and if the process dies first, startup rebuilds the registry from
+			// whatever providers still exist.
 			r.deregister(req.Name)
 			logger.Info("provider deleted, removed from registry", "provider", req.Name)
 			return ctrl.Result{}, nil
@@ -115,100 +128,255 @@ func (r *SandboxProviderReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
-	observed := provider.Status.DeepCopy()
-	ready := r.sync(ctx, &provider)
-	return r.writeStatus(ctx, &provider, observed, ready)
+	observed := sp.Status.DeepCopy()
+	ready, claiming := r.sync(ctx, &sp)
+	return r.writeStatus(ctx, &sp, observed, ready, claiming)
 }
 
-// sync registers the provider as its spec says and returns its readiness,
-// filling in the rest of its status along the way.
-func (r *SandboxProviderReconciler) sync(ctx context.Context, provider *v1alpha1.SandboxProvider) readiness {
-	if provider.Spec.Disabled {
+// sync registers the provider as its spec says and returns its Ready and
+// Claiming conditions, filling in the rest of its status along the way.
+func (r *SandboxProviderReconciler) sync(ctx context.Context, p *v1alpha1.SandboxProvider) (readiness, *readiness) {
+	if p.Spec.Disabled {
 		// Drained, not deleted. Configuration is preserved and one field flip
 		// brings it back.
-		r.deregister(provider.Name)
+		r.deregister(p.Name)
 		return readiness{metav1.ConditionFalse, ReasonDisabled,
-			"provider is disabled and will not be considered for placement"}
+				"provider is disabled and will not be considered for placement"},
+			&readiness{metav1.ConditionFalse, ReasonDisabled, "provider is disabled"}
 	}
 
-	if !adapter.Has(provider.Spec.Adapter) {
+	if !adapter.Has(p.Spec.Adapter) {
 		// Fail visibly rather than never polling it. An unknown adapter usually
 		// means a typo or a scheduler older than the config.
-		r.deregister(provider.Name)
-		return readiness{metav1.ConditionFalse, ReasonUnknownAdapter,
-			fmt.Sprintf("unknown adapter %q (available: %v)", provider.Spec.Adapter, adapter.Names())}
+		r.deregister(p.Name)
+		msg := fmt.Sprintf("unknown adapter %q (available: %v)", p.Spec.Adapter, adapter.Names())
+		return readiness{metav1.ConditionFalse, ReasonUnknownAdapter, msg},
+			&readiness{metav1.ConditionFalse, ReasonUnknownAdapter, msg}
 	}
 
-	creds, err := r.resolveCredentials(ctx, provider)
+	claimsEnabled := p.Spec.Claims != nil && p.Spec.Claims.Enabled
+	if !claimsEnabled && r.Binder != nil {
+		r.Binder.RemoveTarget(p.Name)
+	}
+
+	creds, err := r.resolveCredentials(ctx, p)
 	if err != nil {
 		// Keep polling with what we had rather than dropping the provider: a
-		// Secret that is briefly unreadable should not evacuate a cluster.
-		return readiness{metav1.ConditionFalse, ReasonCredentials, err.Error()}
+		// Secret that is briefly unreadable should not evacuate a cluster, but
+		// billable claims must stop immediately when credentials are missing.
+		if r.Binder != nil {
+			r.Binder.RemoveTarget(p.Name)
+		}
+		claiming := &readiness{
+			status:  metav1.ConditionFalse,
+			reason:  ReasonCredentials,
+			message: err.Error(),
+		}
+		if !claimsEnabled {
+			claiming = &readiness{
+				status:  metav1.ConditionFalse,
+				reason:  ReasonClaimsDisabled,
+				message: "claims are not enabled on this provider (set spec.claims.enabled=true)",
+			}
+		} else if r.Binder == nil {
+			claiming = &readiness{
+				status:  metav1.ConditionFalse,
+				reason:  ReasonClaimsDisabled,
+				message: "sandbox claims are disabled on the scheduler (start with --enable-claims)",
+			}
+		}
+		return readiness{metav1.ConditionFalse, ReasonCredentials, err.Error()}, claiming
+	}
+
+	templates := templateMap(p.Spec.Templates)
+	opts := providerOptions(p)
+	if p.Spec.KubeAPI != nil && p.Spec.KubeAPI.Namespace != "" {
+		if _, exists := opts["namespace"]; !exists {
+			opts["namespace"] = p.Spec.KubeAPI.Namespace
+		}
 	}
 
 	cfg := adapter.Config{
-		ProviderID:  provider.Name,
-		Endpoint:    provider.Spec.Endpoint,
+		ProviderID:  p.Name,
+		Endpoint:    p.Spec.Endpoint,
 		Credentials: creds,
-		Options:     providerOptions(provider),
+		Options:     opts,
+		Templates:   templates,
 	}
-	digest := configDigest(provider.Spec.Adapter, cfg)
-	if !r.isBuilt(provider.Name, digest) {
-		source, err := adapter.New(provider.Spec.Adapter, cfg)
+	digest := configDigest(p.Spec.Adapter, cfg)
+	prov, ok := r.builtProvider(p.Name, digest)
+	if !ok {
+		built, err := adapter.New(p.Spec.Adapter, cfg)
 		if err != nil {
-			r.deregister(provider.Name)
-			return readiness{metav1.ConditionFalse, ReasonAdapterConfig, err.Error()}
+			r.deregister(p.Name)
+			return readiness{metav1.ConditionFalse, ReasonAdapterConfig, err.Error()},
+				&readiness{metav1.ConditionFalse, ReasonAdapterConfig, err.Error()}
 		}
+		prov = built
 		// Re-registering keeps any capacity already known, so a changed
 		// endpoint or rotated credential does not blind the scheduler to this
 		// provider until the new source's first poll.
-		r.Registry.AddSource(source)
-		r.setBuilt(provider.Name, digest)
+		r.Registry.AddSource(prov.Source)
+		r.setBuilt(p.Name, digest, prov)
 	}
 
 	var interval time.Duration
-	if provider.Spec.RefreshInterval != nil {
-		interval = provider.Spec.RefreshInterval.Duration
+	if p.Spec.RefreshInterval != nil {
+		interval = p.Spec.RefreshInterval.Duration
 	}
-	r.Registry.SetRefreshInterval(provider.Name, interval)
+	r.Registry.SetRefreshInterval(p.Name, interval)
 
-	// The trusted half. Attributes and cost come from the spec — written by
-	// someone with permission to write it — and never from what the provider
-	// reports about itself. See registry.ProviderConfig.
-	pc := registry.ProviderConfig{Attributes: provider.Spec.Attributes}
-	if provider.Spec.CostPerHour != nil {
-		pc.CostPerHour = provider.Spec.CostPerHour.AsApproximateFloat64()
+	// The trusted half. Attributes, templates, and cost come from the spec —
+	// written by someone with permission to write it — and never from what the
+	// provider reports about itself. See registry.ProviderConfig.
+	pc := registry.ProviderConfig{
+		Attributes: p.Spec.Attributes,
+		Templates:  templates,
 	}
-	r.Registry.SetConfig(provider.Name, pc)
+	if p.Spec.CostPerHour != nil {
+		pc.CostPerHour = p.Spec.CostPerHour.AsApproximateFloat64()
+	}
+	if p.Spec.Claims != nil && p.Spec.Claims.ElasticWarmScore != nil {
+		score := int(*p.Spec.Claims.ElasticWarmScore)
+		pc.ElasticWarmScore = &score
+	}
+	r.Registry.SetConfig(p.Name, pc)
 
-	return r.registryReadiness(provider)
+	ready, isElastic := r.registryReadiness(p)
+	claiming := r.syncClaims(p, prov, templates, isElastic)
+	return ready, claiming
+}
+
+func (r *SandboxProviderReconciler) syncClaims(
+	p *v1alpha1.SandboxProvider,
+	prov provider.Provider,
+	templates map[string]string,
+	isElastic bool,
+) *readiness {
+	claimsEnabled := p.Spec.Claims != nil && p.Spec.Claims.Enabled
+
+	tcfg := binder.TargetConfig{
+		Enabled:   claimsEnabled && prov.Binder != nil,
+		Elastic:   isElastic,
+		Templates: templates,
+	}
+	if cs := p.Spec.Claims; cs != nil {
+		if cs.MaxInFlight != nil && *cs.MaxInFlight > 0 {
+			tcfg.MaxInFlight = int(*cs.MaxInFlight)
+		}
+		if cs.Timeout != nil && cs.Timeout.Duration > 0 {
+			tcfg.Timeout = cs.Timeout.Duration
+		}
+		if cs.MaxRate != nil && *cs.MaxRate > 0 {
+			tcfg.MaxRate = int(*cs.MaxRate)
+		}
+		if cs.LookupRate != nil && *cs.LookupRate > 0 {
+			tcfg.LookupRate = int(*cs.LookupRate)
+		}
+		if cs.ElasticWarmScore != nil {
+			score := int(*cs.ElasticWarmScore)
+			tcfg.ElasticWarmScore = &score
+		}
+	}
+
+	if r.Binder != nil {
+		r.Binder.SetTarget(p.Name, prov, tcfg)
+	}
+
+	if !claimsEnabled {
+		return &readiness{
+			status:  metav1.ConditionFalse,
+			reason:  ReasonClaimsDisabled,
+			message: "claims are not enabled on this provider (set spec.claims.enabled=true)",
+		}
+	}
+	if r.Binder == nil {
+		return &readiness{
+			status:  metav1.ConditionFalse,
+			reason:  ReasonClaimsDisabled,
+			message: "sandbox claims are disabled on the scheduler (start with --enable-claims)",
+		}
+	}
+	if prov.Binder == nil {
+		return &readiness{
+			status:  metav1.ConditionFalse,
+			reason:  ReasonNotClaimCapable,
+			message: fmt.Sprintf("adapter %q supports capacity polling only", p.Spec.Adapter),
+		}
+	}
+
+	if r.Binder != nil {
+		if hs, ok := r.Binder.HealthStatus(p.Name); ok {
+			if !hs.LastSuccessTime.IsZero() || hs.LastFailureReason != "" {
+				if p.Status.Claims == nil {
+					p.Status.Claims = &v1alpha1.ClaimsStatus{}
+				}
+				if !hs.LastSuccessTime.IsZero() {
+					t := metav1.NewTime(hs.LastSuccessTime).Rfc3339Copy()
+					p.Status.Claims.LastSuccessTime = &t
+				}
+				p.Status.Claims.LastFailureReason = hs.LastFailureReason
+			}
+			if hs.CredentialsError {
+				return &readiness{
+					status:  metav1.ConditionFalse,
+					reason:  ReasonClaimRejected,
+					message: fmt.Sprintf("provider rejected recent claim: %s", hs.LastFailureReason),
+				}
+			}
+			if !hs.Healthy {
+				return &readiness{
+					status:  metav1.ConditionFalse,
+					reason:  ReasonClaimCircuitOpen,
+					message: fmt.Sprintf("claim circuit breaker open: %s", hs.LastFailureReason),
+				}
+			}
+		}
+	}
+
+	return &readiness{
+		status:  metav1.ConditionTrue,
+		reason:  ReasonClaimCapable,
+		message: "provider is ready to serve sandbox claims",
+	}
 }
 
 // deregister stops polling a provider and forgets the source built for it.
 func (r *SandboxProviderReconciler) deregister(name string) {
 	r.Registry.RemoveSource(name)
+	if r.Binder != nil {
+		r.Binder.RemoveTarget(name)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.built, name)
+	delete(r.providers, name)
 }
 
-// isBuilt reports whether the registered source was built from digest. The
-// registry is checked too, so a source it no longer has is rebuilt whatever
-// this reconciler remembers.
-func (r *SandboxProviderReconciler) isBuilt(name string, digest [sha256.Size]byte) bool {
+// builtProvider returns the cached provider.Provider if its digest matches and
+// the registry still has its source.
+func (r *SandboxProviderReconciler) builtProvider(name string, digest [sha256.Size]byte) (provider.Provider, bool) {
 	r.mu.Lock()
 	d, ok := r.built[name]
+	prov := r.providers[name]
 	r.mu.Unlock()
-	return ok && d == digest && r.Registry.HasSource(name)
+	if !ok || d != digest || !r.Registry.HasSource(name) {
+		return provider.Provider{}, false
+	}
+	return prov, true
 }
 
-func (r *SandboxProviderReconciler) setBuilt(name string, digest [sha256.Size]byte) {
+func (r *SandboxProviderReconciler) setBuilt(name string, digest [sha256.Size]byte, prov provider.Provider) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.built == nil {
 		r.built = map[string][sha256.Size]byte{}
 	}
+	if r.providers == nil {
+		r.providers = map[string]provider.Provider{}
+	}
 	r.built[name] = digest
+	r.providers[name] = prov
 }
 
 // configDigest identifies everything a source is built from, so a change to
@@ -227,6 +395,7 @@ func configDigest(adapterName string, cfg adapter.Config) [sha256.Size]byte {
 	field([]byte(cfg.Endpoint))
 	writeMap(h, field, cfg.Options, func(v string) []byte { return []byte(v) })
 	writeMap(h, field, cfg.Credentials, func(v []byte) []byte { return v })
+	writeMap(h, field, cfg.Templates, func(v string) []byte { return []byte(v) })
 	var out [sha256.Size]byte
 	copy(out[:], h.Sum(nil))
 	return out
@@ -243,6 +412,17 @@ func writeMap[V any](h hash.Hash, field func([]byte), m map[string]V, bytes func
 		field([]byte(k))
 		field(bytes(m[k]))
 	}
+}
+
+func templateMap(list []v1alpha1.TemplateMapping) map[string]string {
+	if len(list) == 0 {
+		return nil
+	}
+	m := make(map[string]string, len(list))
+	for _, item := range list {
+		m[item.Name] = item.Ref
+	}
+	return m
 }
 
 // resolveCredentials reads the referenced Secret, if any.
@@ -266,7 +446,7 @@ func (r *SandboxProviderReconciler) resolveCredentials(ctx context.Context, p *v
 
 // registryReadiness copies what the registry knows onto the object's status
 // and says what it means for readiness.
-func (r *SandboxProviderReconciler) registryReadiness(p *v1alpha1.SandboxProvider) readiness {
+func (r *SandboxProviderReconciler) registryReadiness(p *v1alpha1.SandboxProvider) (readiness, bool) {
 	var found *registry.Status
 	for _, st := range r.Registry.Statuses() {
 		if st.Provider == p.Name {
@@ -276,7 +456,7 @@ func (r *SandboxProviderReconciler) registryReadiness(p *v1alpha1.SandboxProvide
 		}
 	}
 	if found == nil {
-		return readiness{metav1.ConditionFalse, ReasonNoReport, "registered, but no capacity report yet"}
+		return readiness{metav1.ConditionFalse, ReasonNoReport, "registered, but no capacity report yet"}, false
 	}
 
 	p.Status.WarmCapacity = int32(found.Report.WarmCapacity)
@@ -299,21 +479,21 @@ func (r *SandboxProviderReconciler) registryReadiness(p *v1alpha1.SandboxProvide
 		// is inside its freshness window — but the error is surfaced so a
 		// flapping provider is visible rather than looking healthy.
 		return readiness{metav1.ConditionTrue, ReasonReporting,
-			fmt.Sprintf("serving last known capacity; most recent fetch failed: %s", found.LastError)}
+			fmt.Sprintf("serving last known capacity; most recent fetch failed: %s", found.LastError)}, found.Report.Elastic
 	case found.Reachable:
 		return readiness{metav1.ConditionTrue, ReasonReporting,
-			fmt.Sprintf("%d warm sandboxes available", found.Report.WarmCapacity)}
+			fmt.Sprintf("%d warm sandboxes available", found.Report.WarmCapacity)}, found.Report.Elastic
 	case found.Stale:
 		// Since a time rather than for a duration: a duration would change the
 		// message, and so cost a status write, on every reconcile for as long
 		// as the provider stays down.
 		return readiness{metav1.ConditionFalse, ReasonStale,
 			fmt.Sprintf("no successful report since %s; last error: %v",
-				found.UpdatedAt.UTC().Format(time.RFC3339), found.LastError)}
+				found.UpdatedAt.UTC().Format(time.RFC3339), found.LastError)}, found.Report.Elastic
 	case found.LastError != nil:
-		return readiness{metav1.ConditionFalse, ReasonFetchFailed, found.LastError.Error()}
+		return readiness{metav1.ConditionFalse, ReasonFetchFailed, found.LastError.Error()}, found.Report.Elastic
 	default:
-		return readiness{metav1.ConditionFalse, ReasonNoReport, "registered, but no capacity report yet"}
+		return readiness{metav1.ConditionFalse, ReasonNoReport, "registered, but no capacity report yet"}, found.Report.Elastic
 	}
 }
 
@@ -323,7 +503,7 @@ func (r *SandboxProviderReconciler) registryReadiness(p *v1alpha1.SandboxProvide
 // server round trip and an etcd revision each, and wakes every watcher of
 // SandboxProviders, for nothing.
 func (r *SandboxProviderReconciler) writeStatus(ctx context.Context, p *v1alpha1.SandboxProvider,
-	observed *v1alpha1.SandboxProviderStatus, ready readiness) (ctrl.Result, error) {
+	observed *v1alpha1.SandboxProviderStatus, ready readiness, claiming *readiness) (ctrl.Result, error) {
 
 	if r.WriteStatus != nil && !r.WriteStatus() {
 		return ctrl.Result{RequeueAfter: r.statusInterval()}, nil
@@ -337,11 +517,23 @@ func (r *SandboxProviderReconciler) writeStatus(ctx context.Context, p *v1alpha1
 		ObservedGeneration: p.Generation,
 		LastTransitionTime: metav1.Now(),
 	})
+	if claiming != nil {
+		setCondition(&p.Status.Conditions, metav1.Condition{
+			Type:               ConditionClaiming,
+			Status:             claiming.status,
+			Reason:             claiming.reason,
+			Message:            claiming.message,
+			ObservedGeneration: p.Generation,
+			LastTransitionTime: metav1.Now(),
+		})
+	}
 	if equality.Semantic.DeepEqual(observed, &p.Status) {
 		return ctrl.Result{RequeueAfter: r.statusInterval()}, nil
 	}
 
-	if err := r.Status().Update(ctx, p); err != nil {
+	base := p.DeepCopy()
+	base.Status = *observed
+	if err := r.Status().Patch(ctx, p, client.MergeFrom(base)); err != nil {
 		if apierrors.IsConflict(err) {
 			// Someone else wrote first. Requeue rather than fight: the next
 			// pass reads fresh and converges.

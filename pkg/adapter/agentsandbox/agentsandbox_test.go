@@ -13,7 +13,7 @@ import (
 
 func build(t *testing.T, endpoint, token string, opts map[string]string) (fetch func() (int, error)) {
 	t.Helper()
-	src, err := adapter.New(agentsandbox.AdapterName, adapter.Config{
+	p, err := adapter.New(agentsandbox.AdapterName, adapter.Config{
 		ProviderID:  "civo",
 		Endpoint:    endpoint,
 		Credentials: map[string][]byte{agentsandbox.CredentialKey: []byte(token)},
@@ -23,7 +23,7 @@ func build(t *testing.T, endpoint, token string, opts map[string]string) (fetch 
 		t.Fatalf("building adapter: %v", err)
 	}
 	return func() (int, error) {
-		rep, err := src.Fetch(context.Background())
+		rep, err := p.Source.Fetch(context.Background())
 		return rep.WarmCapacity, err
 	}
 }
@@ -178,7 +178,7 @@ func TestContextCancellationIsRespected(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	src, err := adapter.New(agentsandbox.AdapterName, adapter.Config{
+	p, err := adapter.New(agentsandbox.AdapterName, adapter.Config{
 		ProviderID: "civo", Endpoint: srv.URL,
 	})
 	if err != nil {
@@ -186,7 +186,7 @@ func TestContextCancellationIsRespected(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := src.Fetch(ctx); err == nil {
+	if _, err := p.Source.Fetch(ctx); err == nil {
 		t.Fatal("a cancelled context must abort the fetch")
 	}
 }
