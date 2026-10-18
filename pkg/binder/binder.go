@@ -338,7 +338,7 @@ func (b *Binder) SetTarget(providerID string, prov provider.Provider, cfg Target
 
 	var coalescer *lookupCoalescer
 	if prov.BatchLookup != nil {
-		coalescer = newLookupCoalescer(prov.BatchLookup, lookupLim, b.coalesceWindow, b.now)
+		coalescer = newLookupCoalescer(prov.BatchLookup, lookupLim, slots, b.startAttempt, b.finishAttempt, b.coalesceWindow, b.now)
 	}
 
 	templatesCopy := make(map[string]string, len(cfg.Templates))
@@ -1340,7 +1340,7 @@ func (b *Binder) attemptProvider(
 		if warmReserved {
 			b.reg.ReleaseReservation(chosen)
 		}
-		return b.retryPinnedKeyBusy(reqCtx, t, decision, policy, claimReq, reqDeadline, err)
+		return b.retryPinnedKeyBusy(reqCtx, t, decision, policy, req, claimReq, reqDeadline, err)
 
 	case provider.KindUnknownOutcome:
 		// Outcome is unknown: keep the warm reservation and pin to this
@@ -1451,11 +1451,13 @@ func (b *Binder) retryPinnedKeyBusy(
 	t *target,
 	decision *framework.Decision,
 	policy *v1alpha1.SandboxPlacementPolicy,
+	req Request,
 	claimReq provider.ClaimRequest,
 	reqDeadline time.Time,
 	initialErr error,
 ) (*Result, *Error, attemptAction) {
 	lastErr := initialErr
+	requiresWarm := req.WarmOnly || policyHasFilterName(policy, "WarmOnly")
 	for b.now().Before(reqDeadline) && reqCtx.Err() == nil {
 		wait := provider.RetryAfterOf(lastErr)
 		if wait <= 0 {
@@ -1468,16 +1470,48 @@ func (b *Binder) retryPinnedKeyBusy(
 		if !b.sleepUntil(reqCtx, nextTry) {
 			break
 		}
+
+		// Reacquire warm capacity (or account a cold placement) for this retry
+		// attempt so the ledger stays accurate and warmOnly is enforced.
+		retryWarm := false
+		if !t.cfg.Elastic && b.reg.TryReserveWarm(t.id) {
+			retryWarm = true
+		} else {
+			if requiresWarm {
+				return nil, &Error{
+					Status:    409,
+					Reason:    ReasonNoCapacity,
+					Message:   fmt.Sprintf("provider %q has no warm capacity remaining while retrying key %q", t.id, req.Key),
+					Providers: []string{t.id},
+				}, attemptDone
+			}
+			now := b.now()
+			if !t.claimRate.AllowN(now, 1) {
+				return nil, &Error{
+					Status:     429,
+					Reason:     ReasonRateLimited,
+					Message:    fmt.Sprintf("provider %q exceeded spec.claims.maxRate while retrying key %q", t.id, req.Key),
+					Providers:  []string{t.id},
+					RetryAfter: b.jitterDelay(b.timeUntilNextToken(t.claimRate, now)),
+				}, attemptDone
+			}
+			b.reg.RecordColdPlacement(t.id)
+		}
+
 		h, replay, err := b.invokeClaim(reqCtx, t, claimReq, reqDeadline)
 		if err == nil {
 			t.health.recordSuccess(b.now())
 			return &Result{
 				Handle:      h,
 				Replay:      replay,
+				Warm:        retryWarm,
 				Policy:      policy.Name,
 				Score:       decision.Score,
 				Explanation: decision.Explain(),
 			}, nil, attemptDone
+		}
+		if retryWarm && provider.KindOf(err) != provider.KindNoCapacity && provider.KindOf(err) != provider.KindUnknownOutcome {
+			b.reg.ReleaseReservation(t.id)
 		}
 		lastErr = err
 		if provider.KindOf(err) == provider.KindKeyConflict {
@@ -1708,9 +1742,10 @@ func (b *Binder) buildScheduleProfile(
 }
 
 // passesCandidateFilters checks whether providerID satisfies the hard filters
-// of policy and req (Requires and Template) for a sandbox that already exists
-// on providerID. WarmOnly is not checked here because a sandbox found by
-// Lookup is already running.
+// of policy and req for a sandbox that already exists on providerID. WarmOnly
+// is not checked here because a sandbox found by Lookup is already running and
+// cand.WarmCapacity reflects remaining pool capacity after the sandbox was
+// claimed.
 func (b *Binder) passesCandidateFilters(
 	providerID string,
 	policy *v1alpha1.SandboxPlacementPolicy,
@@ -1720,7 +1755,8 @@ func (b *Binder) passesCandidateFilters(
 		policy = v1alpha1.DefaultPolicy()
 	}
 	var cand *framework.Candidate
-	for _, c := range b.reg.Snapshot() {
+	allSnapshots := b.reg.Snapshot()
+	for _, c := range allSnapshots {
 		if c.Provider == providerID {
 			cp := c
 			cand = &cp
@@ -1740,13 +1776,17 @@ func (b *Binder) passesCandidateFilters(
 		cand.Templates = t.cfg.Templates
 	}
 
-	schedReq := policy.BuildRequest(req.Key, req.Requires, req.PreferProvider)
-	schedReq.Template = req.Template
-	if ok, _ := (plugins.RequiredAttributes{}).Filter(context.Background(), schedReq, cand); !ok {
+	profile, schedReq, err := b.buildScheduleProfile(policy, req, allSnapshots)
+	if err != nil {
 		return false
 	}
-	if ok, _ := (plugins.TemplateAvailable{}).Filter(context.Background(), schedReq, cand); !ok {
-		return false
+	for _, f := range profile.Filters {
+		if f.Name() == "WarmOnly" {
+			continue
+		}
+		if ok, _ := f.Filter(context.Background(), schedReq, cand); !ok {
+			return false
+		}
 	}
 	return true
 }
@@ -1760,10 +1800,22 @@ func (b *Binder) passesJoinerConstraints(
 	if req.PinProvider != "" && req.PinProvider != providerID {
 		return false
 	}
-	if req.WarmOnly && !wasWarm {
+	if (req.WarmOnly || policyHasFilterName(policy, "WarmOnly")) && !wasWarm {
 		return false
 	}
 	return b.passesCandidateFilters(providerID, policy, req)
+}
+
+func policyHasFilterName(policy *v1alpha1.SandboxPlacementPolicy, name string) bool {
+	if policy == nil {
+		return false
+	}
+	for _, f := range policy.Spec.Filters {
+		if f == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Binder) recordRefusal(providerID, template string, now time.Time) {

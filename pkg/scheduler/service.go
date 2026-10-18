@@ -100,9 +100,9 @@ type ClaimRequest struct {
 	PinProvider    string            `json:"pinProvider,omitempty"`
 	WarmOnly       bool              `json:"warmOnly,omitempty"`
 	TTL            string            `json:"ttl,omitempty"`
-	TTLSeconds     int64             `json:"ttlSeconds,omitempty"`
+	TTLSeconds     *int64            `json:"ttlSeconds,omitempty"`
 	Timeout        string            `json:"timeout,omitempty"`
-	TimeoutSeconds int64             `json:"timeoutSeconds,omitempty"`
+	TimeoutSeconds *int64            `json:"timeoutSeconds,omitempty"`
 }
 
 // ClaimResponse is the JSON body of a successful POST /api/v1alpha1/sandboxes.
@@ -405,9 +405,18 @@ func (s *Service) handleClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	const maxSecondsField = int64(time.Hour * 24 * 365 / time.Second)
 	var ttl time.Duration
-	if raw.TTLSeconds > 0 {
-		ttl = time.Duration(raw.TTLSeconds) * time.Second
+	if raw.TTLSeconds != nil {
+		if *raw.TTLSeconds <= 0 || *raw.TTLSeconds > maxSecondsField {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{
+				Error:     "invalid ttlSeconds: must be positive",
+				Reason:    binder.ReasonInvalidRequest,
+				Providers: []string{},
+			})
+			return
+		}
+		ttl = time.Duration(*raw.TTLSeconds) * time.Second
 	} else if raw.TTL != "" {
 		d, err := time.ParseDuration(raw.TTL)
 		if err != nil || d <= 0 {
@@ -422,8 +431,16 @@ func (s *Service) handleClaim(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var timeout time.Duration
-	if raw.TimeoutSeconds > 0 {
-		timeout = time.Duration(raw.TimeoutSeconds) * time.Second
+	if raw.TimeoutSeconds != nil {
+		if *raw.TimeoutSeconds <= 0 || *raw.TimeoutSeconds > maxSecondsField {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{
+				Error:     "invalid timeoutSeconds: must be positive",
+				Reason:    binder.ReasonInvalidRequest,
+				Providers: []string{},
+			})
+			return
+		}
+		timeout = time.Duration(*raw.TimeoutSeconds) * time.Second
 	} else if raw.Timeout != "" {
 		d, err := time.ParseDuration(raw.Timeout)
 		if err != nil || d <= 0 {
@@ -609,6 +626,7 @@ func (s *Service) handleProviders(w http.ResponseWriter, _ *http.Request) {
 			WarmCapacity: st.Report.WarmCapacity,
 			Reserved:     st.Reserved,
 			InFlightCold: st.InFlightCold,
+			Templates:    st.Config.Templates,
 			AgeSeconds:   int64(st.Age / time.Second),
 		}
 		if s.Endpoints != nil {

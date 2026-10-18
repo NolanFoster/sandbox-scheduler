@@ -81,7 +81,7 @@ func newTestBinder(t *testing.T, opts binder.Options) (*binder.Binder, *registry
 	reg := registry.New(registry.Options{})
 	opts.Registry = reg
 	if opts.Owner == "" {
-		opts.Owner = provider.OwnerID("cluster-uid-1", "sandbox-scheduler", "default")
+		opts.Owner = provider.OwnerID("sandbox-scheduler", "default", "cluster-uid-1")
 	}
 	b := binder.New(opts)
 	t.Cleanup(func() {
@@ -535,5 +535,64 @@ func TestWarmOnlyRequiresWarmCapacity(t *testing.T) {
 	})
 	if berr == nil || berr.Status != 409 || berr.Reason != binder.ReasonNoCapacity {
 		t.Fatalf("expected 409 NoCapacity when WarmOnly=true and WarmCapacity=0, got %+v", berr)
+	}
+}
+
+func TestPinnedKeyBusyRetryReacquiresWarmCapacity(t *testing.T) {
+	b, reg := newTestBinder(t, binder.Options{
+		RandFloat64: func() float64 { return 0.01 },
+	})
+	reg.Report("civo", registry.Report{WarmCapacity: 1})
+
+	var attempts atomic.Int32
+	civoBinder := &scriptBinder{
+		claimFn: func(_ context.Context, req provider.ClaimRequest) (provider.Handle, error) {
+			if attempts.Add(1) == 1 {
+				return provider.Handle{}, provider.KeyBusy(5*time.Millisecond, errors.New("transient key lock"))
+			}
+			return provider.Handle{Provider: "civo", ID: "sb-" + req.Key}, nil
+		},
+	}
+	b.SetTarget("civo", civoBinder.asProvider(false), binder.TargetConfig{Enabled: true})
+
+	res, berr := b.Bind(context.Background(), nil, binder.Request{
+		Key:      "key-busy-1",
+		WarmOnly: true,
+	})
+	if berr != nil {
+		t.Fatalf("unexpected error on KeyBusy retry: %+v", berr)
+	}
+	if !res.Warm {
+		t.Fatalf("expected Warm=true after reacquiring warm reservation on retry")
+	}
+	for _, st := range reg.Statuses() {
+		if st.Provider == "civo" && st.Reserved != 1 {
+			t.Fatalf("expected civo Reserved=1 after KeyBusy retry succeeded, got %d", st.Reserved)
+		}
+	}
+}
+
+func TestReplayEvaluatesReachablePolicyFilter(t *testing.T) {
+	b, _ := newTestBinder(t, binder.Options{})
+	// Do not report capacity for "unreachable", so its candidate has Reachable=false.
+	unreachBinder := &scriptBinder{
+		lookupFn: func(_ context.Context, req provider.ClaimRequest) (provider.Handle, error) {
+			return provider.Handle{Provider: "unreachable", ID: "sb-" + req.Key}, nil
+		},
+	}
+	b.SetTarget("unreachable", unreachBinder.asProvider(false), binder.TargetConfig{Enabled: true})
+
+	policy := &v1alpha1.SandboxPlacementPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "reachable-only"},
+		Spec: v1alpha1.SandboxPlacementPolicySpec{
+			Filters: []string{"Reachable"},
+		},
+	}
+	_, berr := b.Bind(context.Background(), policy, binder.Request{
+		Key:   "existing-unreachable-sb",
+		Retry: true,
+	})
+	if berr == nil || berr.Status != 409 || berr.Reason != binder.ReasonConstraintExcluded {
+		t.Fatalf("expected 409 ConstraintExcluded when replayed sandbox violates Reachable policy filter, got %+v", berr)
 	}
 }

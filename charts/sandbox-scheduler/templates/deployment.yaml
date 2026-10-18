@@ -48,6 +48,7 @@ spec:
             - --max-spill={{ .Values.scheduler.maxSpill }}
             - --max-joiners-per-key={{ .Values.scheduler.maxJoinersPerKey }}
             - --refusal-ttl={{ .Values.scheduler.refusalTTL }}
+            - --release-name={{ include "sandbox-scheduler.fullname" . }}
             {{- if .Values.scheduler.clusterId }}
             - --cluster-id={{ .Values.scheduler.clusterId }}
             {{- end }}

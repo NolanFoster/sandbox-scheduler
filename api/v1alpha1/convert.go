@@ -21,6 +21,7 @@ var knownFilters = map[string]func() framework.Filter{
 	"RequiredAttributes": func() framework.Filter { return plugins.RequiredAttributes{} },
 	"Reachable":          func() framework.Filter { return plugins.Reachable{} },
 	"TemplateAvailable":  func() framework.Filter { return plugins.TemplateAvailable{} },
+	"WarmOnly":           func() framework.Filter { return plugins.WarmOnly{} },
 }
 
 // knownScorers maps API names to implementations.

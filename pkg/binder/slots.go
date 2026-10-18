@@ -126,25 +126,39 @@ type coalescedItem struct {
 // what lets a hosted provider rate-limited at 20 calls/s resolve up to 2,000
 // retry keys/s during failover recovery.
 type lookupCoalescer struct {
-	batcher    provider.BatchLookuper
-	limiter    *rate.Limiter
-	window     time.Duration
-	now        func() time.Time
-	mu         sync.Mutex
-	pending    []coalescedItem
-	flushing   bool
-	batchTimer *time.Timer
+	batcher       provider.BatchLookuper
+	limiter       *rate.Limiter
+	slots         *slotLimiter
+	startAttempt  func() bool
+	finishAttempt func()
+	window        time.Duration
+	now           func() time.Time
+	mu            sync.Mutex
+	pending       []coalescedItem
+	flushing      bool
+	batchTimer    *time.Timer
 }
 
-func newLookupCoalescer(batcher provider.BatchLookuper, limiter *rate.Limiter, window time.Duration, now func() time.Time) *lookupCoalescer {
+func newLookupCoalescer(
+	batcher provider.BatchLookuper,
+	limiter *rate.Limiter,
+	slots *slotLimiter,
+	startAttempt func() bool,
+	finishAttempt func(),
+	window time.Duration,
+	now func() time.Time,
+) *lookupCoalescer {
 	if window <= 0 {
 		window = defaultCoalesceWindow
 	}
 	return &lookupCoalescer{
-		batcher: batcher,
-		limiter: limiter,
-		window:  window,
-		now:     now,
+		batcher:       batcher,
+		limiter:       limiter,
+		slots:         slots,
+		startAttempt:  startAttempt,
+		finishAttempt: finishAttempt,
+		window:        window,
+		now:           now,
 	}
 }
 
@@ -204,28 +218,46 @@ func (c *lookupCoalescer) flush(attemptTimeout time.Duration) {
 	}
 	c.mu.Unlock()
 
+	failBatch := func(err error) {
+		for _, it := range batch {
+			it.done <- provider.LookupResult{Err: err}
+		}
+	}
+
 	// Reserve one Lookup token for the entire batch.
 	now := c.now()
 	res := c.limiter.ReserveN(now, 1)
 	if !res.OK() {
-		err := provider.Busy(time.Second, errors.New("lookup rate limit exceeded"))
-		for _, it := range batch {
-			it.done <- provider.LookupResult{Err: err}
-		}
+		failBatch(provider.Busy(time.Second, errors.New("lookup rate limit exceeded")))
 		return
 	}
 	delay := res.DelayFrom(now)
 	if delay > attemptTimeout {
 		res.CancelAt(now)
-		err := provider.Busy(delay, errors.New("lookup rate limit wait exceeds deadline"))
-		for _, it := range batch {
-			it.done <- provider.LookupResult{Err: err}
-		}
+		failBatch(provider.Busy(delay, errors.New("lookup rate limit wait exceeds deadline")))
 		return
 	}
 	if delay > 0 {
 		timer := time.NewTimer(delay)
 		<-timer.C
+	}
+
+	// Track detached attempt for graceful shutdown and bound concurrency via
+	// the provider's slotLimiter just like ordinary Lookup calls.
+	if c.startAttempt != nil && !c.startAttempt() {
+		failBatch(provider.Unavailable(errors.New("scheduler is shutting down")))
+		return
+	}
+	if c.finishAttempt != nil {
+		defer c.finishAttempt()
+	}
+
+	if c.slots != nil {
+		if !c.slots.tryAcquire() {
+			failBatch(provider.Busy(100*time.Millisecond, errors.New("provider in-flight slots full")))
+			return
+		}
+		defer c.slots.release()
 	}
 
 	reqs := make([]provider.ClaimRequest, len(batch))
@@ -234,14 +266,24 @@ func (c *lookupCoalescer) flush(attemptTimeout time.Duration) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
 	defer cancel()
-	results := c.batcher.LookupMany(ctx, reqs)
-	for i, it := range batch {
-		if i < len(results) {
-			it.done <- results[i]
-		} else {
-			it.done <- provider.LookupResult{Err: errors.New("batch lookup omitted result")}
+
+	var results []provider.LookupResult
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				results = nil
+				failBatch(errors.New("panic in adapter LookupMany"))
+			}
+		}()
+		results = c.batcher.LookupMany(ctx, reqs)
+		for i, it := range batch {
+			if i < len(results) {
+				it.done <- results[i]
+			} else {
+				it.done <- provider.LookupResult{Err: errors.New("batch lookup omitted result")}
+			}
 		}
-	}
+	}()
 }
 
 // --- claim health tracker --------------------------------------------------

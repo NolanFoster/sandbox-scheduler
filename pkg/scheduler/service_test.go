@@ -714,3 +714,45 @@ func TestClaimAndReleaseEndToEndWithSeparateClaimToken(t *testing.T) {
 		t.Fatalf("release failed: %d %s", delW.Code, delW.Body.String())
 	}
 }
+
+func TestClaimRejectsNonPositiveNumericTTLAndTimeout(t *testing.T) {
+	reg := registry.New(registry.Options{})
+	reg.Report("civo", registry.Report{WarmCapacity: 2})
+	b := binder.New(binder.Options{Registry: reg})
+	fake := adaptertest.NewFake("civo", 2, false)
+	b.SetTarget("civo", fake.Provider(false), binder.TargetConfig{Enabled: true})
+
+	svc := &scheduler.Service{
+		Registry:      reg,
+		Policies:      &scheduler.PolicyList{},
+		Binder:        b,
+		ClaimsEnabled: true,
+	}
+	h := svc.Handler()
+
+	for _, body := range []string{
+		`{"key":"k1","ttlSeconds":0}`,
+		`{"key":"k1","ttlSeconds":-10}`,
+		`{"key":"k1","timeoutSeconds":0}`,
+		`{"key":"k1","timeoutSeconds":-5}`,
+	} {
+		w := do(h, http.MethodPost, "/api/v1alpha1/sandboxes", body)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request for %s, got %d (%s)", body, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestProvidersIncludesTemplates(t *testing.T) {
+	h := newServiceWithConfig(t,
+		map[string]registry.Report{
+			"civo": {WarmCapacity: 3},
+		},
+		map[string]registry.ProviderConfig{
+			"civo": {Templates: map[string]string{"python": "py-pool"}},
+		})
+	got := providers(t, h)["civo"]
+	if got.Templates["python"] != "py-pool" {
+		t.Fatalf("expected templates[python]=py-pool in /providers, got %+v", got.Templates)
+	}
+}

@@ -81,6 +81,7 @@ func main() {
 		maxJoinersPerKey  int
 		refusalTTL        time.Duration
 		clusterID         string
+		releaseName       string
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address for the metrics endpoint.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address for health and readiness probes.")
@@ -122,6 +123,8 @@ func main() {
 		"How long a provider's NoCapacity refusal for a template suppresses further claims for that template.")
 	flag.StringVar(&clusterID, "cluster-id", "",
 		"Cluster identifier used to scope sandbox owner labels; defaults to the kube-system Namespace UID when unset.")
+	flag.StringVar(&releaseName, "release-name", envOr("RELEASE_NAME", "sandbox-scheduler"),
+		"Helm release / deployment fullname used to scope sandbox owner labels.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -170,7 +173,7 @@ func main() {
 	})
 
 	resolvedClusterID := resolveClusterID(mgr.GetAPIReader(), clusterID)
-	ownerID := provider.OwnerID(resolvedClusterID, envOr("POD_NAMESPACE", secretNamespace), "sandbox-scheduler")
+	ownerID := provider.OwnerID(releaseName, envOr("POD_NAMESPACE", secretNamespace), resolvedClusterID)
 
 	claimBinder := binder.New(binder.Options{
 		Registry:          reg,
