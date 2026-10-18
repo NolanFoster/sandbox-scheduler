@@ -6,29 +6,29 @@ import (
 	"testing"
 
 	"github.com/NolanFoster/sandbox-scheduler/pkg/adapter"
-	"github.com/NolanFoster/sandbox-scheduler/pkg/registry"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/provider"
 )
 
 type stubSource struct{ id string }
 
 func (s stubSource) ProviderID() string { return s.id }
-func (s stubSource) Fetch(context.Context) (registry.Report, error) {
-	return registry.Report{}, nil
+func (s stubSource) Fetch(context.Context) (provider.Report, error) {
+	return provider.Report{}, nil
 }
 
 func init() {
-	adapter.Register("stub", func(cfg adapter.Config) (registry.Source, error) {
-		return stubSource{id: cfg.ProviderID}, nil
+	adapter.Register("stub", func(cfg adapter.Config) (provider.Provider, error) {
+		return provider.Provider{Source: stubSource{id: cfg.ProviderID}}, nil
 	})
 }
 
 func TestNewBuildsARegisteredAdapter(t *testing.T) {
-	src, err := adapter.New("stub", adapter.Config{ProviderID: "civo"})
+	p, err := adapter.New("stub", adapter.Config{ProviderID: "civo"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if src.ProviderID() != "civo" {
-		t.Fatalf("provider id %q, want civo", src.ProviderID())
+	if p.Source.ProviderID() != "civo" {
+		t.Fatalf("provider id %q, want civo", p.Source.ProviderID())
 	}
 }
 
@@ -78,7 +78,7 @@ func TestDuplicateRegistrationPanics(t *testing.T) {
 			t.Fatal("registering a duplicate adapter name should panic")
 		}
 	}()
-	adapter.Register("stub", func(adapter.Config) (registry.Source, error) { return nil, nil })
+	adapter.Register("stub", func(adapter.Config) (provider.Provider, error) { return provider.Provider{}, nil })
 }
 
 func TestCredentialAccessorHandlesAbsentKeys(t *testing.T) {

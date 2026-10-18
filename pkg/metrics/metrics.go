@@ -92,6 +92,52 @@ var (
 		},
 		[]string{"provider", "filter"},
 	)
+
+	// ClaimAttemptsTotal counts individual provider claim attempts by outcome.
+	ClaimAttemptsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "claim_attempts_total",
+			Help: "Sandbox claim attempts per provider and outcome kind " +
+				"(ok, unknown_outcome, no_capacity, unavailable, rejected, busy, key_conflict, key_busy).",
+		},
+		[]string{"provider", "kind"},
+	)
+
+	// ClaimDuration measures per-provider claim attempt latency.
+	ClaimDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "claim_duration_seconds",
+			Help:      "Duration of individual sandbox claim attempts per provider.",
+			Buckets: []float64{
+				0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
+				0.5, 1.0, 2.0, 3.0, 5.0, 10.0,
+			},
+		},
+		[]string{"provider"},
+	)
+
+	// ClaimSpillsTotal counts times a claim attempt was refused by one
+	// provider and retried on the next candidate.
+	ClaimSpillsTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "claim_spills_total",
+			Help:      "Times a refused claim attempt spilled to the next candidate provider.",
+		},
+	)
+
+	// ClaimInflight tracks the number of claim attempts currently in flight
+	// per provider.
+	ClaimInflight = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "claim_inflight",
+			Help:      "Sandbox claim attempts currently in flight per provider.",
+		},
+		[]string{"provider"},
+	)
 )
 
 func init() {
@@ -100,7 +146,23 @@ func init() {
 		PlacementFailuresTotal,
 		PlacementDuration,
 		FilteredTotal,
+		ClaimAttemptsTotal,
+		ClaimDuration,
+		ClaimSpillsTotal,
+		ClaimInflight,
 	)
+}
+
+// RecordClaimAttempt records the outcome and duration of one provider claim
+// attempt.
+func RecordClaimAttempt(providerName, kind string, took time.Duration) {
+	ClaimAttemptsTotal.WithLabelValues(providerName, kind).Inc()
+	ClaimDuration.WithLabelValues(providerName).Observe(took.Seconds())
+}
+
+// RecordClaimSpill increments the claim spill counter.
+func RecordClaimSpill() {
+	ClaimSpillsTotal.Inc()
 }
 
 // RecordDecision records a successful placement.

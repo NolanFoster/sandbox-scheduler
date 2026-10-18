@@ -1,0 +1,125 @@
+// Out-of-process provider adapter contract for sandbox-scheduler.
+//
+// Experimental: this schema mirrors pkg/provider and may change incompatibly
+// until a non-Kubernetes adapter has implemented it (see
+// docs/design/pluggable-claims.md, phase 6).
+syntax = "proto3";
+
+package placement.adapter.v1alpha1;
+
+option go_package = "github.com/NolanFoster/sandbox-scheduler/proto/adapter/v1alpha1;adapterv1alpha1";
+
+// Kind classifies a claim or lookup error.
+//
+// Enum numbers are append-only and never reused. The host maps
+// KIND_UNSPECIFIED (0) and any unrecognised number from a newer sidecar to
+// KindUnknownOutcome so an unknown failure mode never spills a claim.
+enum Kind {
+  KIND_UNSPECIFIED = 0;
+  KIND_UNKNOWN_OUTCOME = 1;
+  KIND_NO_CAPACITY = 2;
+  KIND_UNAVAILABLE = 3;
+  KIND_REJECTED = 4;
+  KIND_BUSY = 5;
+  KIND_KEY_CONFLICT = 6;
+  KIND_KEY_BUSY = 7;
+}
+
+service ProviderAdapter {
+  // GetInfo reports the adapter's capabilities and supported error kinds.
+  rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+  // Fetch returns current warm capacity and self-reported attributes.
+  rpc Fetch(FetchRequest) returns (FetchResponse);
+  // Claim idempotently provisions a sandbox for key.
+  rpc Claim(ClaimRequest) returns (ClaimResponse);
+  // Lookup consistently reads a sandbox previously claimed with key.
+  rpc Lookup(ClaimRequest) returns (LookupResponse);
+  // LookupMany resolves a batch of keys in one provider call.
+  rpc LookupMany(LookupManyRequest) returns (LookupManyResponse);
+  // Release deletes a sandbox, enforcing Handle.version when non-empty.
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+  // ListOwned returns a page of sandboxes created by owner.
+  rpc ListOwned(ListOwnedRequest) returns (ListOwnedResponse);
+}
+
+message GetInfoRequest {}
+
+message GetInfoResponse {
+  bool can_claim = 1;
+  bool can_lookup = 2;
+  bool can_batch_lookup = 3;
+  bool can_list_owned = 4;
+  bool elastic = 5;
+  repeated Kind supported_kinds = 6;
+}
+
+message FetchRequest {}
+
+message FetchResponse {
+  int32 warm_capacity = 1;
+  bool elastic = 2;
+  map<string, string> attributes = 3;
+}
+
+message ClaimRequest {
+  string template = 1;
+  string key = 2;
+  string spec_hash = 3;
+  string owner = 4;
+  map<string, string> labels = 5;
+  int64 ttl_nanos = 6;
+}
+
+message Handle {
+  string provider = 1;
+  string id = 2;
+  string version = 3;
+  string endpoint = 4;
+  map<string, string> connect = 5;
+  int64 expires_at_unix_nano = 6;
+}
+
+message ErrorDetail {
+  Kind kind = 1;
+  bool not_found = 2;
+  int64 retry_after_nanos = 3;
+  string message = 4;
+}
+
+message ClaimResponse {
+  Handle handle = 1;
+  ErrorDetail error = 2;
+}
+
+message LookupResponse {
+  Handle handle = 1;
+  ErrorDetail error = 2;
+}
+
+message LookupManyRequest {
+  repeated ClaimRequest requests = 1;
+}
+
+message LookupManyResponse {
+  repeated LookupResponse results = 1;
+}
+
+message ReleaseRequest {
+  Handle handle = 1;
+}
+
+message ReleaseResponse {
+  ErrorDetail error = 1;
+}
+
+message ListOwnedRequest {
+  string owner = 1;
+  string page_token = 2;
+  int32 limit = 3;
+}
+
+message ListOwnedResponse {
+  repeated Handle handles = 1;
+  string next_page_token = 2;
+  ErrorDetail error = 3;
+}

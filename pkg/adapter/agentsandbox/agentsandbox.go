@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/NolanFoster/sandbox-scheduler/pkg/adapter"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/provider"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/registry"
 )
 
@@ -33,16 +34,18 @@ const AdapterName = "agent-sandbox"
 const CredentialKey = "token"
 
 func init() {
-	adapter.Register(AdapterName, func(cfg adapter.Config) (registry.Source, error) {
+	adapter.Register(AdapterName, func(cfg adapter.Config) (provider.Provider, error) {
 		if cfg.Endpoint == "" {
-			return nil, fmt.Errorf("adapter %s: endpoint is required", AdapterName)
+			return provider.Provider{}, fmt.Errorf("adapter %s: endpoint is required", AdapterName)
 		}
-		return &Source{
-			id:       cfg.ProviderID,
-			endpoint: strings.TrimRight(cfg.Endpoint, "/"),
-			token:    cfg.Credential(CredentialKey),
-			pool:     cfg.Options["warmPoolName"],
-			client:   &http.Client{Timeout: 30 * time.Second},
+		return provider.Provider{
+			Source: &Source{
+				id:       cfg.ProviderID,
+				endpoint: strings.TrimRight(cfg.Endpoint, "/"),
+				token:    cfg.Credential(CredentialKey),
+				pool:     cfg.Options["warmPoolName"],
+				client:   &http.Client{Timeout: 30 * time.Second},
+			},
 		}, nil
 	})
 }

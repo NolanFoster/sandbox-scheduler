@@ -54,7 +54,44 @@ func (RequiredAttributes) Filter(_ context.Context, req *framework.Request, c *f
 	return true, ""
 }
 
+// TemplateAvailable enforces Request.Template against the templates declared
+// on a candidate. When Request.Template is empty (for example on POST
+// /schedule), every candidate passes so decide-only callers are unaffected.
+type TemplateAvailable struct{}
+
+func (TemplateAvailable) Name() string { return "TemplateAvailable" }
+
+func (TemplateAvailable) Filter(_ context.Context, req *framework.Request, c *framework.Candidate) (bool, string) {
+	if req.Template == "" {
+		return true, ""
+	}
+	if c.HasTemplate(req.Template) {
+		return true, ""
+	}
+	return false, fmt.Sprintf("template %q is not offered by this provider", req.Template)
+}
+
+// WarmOnly rejects candidates without pre-warmed capacity when Request.WarmOnly
+// is set.
+type WarmOnly struct{}
+
+func (WarmOnly) Name() string { return "WarmOnly" }
+
+func (WarmOnly) Filter(_ context.Context, req *framework.Request, c *framework.Candidate) (bool, string) {
+	if !req.WarmOnly || c.WarmCapacity > 0 {
+		return true, ""
+	}
+	return false, "request requires a warm sandbox, provider has 0 warm"
+}
+
 // --- scorers ---------------------------------------------------------------
+
+// DefaultElasticWarmScore is the WarmCapacity score (out of 100) assigned to
+// an elastic provider when it has no pre-warmed pool of its own. At 20 it
+// scores 400 + 3*cost under the default profile, losing to a cold cluster
+// priced below roughly two thirds of the most expensive provider rather than
+// absorbing all overflow at per-use rates.
+const DefaultElasticWarmScore int64 = 20
 
 // WarmCapacity prefers providers with pre-warmed sandboxes waiting.
 //
@@ -80,6 +117,18 @@ func (w WarmCapacity) Score(_ context.Context, _ *framework.Request, c *framewor
 		sat = 5
 	}
 	if c.WarmCapacity <= 0 {
+		if c.Elastic {
+			if c.ElasticWarmScore < 0 {
+				return 0
+			}
+			if c.ElasticWarmScore == 0 {
+				return DefaultElasticWarmScore
+			}
+			if int64(c.ElasticWarmScore) > framework.MaxScore {
+				return framework.MaxScore
+			}
+			return int64(c.ElasticWarmScore)
+		}
 		return 0
 	}
 	if c.WarmCapacity >= sat {

@@ -1,13 +1,13 @@
 // Package adapter connects the scheduler to concrete providers.
 //
-// An adapter answers one question — "how much warm capacity do you have?" — for
-// one kind of provider. That narrowness is deliberate. Placement needs to
-// compare a Kubernetes cluster running agent-sandbox against a hosted API with
-// no cluster at all, and the only way that comparison stays honest is if every
-// provider is reduced to the same small set of facts before policy sees it.
+// An adapter answers capacity and, optionally, sandbox claim operations for
+// one kind of provider. Placement needs to compare a Kubernetes cluster
+// running agent-sandbox against a hosted API with no cluster at all, and the
+// only way that comparison stays honest is if every provider is reduced to the
+// same small contract (pkg/provider) before policy sees it.
 //
-// Adapters run off the placement path, driven by pkg/registry. A slow adapter
-// costs freshness, never placement latency.
+// Capacity polling runs off the placement path, driven by pkg/registry. A slow
+// adapter costs freshness, never placement latency.
 package adapter
 
 import (
@@ -15,7 +15,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/NolanFoster/sandbox-scheduler/pkg/registry"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/provider"
 )
 
 // Config is what a SandboxProvider spec becomes once its credentials are
@@ -34,6 +34,11 @@ type Config struct {
 
 	// Options carries adapter-specific settings from the provider spec.
 	Options map[string]string
+
+	// Templates maps provider-neutral template names to provider-native
+	// references (for example, a SandboxWarmPool name on agent-sandbox or a
+	// template ID on a hosted API).
+	Templates map[string]string
 }
 
 // Credential returns a credential value as a string, or "" if absent.
@@ -44,8 +49,8 @@ func (c *Config) Credential(key string) string {
 	return string(c.Credentials[key])
 }
 
-// Factory builds a Source for one provider.
-type Factory func(cfg Config) (registry.Source, error)
+// Factory builds a provider.Provider for one provider.
+type Factory func(cfg Config) (provider.Provider, error)
 
 var (
 	mu        sync.RWMutex
@@ -65,22 +70,29 @@ func Register(name string, f Factory) {
 	factories[name] = f
 }
 
-// New builds a Source for the named adapter.
+// New builds a provider.Provider for the named adapter.
 //
 // An unknown adapter is an error naming what is available, not a silent
 // fallback: a provider configured with an adapter this build does not have must
 // show up as broken rather than quietly never being polled.
-func New(name string, cfg Config) (registry.Source, error) {
+func New(name string, cfg Config) (provider.Provider, error) {
 	mu.RLock()
 	f, ok := factories[name]
 	mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("unknown adapter %q (available: %v)", name, Names())
+		return provider.Provider{}, fmt.Errorf("unknown adapter %q (available: %v)", name, Names())
 	}
 	if cfg.ProviderID == "" {
-		return nil, fmt.Errorf("adapter %q: provider id is required", name)
+		return provider.Provider{}, fmt.Errorf("adapter %q: provider id is required", name)
 	}
-	return f(cfg)
+	p, err := f(cfg)
+	if err != nil {
+		return provider.Provider{}, err
+	}
+	if p.Source == nil {
+		return provider.Provider{}, fmt.Errorf("adapter %q returned a Provider with nil Source", name)
+	}
+	return p, nil
 }
 
 // Names lists the registered adapters, sorted.

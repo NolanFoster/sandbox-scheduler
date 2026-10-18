@@ -23,6 +23,9 @@ spec:
       {{- end }}
       serviceAccountName: {{ include "sandbox-scheduler.serviceAccountName" . }}
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.scheduler.enableClaims }}
+      terminationGracePeriodSeconds: {{ .Values.scheduler.terminationGracePeriodSeconds | default 30 }}
+      {{- end }}
       containers:
         - name: scheduler
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -37,6 +40,17 @@ spec:
             - --metrics-bind-address=:{{ .Values.metrics.port }}
             - --health-probe-bind-address=:8081
             - --leader-elect={{ .Values.leaderElection }}
+            - --enable-claims={{ .Values.scheduler.enableClaims }}
+            - --claim-timeout={{ .Values.scheduler.claimTimeout }}
+            - --claim-max-inflight={{ .Values.scheduler.claimMaxInFlight }}
+            - --claim-queue-timeout={{ .Values.scheduler.claimQueueTimeout }}
+            - --claim-max-ttl={{ .Values.scheduler.claimMaxTTL }}
+            - --max-spill={{ .Values.scheduler.maxSpill }}
+            - --max-joiners-per-key={{ .Values.scheduler.maxJoinersPerKey }}
+            - --refusal-ttl={{ .Values.scheduler.refusalTTL }}
+            {{- if .Values.scheduler.clusterId }}
+            - --cluster-id={{ .Values.scheduler.clusterId }}
+            {{- end }}
           env:
             # The scheduler defaults --secret-namespace from this, so the flag
             # above and this stay consistent even if one is overridden.
@@ -55,6 +69,13 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.placementApi.existingSecret | default (printf "%s-api-token" (include "sandbox-scheduler.fullname" .)) }}
                   key: {{ .Values.placementApi.existingSecretKey }}
+            {{- end }}
+            {{- if or .Values.placementApi.claimToken .Values.placementApi.claimExistingSecret }}
+            - name: PLACEMENT_CLAIM_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.placementApi.claimExistingSecret | default (printf "%s-api-token" (include "sandbox-scheduler.fullname" .)) }}
+                  key: {{ .Values.placementApi.claimExistingSecretKey }}
             {{- end }}
           ports:
             - name: placement

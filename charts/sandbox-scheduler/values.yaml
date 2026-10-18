@@ -50,6 +50,19 @@ scheduler:
   # start takes. When providers with no warm capacity tie, the next cold start
   # goes to the one with fewer in flight rather than the first by name.
   coldStartWindow: 30s
+  # Optional scheduler-managed sandbox claiming (POST/DELETE
+  # /api/v1alpha1/sandboxes). Off by default so placement-only deployments have
+  # zero claim surface.
+  enableClaims: false
+  claimTimeout: 15s
+  claimMaxInFlight: 4096
+  claimQueueTimeout: 1s
+  claimMaxTTL: 24h
+  maxSpill: 3
+  maxJoinersPerKey: 8
+  refusalTTL: 1s
+  clusterId: ""
+  terminationGracePeriodSeconds: 30
 
 service:
   type: ClusterIP
@@ -67,6 +80,11 @@ placementApi:
   token: ""
   existingSecret: ""
   existingSecretKey: token
+  # Optional separate token for POST/DELETE /api/v1alpha1/sandboxes. Falls back
+  # to token when empty.
+  claimToken: ""
+  claimExistingSecret: ""
+  claimExistingSecretKey: claim-token
 
 metrics:
   enabled: true

@@ -54,6 +54,16 @@ type Candidate struct {
 	// which is why it exists as a first-class field rather than an attribute.
 	WarmCapacity int
 
+	// Elastic reports that this provider provisions on demand without a fixed
+	// warm pool. When WarmCapacity is 0, WarmCapacity scores ElasticWarmScore
+	// (default 20 of 100) rather than 0 or saturation.
+	Elastic bool
+
+	// ElasticWarmScore is the WarmCapacity score (0..100) used when Elastic is
+	// true and WarmCapacity is 0. Zero uses the default of 20; a negative
+	// value explicitly scores 0.
+	ElasticWarmScore int
+
 	// InFlightCold is how many cold starts were recently placed here. Not
 	// scored: it only decides between cold candidates that tie, so a burst of
 	// cold starts spreads across equally good providers instead of queueing
@@ -64,6 +74,11 @@ type Candidate struct {
 	// runtime=gvisor, gpu=true, region=nyc1, kubernetes=true. Free-form so a
 	// new policy does not require a schema change.
 	Attributes map[string]string
+
+	// Templates maps provider-neutral template names to provider-native
+	// references, matched by the TemplateAvailable filter when Request.Template
+	// is set.
+	Templates map[string]string
 
 	// CostPerHour is the relative price of a sandbox-hour here. Units are the
 	// operator's own; only the ordering is used.
@@ -78,10 +93,26 @@ func (c *Candidate) Attr(key string) string {
 	return c.Attributes[key]
 }
 
+// HasTemplate reports whether the candidate offers the named template.
+func (c *Candidate) HasTemplate(name string) bool {
+	if c.Templates == nil {
+		return false
+	}
+	return c.Templates[name] != ""
+}
+
 // Request is what needs placing.
 type Request struct {
 	// Name of the sandbox being placed, for logs and traces.
 	Name string
+
+	// Template is the optional provider-neutral template name requested by a
+	// claim. Enforced by the TemplateAvailable filter when non-empty.
+	Template string
+
+	// WarmOnly, when true, requires a pre-warmed sandbox (WarmCapacity > 0)
+	// and rejects cold or elastic-only candidates.
+	WarmOnly bool
 
 	// Requires are hard requirements matched against candidate attributes by
 	// the RequiredAttributes filter, e.g. {"gpu": "true"}.

@@ -114,6 +114,30 @@ func (r *ring) sumSince(since uint32) int {
 	return n
 }
 
+// takeOne decrements one count from the most recent non-empty bucket at or
+// before sec, returning true only if a count was removed by compare-and-swap.
+func (r *ring) takeOne(sec uint32) bool {
+	for step := uint32(0); step <= r.mask; step++ {
+		idx := (sec - step) & r.mask
+		b := &r.buckets[idx]
+		for {
+			old := b.Load()
+			e, c := unpack(old)
+			if c == 0 {
+				break
+			}
+			var next uint64
+			if c > 1 {
+				next = pack(e, c-1)
+			}
+			if b.CompareAndSwap(old, next) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // epoch is the one-second bucket t falls in. Seconds since the Unix epoch fit
 // in 32 bits until 2106.
 func epoch(t time.Time) uint32 { return uint32(t.Unix()) }
@@ -162,6 +186,43 @@ func (l *ledger) tryReserve(now time.Time) bool {
 	}
 	l.record(epoch(now))
 	return true
+}
+
+// release undoes one warm reservation. It decrements the state word only if it
+// first removed a count from a ring bucket or carry by compare-and-swap; if a
+// poll already cleared the reservation, it does nothing, preserving the
+// invariant that outstanding reservations never go below zero.
+func (l *ledger) release(now time.Time) bool {
+	if !l.reservations.takeOne(epoch(now)) && !l.takeFromCarry() {
+		return false
+	}
+	for {
+		old := l.state.Load()
+		warm, out := unpack(old)
+		if out == 0 {
+			return false
+		}
+		if l.state.CompareAndSwap(old, pack(warm, out-1)) {
+			return true
+		}
+	}
+}
+
+func (l *ledger) takeFromCarry() bool {
+	for {
+		old := l.carry.Load()
+		e, c := unpack(old)
+		if c == 0 {
+			return false
+		}
+		var next uint64
+		if c > 1 {
+			next = pack(e, c-1)
+		}
+		if l.carry.CompareAndSwap(old, next) {
+			return true
+		}
+	}
 }
 
 // record counts one reservation in the bucket for sec, carrying whatever the

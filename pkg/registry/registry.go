@@ -36,54 +36,37 @@ import (
 	"time"
 
 	"github.com/NolanFoster/sandbox-scheduler/pkg/framework"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/provider"
 )
 
-// Report is what a provider says about *itself* at a point in time.
-//
-// Deliberately narrow: capacity, and facts that are informational only. Nothing
-// a provider reports here is used for placement decisions, because a provider
-// must not be able to influence its own selection. See ProviderConfig.
-type Report struct {
-	// WarmCapacity is the number of pre-warmed sandboxes ready to claim.
-	// The one self-reported value placement does trust — a provider
-	// overstating it only hurts itself, by attracting claims it cannot serve.
-	WarmCapacity int
+// Report is what a provider says about itself at a point in time. Aliased from
+// pkg/provider so existing callers can import pkg/registry alone.
+type Report = provider.Report
 
-	// Attributes are facts the provider reports about itself. Surfaced in
-	// status for humans; never matched on by filters. A provider able to
-	// assert runtime=gvisor about itself could claim an isolation property it
-	// does not have, and the filter that keeps untrusted workloads off weak
-	// providers would wave them through.
-	Attributes map[string]string
-}
+// Source fetches a Report for one provider. Aliased from pkg/provider.
+type Source = provider.Source
 
 // ProviderConfig is what the operator declares about a provider.
 //
-// This is the authoritative half. Attributes and cost come from here — from a
-// SandboxProvider spec, written by someone with permission to write it — and
-// never from the provider itself. Cost especially: a provider that could report
-// its own price could report zero and win every placement.
+// This is the authoritative half. Attributes, templates, and cost come from
+// here — from a SandboxProvider spec, written by someone with permission to
+// write it — and never from the provider itself. Cost especially: a provider
+// that could report its own price could report zero and win every placement.
 type ProviderConfig struct {
 	// Attributes are matched by filters and scorers: runtime=gvisor, gpu=true.
 	Attributes map[string]string
 
+	// Templates maps provider-neutral template names to provider-native
+	// references, matched by the TemplateAvailable filter.
+	Templates map[string]string
+
 	// CostPerHour is the relative price of a sandbox-hour. Units are the
 	// operator's own; only the ordering is used.
 	CostPerHour float64
-}
 
-// Source fetches a Report for one provider.
-//
-// Implementations are adapters: a Kubernetes cluster running agent-sandbox, a
-// hosted sandbox API, anything that can answer "how much warm capacity do you
-// have". They are called off the decision path, so a slow implementation costs
-// freshness, never placement latency.
-type Source interface {
-	// ProviderID is the stable identifier recorded on placed sandboxes.
-	ProviderID() string
-	// Fetch returns current capacity. It must respect ctx cancellation; the
-	// registry imposes its own timeout regardless.
-	Fetch(ctx context.Context) (Report, error)
+	// ElasticWarmScore, when non-nil, overrides the default WarmCapacity score
+	// (20 of 100) given to an elastic provider when WarmCapacity is 0.
+	ElasticWarmScore *int
 }
 
 // entry is the registry's per-provider state.
@@ -418,6 +401,19 @@ func (r *Registry) TryReserveWarm(providerID string) bool {
 	return l.tryReserve(r.now())
 }
 
+// ReleaseReservation undoes one warm reservation for providerID when a claim
+// fails provably before taking a sandbox (for example on Busy, Unavailable,
+// Rejected, or KeyConflict). It decrements the provider's outstanding
+// reservation count only if it removed a count from a ring bucket or carry by
+// compare-and-swap; if a poll already cleared the reservation, it does nothing.
+func (r *Registry) ReleaseReservation(providerID string) bool {
+	l, ok := (*r.ledgers.Load())[providerID]
+	if !ok {
+		return false
+	}
+	return l.release(r.now())
+}
+
 // RecordColdPlacement counts a placement that takes no warm sandbox, so that
 // snapshots for the next ColdStartWindow show it in the provider's
 // InFlightCold.
@@ -595,12 +591,22 @@ func (r *Registry) Snapshot() []framework.Candidate {
 	now := r.now()
 	out := make([]framework.Candidate, 0, len(r.entries))
 	for id, e := range r.entries {
+		elasticScore := 0
+		if e.config.ElasticWarmScore != nil {
+			if *e.config.ElasticWarmScore <= 0 {
+				elasticScore = -1
+			} else {
+				elasticScore = *e.config.ElasticWarmScore
+			}
+		}
 		c := framework.Candidate{
 			Provider: id,
 			// Observed: the provider's own count of what is warm, less what
 			// has been placed there since.
-			WarmCapacity: e.ledger.available(),
-			InFlightCold: e.ledger.inFlightCold(now),
+			WarmCapacity:     e.ledger.available(),
+			Elastic:          e.report.Elastic,
+			ElasticWarmScore: elasticScore,
+			InFlightCold:     e.ledger.inFlightCold(now),
 			// Declared: never the provider's own claim. See ProviderConfig.
 			CostPerHour: e.config.CostPerHour,
 			// Fresh only if we have heard from it at all, and recently.
@@ -610,6 +616,12 @@ func (r *Registry) Snapshot() []framework.Candidate {
 			c.Attributes = make(map[string]string, len(e.config.Attributes))
 			for k, v := range e.config.Attributes {
 				c.Attributes[k] = v
+			}
+		}
+		if len(e.config.Templates) > 0 {
+			c.Templates = make(map[string]string, len(e.config.Templates))
+			for k, v := range e.config.Templates {
+				c.Templates[k] = v
 			}
 		}
 		out = append(out, c)
