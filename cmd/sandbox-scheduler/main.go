@@ -172,29 +172,26 @@ func main() {
 		ColdStartWindow:  coldStartWindow,
 	})
 
-	var ownerID string
+	var claimBinder *binder.Binder
 	if enableClaims {
 		resolvedClusterID, err := resolveClusterID(mgr.GetAPIReader(), clusterID)
 		if err != nil {
 			log.Error(err, "unable to resolve cluster ID for sandbox claims; set --cluster-id or grant get on namespace kube-system")
 			os.Exit(1)
 		}
-		ownerID = provider.OwnerID(releaseName, envOr("POD_NAMESPACE", secretNamespace), resolvedClusterID)
-	} else {
-		ownerID = provider.OwnerID(releaseName, envOr("POD_NAMESPACE", secretNamespace), clusterID)
+		ownerID := provider.OwnerID(releaseName, envOr("POD_NAMESPACE", secretNamespace), resolvedClusterID)
+		claimBinder = binder.New(binder.Options{
+			Registry:          reg,
+			Owner:             ownerID,
+			ClaimTimeout:      claimTimeout,
+			QueueTimeout:      claimQueueTimeout,
+			RefusalTTL:        refusalTTL,
+			MaxTTL:            claimMaxTTL,
+			MaxSpill:          maxSpill,
+			GlobalMaxInFlight: claimMaxInFlight,
+			MaxJoinersPerKey:  maxJoinersPerKey,
+		})
 	}
-
-	claimBinder := binder.New(binder.Options{
-		Registry:          reg,
-		Owner:             ownerID,
-		ClaimTimeout:      claimTimeout,
-		QueueTimeout:      claimQueueTimeout,
-		RefusalTTL:        refusalTTL,
-		MaxTTL:            claimMaxTTL,
-		MaxSpill:          maxSpill,
-		GlobalMaxInFlight: claimMaxInFlight,
-		MaxJoinersPerKey:  maxJoinersPerKey,
-	})
 
 	// Provider gauges are collected at scrape time, so they always reflect what
 	// the scheduler believes right now rather than what a timer last copied.
@@ -253,16 +250,18 @@ func main() {
 	var labeler *leader.PodLabeler
 	if leaderElection {
 		svc.Active = elected
-		if err := mgr.Add(everyReplica{manager.RunnableFunc(func(ctx context.Context) error {
-			select {
-			case <-mgr.Elected():
-				claimBinder.NotifyElected()
-			case <-ctx.Done():
+		if claimBinder != nil {
+			if err := mgr.Add(everyReplica{manager.RunnableFunc(func(ctx context.Context) error {
+				select {
+				case <-mgr.Elected():
+					claimBinder.NotifyElected()
+				case <-ctx.Done():
+				}
+				return nil
+			})}); err != nil {
+				log.Error(err, "unable to add leader election hold-off hook")
+				os.Exit(1)
 			}
-			return nil
-		})}); err != nil {
-			log.Error(err, "unable to add leader election hold-off hook")
-			os.Exit(1)
 		}
 		if podName := os.Getenv("POD_NAME"); podName != "" {
 			labeler = &leader.PodLabeler{

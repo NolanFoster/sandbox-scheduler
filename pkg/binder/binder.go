@@ -163,14 +163,17 @@ type Options struct {
 	RandFloat64        func() float64
 }
 
-// flight tracks an in-flight claim for a single idempotency key so concurrent
-// requests for the same key share one execution on the leader.
+// flight tracks an in-flight or recently completed claim for a single
+// idempotency key so concurrent and overlapping requests for the same key
+// share one execution on the leader.
 type flight struct {
-	specHash string
-	joiners  atomic.Int32
-	done     chan struct{}
-	res      *Result
-	err      *Error
+	specHash       string
+	joiners        atomic.Int32
+	done           chan struct{}
+	res            *Result
+	err            *Error
+	completed      bool
+	completedUntil time.Time
 }
 
 // Binder coordinates sandbox claims across providers.
@@ -324,17 +327,29 @@ func (b *Binder) SetTarget(providerID string, prov provider.Provider, cfg Target
 		health = newHealthTracker()
 	}
 
-	claimLim := rate.NewLimiter(rate.Limit(cfg.MaxRate), cfg.MaxRate)
-	lookupLim := rate.NewLimiter(rate.Limit(cfg.LookupRate), cfg.LookupRate)
-	retryRate := cfg.MaxRate / 10
-	if retryRate < 1 {
-		retryRate = 1
+	var claimLim, retryLim *rate.Limiter
+	if prev != nil && prev.cfg.MaxRate == cfg.MaxRate && prev.claimRate != nil && prev.retryBudget != nil {
+		claimLim = prev.claimRate
+		retryLim = prev.retryBudget
+	} else {
+		claimLim = rate.NewLimiter(rate.Limit(cfg.MaxRate), cfg.MaxRate)
+		retryRate := cfg.MaxRate / 10
+		if retryRate < 1 {
+			retryRate = 1
+		}
+		retryBurst := retryRate
+		if retryBurst < 2 {
+			retryBurst = 2
+		}
+		retryLim = rate.NewLimiter(rate.Limit(retryRate), retryBurst)
 	}
-	retryBurst := retryRate
-	if retryBurst < 2 {
-		retryBurst = 2
+
+	var lookupLim *rate.Limiter
+	if prev != nil && prev.cfg.LookupRate == cfg.LookupRate && prev.lookupRate != nil {
+		lookupLim = prev.lookupRate
+	} else {
+		lookupLim = rate.NewLimiter(rate.Limit(cfg.LookupRate), cfg.LookupRate)
 	}
-	retryLim := rate.NewLimiter(rate.Limit(retryRate), retryBurst)
 
 	var coalescer *lookupCoalescer
 	if prov.BatchLookup != nil {
@@ -382,6 +397,7 @@ func (b *Binder) RemoveTarget(providerID string) {
 	}
 	b.targets.Store(&next)
 	metrics.ClaimInflight.DeleteLabelValues(providerID)
+	b.evictCompletedFlight(providerID, "")
 }
 
 // HealthStatus returns the current claim-path health of providerID.
@@ -518,11 +534,31 @@ func (b *Binder) Bind(ctx context.Context, policy *v1alpha1.SandboxPlacementPoli
 		}
 	}
 
-	// De-duplicate concurrent requests for the same key on the leader.
+	// De-duplicate concurrent and overlapping requests for the same key on the leader.
 	b.flightsMu.Lock()
+	now = b.now()
 	if existing, ok := b.flights[req.Key]; ok {
-		b.flightsMu.Unlock()
-		return b.joinFlight(ctx, existing, policy, req, claimReq)
+		if existing.completed && !now.Before(existing.completedUntil) {
+			delete(b.flights, req.Key)
+		} else {
+			b.flightsMu.Unlock()
+			return b.joinFlight(ctx, existing, policy, req, claimReq)
+		}
+	}
+	if len(b.flights) >= 64 {
+		for k, f := range b.flights {
+			if f.completed && !now.Before(f.completedUntil) {
+				delete(b.flights, k)
+			}
+		}
+	}
+	if len(b.flights) >= b.globalMaxInFlight*2 {
+		for k, f := range b.flights {
+			if f.completed {
+				delete(b.flights, k)
+				break
+			}
+		}
 	}
 	fl := &flight{
 		specHash: claimReq.SpecHash,
@@ -544,9 +580,18 @@ func (b *Binder) Bind(ctx context.Context, policy *v1alpha1.SandboxPlacementPoli
 			retErr = fl.err
 		}
 		b.flightsMu.Lock()
-		delete(b.flights, req.Key)
-		b.flightsMu.Unlock()
+		if fl.err == nil && fl.res != nil {
+			retention := b.claimTimeout
+			if ttl > 0 && ttl < retention {
+				retention = ttl
+			}
+			fl.completed = true
+			fl.completedUntil = b.now().Add(retention)
+		} else if b.flights[req.Key] == fl {
+			delete(b.flights, req.Key)
+		}
 		close(fl.done)
+		b.flightsMu.Unlock()
 	}()
 
 	fl.res, fl.err = b.executeFlight(ctx, policy, req, claimReq)
@@ -561,11 +606,19 @@ func (b *Binder) joinFlight(
 	claimReq provider.ClaimRequest,
 ) (*Result, *Error) {
 	if fl.specHash != claimReq.SpecHash {
+		providers := []string{}
+		select {
+		case <-fl.done:
+			if fl.res != nil && fl.res.Handle.Provider != "" {
+				providers = []string{fl.res.Handle.Provider}
+			}
+		default:
+		}
 		return nil, &Error{
 			Status:    409,
 			Reason:    ReasonSpecMismatch,
 			Message:   fmt.Sprintf("key %q is already being claimed with a different spec", req.Key),
-			Providers: []string{},
+			Providers: providers,
 		}
 	}
 	if int(fl.joiners.Add(1)) > b.maxJoinersPerKey {
@@ -582,12 +635,16 @@ func (b *Binder) joinFlight(
 
 	select {
 	case <-fl.done:
-	case <-ctx.Done():
-		return nil, &Error{
-			Status:    504,
-			Reason:    ReasonUnknownOutcome,
-			Message:   "client context cancelled while waiting on in-flight claim for the same key",
-			Providers: []string{},
+	default:
+		select {
+		case <-fl.done:
+		case <-ctx.Done():
+			return nil, &Error{
+				Status:    504,
+				Reason:    ReasonUnknownOutcome,
+				Message:   "client context cancelled while waiting on in-flight claim for the same key",
+				Providers: []string{},
+			}
 		}
 	}
 
@@ -1064,7 +1121,7 @@ func (b *Binder) claimLoop(
 			if !ok || !t.cfg.Enabled || t.prov.Binder == nil {
 				continue
 			}
-			if !t.health.isUsable(now, t.prov.Binder, t.slots, b.startAttempt, b.finishAttempt, t.cfg.Timeout, b.owner) {
+			if !t.health.isUsable(now, t.prov.Binder, t.slots, b.startAttempt, b.finishAttempt, t.cfg.Timeout, b.owner, probeTemplateForTarget(req.Template, t.cfg.Templates)) {
 				continue
 			}
 			if b.isRefused(c.Provider, req.Template, now) {
@@ -1871,6 +1928,7 @@ func (b *Binder) Release(ctx context.Context, providerID, sandboxID string) *Err
 
 	err := t.prov.Binder.Release(rCtx, provider.Handle{Provider: providerID, ID: sandboxID})
 	if err == nil || errors.Is(err, provider.ErrNotFound) {
+		b.evictCompletedFlight(providerID, sandboxID)
 		return nil
 	}
 	switch provider.KindOf(err) {
@@ -1897,6 +1955,37 @@ func (b *Binder) Release(ctx context.Context, providerID, sandboxID string) *Err
 			Providers: []string{providerID},
 		}
 	}
+}
+
+func (b *Binder) evictCompletedFlight(providerID, sandboxID string) {
+	b.flightsMu.Lock()
+	defer b.flightsMu.Unlock()
+	for k, fl := range b.flights {
+		if !fl.completed || fl.res == nil {
+			continue
+		}
+		if fl.res.Handle.Provider == providerID && (sandboxID == "" || fl.res.Handle.ID == sandboxID) {
+			delete(b.flights, k)
+		}
+	}
+}
+
+func probeTemplateForTarget(reqTemplate string, templates map[string]string) string {
+	if len(templates) == 0 {
+		return reqTemplate
+	}
+	if reqTemplate != "" {
+		if _, ok := templates[reqTemplate]; ok {
+			return reqTemplate
+		}
+	}
+	var first string
+	for k := range templates {
+		if first == "" || k < first {
+			first = k
+		}
+	}
+	return first
 }
 
 func (b *Binder) buildScheduleProfile(

@@ -716,3 +716,177 @@ func TestUnknownOutcomeConfirmedNotFoundThenNoCapacitySpills(t *testing.T) {
 		t.Fatalf("expected provider gke, got %q", res.Handle.Provider)
 	}
 }
+
+func TestCompletedFlightDeduplicatesOverlappingCallersUntilRelease(t *testing.T) {
+	b, reg := newTestBinder(t, binder.Options{})
+	reg.Report("civo", registry.Report{WarmCapacity: 2})
+	reg.Report("gke", registry.Report{WarmCapacity: 2})
+	reg.SetConfig("civo", registry.ProviderConfig{CostPerHour: 3})
+	reg.SetConfig("gke", registry.ProviderConfig{CostPerHour: 4})
+
+	civoFake := adaptertest.NewFake("civo", 2, false)
+	var gkeClaims atomic.Int32
+	gkeBinder := &scriptBinder{
+		claimFn: func(_ context.Context, req provider.ClaimRequest) (provider.Handle, error) {
+			gkeClaims.Add(1)
+			return provider.Handle{Provider: "gke", ID: "gke-" + req.Key}, nil
+		},
+	}
+	b.SetTarget("civo", civoFake.Provider(false), binder.TargetConfig{Enabled: true})
+	b.SetTarget("gke", gkeBinder.asProvider(false), binder.TargetConfig{Enabled: true})
+
+	// First caller claims "overlap-key" on civo, consuming civo's single warm slot.
+	res1, berr := b.Bind(context.Background(), nil, binder.Request{Key: "overlap-key"})
+	if berr != nil {
+		t.Fatalf("first claim failed: %+v", berr)
+	}
+	if res1.Handle.Provider != "civo" || res1.Replay {
+		t.Fatalf("expected fresh claim on civo, got %+v", res1)
+	}
+
+	// Second overlapping caller with retry:false arrives just after the first
+	// flight finishes. Even though gke now outscores civo (warm vs depleted),
+	// it must replay the completed flight on civo rather than placing on gke.
+	res2, berr := b.Bind(context.Background(), nil, binder.Request{Key: "overlap-key"})
+	if berr != nil {
+		t.Fatalf("second overlapping claim failed: %+v", berr)
+	}
+	if !res2.Replay || res2.Handle.Provider != "civo" || res2.Handle.ID != res1.Handle.ID {
+		t.Fatalf("expected replay of civo handle, got %+v", res2)
+	}
+	if gkeClaims.Load() != 0 {
+		t.Fatalf("expected 0 claims on gke, got %d", gkeClaims.Load())
+	}
+
+	// Releasing the sandbox evicts the completed flight so a new claim with the
+	// same key can place freshly on gke.
+	if berr := b.Release(context.Background(), "civo", res1.Handle.ID); berr != nil {
+		t.Fatalf("release failed: %+v", berr)
+	}
+	res3, berr := b.Bind(context.Background(), nil, binder.Request{Key: "overlap-key"})
+	if berr != nil {
+		t.Fatalf("third claim after release failed: %+v", berr)
+	}
+	if res3.Replay || res3.Handle.Provider != "gke" {
+		t.Fatalf("expected fresh placement on gke after release, got %+v", res3)
+	}
+}
+
+func TestSetTargetReusesRateLimitersWhenRatesUnchanged(t *testing.T) {
+	now := time.Now()
+	b, reg := newTestBinder(t, binder.Options{
+		Now: func() time.Time { return now },
+	})
+	reg.Report("civo", registry.Report{WarmCapacity: 0})
+
+	civoFake := adaptertest.NewFake("civo", 0, false)
+	cfg := binder.TargetConfig{
+		Enabled: true,
+		MaxRate: 1,
+	}
+	b.SetTarget("civo", civoFake.Provider(false), cfg)
+
+	// Drain the single cold rate token.
+	if _, berr := b.Bind(context.Background(), nil, binder.Request{Key: "rate-1"}); berr != nil {
+		t.Fatalf("first claim failed: %+v", berr)
+	}
+
+	// Re-reconcile with identical MaxRate: must preserve the drained limiter.
+	b.SetTarget("civo", civoFake.Provider(false), cfg)
+
+	_, berr := b.Bind(context.Background(), nil, binder.Request{Key: "rate-2"})
+	if berr == nil || berr.Status != 429 || berr.Reason != binder.ReasonRateLimited {
+		t.Fatalf("expected 429 RateLimited after unchanged SetTarget, got %+v", berr)
+	}
+}
+
+func TestHalfOpenProbeUsesConfiguredProviderTemplate(t *testing.T) {
+	var nowMu sync.Mutex
+	now := time.Now()
+	b, reg := newTestBinder(t, binder.Options{
+		Now: func() time.Time {
+			nowMu.Lock()
+			defer nowMu.Unlock()
+			return now
+		},
+	})
+	reg.Report("civo", registry.Report{WarmCapacity: 2})
+	reg.Report("gke", registry.Report{WarmCapacity: 2})
+	reg.SetConfig("civo", registry.ProviderConfig{CostPerHour: 1, Templates: map[string]string{"python": "py-pool"}})
+	reg.SetConfig("gke", registry.ProviderConfig{CostPerHour: 4, Templates: map[string]string{"python": "py-pool"}})
+
+	var civoDown atomic.Bool
+	civoDown.Store(true)
+	probeDone := make(chan struct{}, 1)
+	civoBinder := &scriptBinder{
+		claimFn: func(_ context.Context, req provider.ClaimRequest) (provider.Handle, error) {
+			if civoDown.Load() {
+				return provider.Handle{}, provider.Unavailable(errors.New("503 gateway down"))
+			}
+			return provider.Handle{Provider: "civo", ID: "civo-" + req.Key}, nil
+		},
+		lookupFn: func(_ context.Context, req provider.ClaimRequest) (provider.Handle, error) {
+			defer func() {
+				select {
+				case probeDone <- struct{}{}:
+				default:
+				}
+			}()
+			if req.Template != "python" {
+				return provider.Handle{}, provider.Rejected(errors.New("unknown template " + req.Template))
+			}
+			return provider.Handle{}, provider.ErrNotFound
+		},
+	}
+	gkeFake := adaptertest.NewFake("gke", 20, false)
+
+	b.SetTarget("civo", civoBinder.asProvider(false), binder.TargetConfig{
+		Enabled:   true,
+		Templates: map[string]string{"python": "py-pool"},
+	})
+	b.SetTarget("gke", gkeFake.Provider(false), binder.TargetConfig{
+		Enabled:   true,
+		Templates: map[string]string{"python": "py-pool"},
+	})
+
+	// Trigger 20 Unavailable outcomes on civo to open its circuit breaker.
+	for i := 0; i < 20; i++ {
+		reg.Report("civo", registry.Report{WarmCapacity: 2})
+		reg.Report("gke", registry.Report{WarmCapacity: 2})
+		key := "demote-" + string(rune('a'+i))
+		if _, berr := b.Bind(context.Background(), nil, binder.Request{Key: key, Template: "python"}); berr != nil {
+			t.Fatalf("spill claim %d failed: %+v", i, berr)
+		}
+	}
+	if hs, ok := b.HealthStatus("civo"); !ok || hs.Healthy {
+		t.Fatalf("expected civo to be demoted after 20 Unavailable errors, got %+v", hs)
+	}
+
+	// Bring civo back and advance time past probeInitialBackoff (2s).
+	civoDown.Store(false)
+	nowMu.Lock()
+	now = now.Add(3 * time.Second)
+	nowMu.Unlock()
+
+	reg.Report("civo", registry.Report{WarmCapacity: 2})
+	reg.Report("gke", registry.Report{WarmCapacity: 2})
+	if _, berr := b.Bind(context.Background(), nil, binder.Request{Key: "trigger-probe", Template: "python"}); berr != nil {
+		t.Fatalf("claim triggering half-open probe failed: %+v", berr)
+	}
+
+	select {
+	case <-probeDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for half-open probe Lookup")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if hs, ok := b.HealthStatus("civo"); ok && hs.Healthy && !hs.CredentialsError {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	hs, _ := b.HealthStatus("civo")
+	t.Fatalf("expected civo to recover after half-open probe with valid template, got %+v", hs)
+}

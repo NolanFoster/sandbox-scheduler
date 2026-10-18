@@ -402,6 +402,7 @@ func (h *healthTracker) isUsable(
 	finishAttempt func(),
 	timeout time.Duration,
 	owner string,
+	probeTemplate string,
 ) bool {
 	h.mu.Lock()
 	if !h.demoted {
@@ -426,7 +427,7 @@ func (h *healthTracker) isUsable(
 	h.probing = true
 	h.mu.Unlock()
 
-	go h.runHalfOpenProbe(now, b, slots, finishAttempt, timeout, owner)
+	go h.runHalfOpenProbe(now, b, slots, finishAttempt, timeout, owner, probeTemplate)
 	return false
 }
 
@@ -437,6 +438,7 @@ func (h *healthTracker) runHalfOpenProbe(
 	finishAttempt func(),
 	timeout time.Duration,
 	owner string,
+	probeTemplate string,
 ) {
 	if finishAttempt != nil {
 		defer finishAttempt()
@@ -453,9 +455,9 @@ func (h *healthTracker) runHalfOpenProbe(
 
 	key := randomProbeKey()
 	req := provider.ClaimRequest{
-		Template: "probe",
+		Template: probeTemplate,
 		Key:      key,
-		SpecHash: provider.SpecHashOf("probe", nil, time.Minute),
+		SpecHash: provider.SpecHashOf(probeTemplate, nil, time.Minute),
 		Owner:    owner,
 		TTL:      time.Minute,
 	}

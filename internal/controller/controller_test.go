@@ -473,3 +473,31 @@ func TestStandbyFillsTheRegistryButLeavesStatusToTheLeader(t *testing.T) {
 		t.Fatalf("standby wrote status: %+v", p.Status.Conditions)
 	}
 }
+
+func TestProviderReportsClaimsDisabledWhenSchedulerBinderIsNil(t *testing.T) {
+	reg := registry.New(registry.Options{})
+	c := newClient(t, provider("civo", func(p *v1alpha1.SandboxProvider) {
+		p.Spec.Claims = &v1alpha1.ClaimsSpec{Enabled: true}
+	}))
+	if _, err := reconcileProvider(t, c, reg, "civo"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var p v1alpha1.SandboxProvider
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "civo"}, &p); err != nil {
+		t.Fatalf("reading provider: %v", err)
+	}
+	var claiming *metav1.Condition
+	for i := range p.Status.Conditions {
+		if p.Status.Conditions[i].Type == controller.ConditionClaiming {
+			claiming = &p.Status.Conditions[i]
+			break
+		}
+	}
+	if claiming == nil {
+		t.Fatal("expected Claiming condition on provider")
+	}
+	if claiming.Status != metav1.ConditionFalse || claiming.Reason != controller.ReasonClaimsDisabled {
+		t.Fatalf("expected Claiming=False/ClaimsDisabled when r.Binder is nil, got %s/%s: %s",
+			claiming.Status, claiming.Reason, claiming.Message)
+	}
+}

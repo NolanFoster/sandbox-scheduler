@@ -263,6 +263,13 @@ func (r *SandboxProviderReconciler) syncClaims(
 			message: "claims are not enabled on this provider (set spec.claims.enabled=true)",
 		}
 	}
+	if r.Binder == nil {
+		return &readiness{
+			status:  metav1.ConditionFalse,
+			reason:  ReasonClaimsDisabled,
+			message: "sandbox claims are disabled on the scheduler (start with --enable-claims)",
+		}
+	}
 	if prov.Binder == nil {
 		return &readiness{
 			status:  metav1.ConditionFalse,
