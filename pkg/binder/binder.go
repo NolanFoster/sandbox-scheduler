@@ -1034,6 +1034,16 @@ func (b *Binder) claimLoop(
 			}
 		}
 
+		filterProfile, schedReq, err := b.buildScheduleProfile(policy, req, allSnapshots)
+		if err != nil {
+			return nil, &Error{
+				Status:    422,
+				Reason:    ReasonInvalidPolicy,
+				Message:   "policy " + policy.Name + " is not usable: " + err.Error(),
+				Providers: []string{},
+			}
+		}
+
 		now := b.now()
 		candidates := make([]framework.Candidate, 0, len(allSnapshots))
 		for _, c := range allSnapshots {
@@ -1050,28 +1060,33 @@ func (b *Binder) claimLoop(
 			if !ok || !t.cfg.Enabled || t.prov.Binder == nil {
 				continue
 			}
-			if !t.health.isUsable(now, t.prov.Binder, t.cfg.Timeout, b.owner) {
+			if !t.health.isUsable(now, t.prov.Binder, t.slots, b.startAttempt, b.finishAttempt, t.cfg.Timeout, b.owner) {
 				continue
 			}
 			if b.isRefused(c.Provider, req.Template, now) {
 				continue
 			}
-			if wait := b.cooldownRemaining(c.Provider, now); wait > 0 {
-				busyCount++
-				if wait > maxBusyWait {
-					maxBusyWait = wait
-				}
-				continue
-			}
-			// Cold cluster claims and all elastic claims are bounded by maxRate.
-			if t.cfg.Elastic || c.WarmCapacity <= 0 {
-				if t.claimRate.TokensAt(now) < 1 {
-					overRate[c.Provider] = b.timeUntilNextToken(t.claimRate, now)
-					continue
-				}
-			}
 			if len(t.cfg.Templates) > 0 && len(c.Templates) == 0 {
 				c.Templates = t.cfg.Templates
+			}
+			// Only treat a provider as rate-limited or in cooldown when it
+			// actually satisfies the policy and request hard filters; otherwise
+			// let profile.Schedule reject it and record the filter explanation.
+			if passesHardFilters(reqCtx, filterProfile.Filters, schedReq, &c) {
+				if wait := b.cooldownRemaining(c.Provider, now); wait > 0 {
+					busyCount++
+					if wait > maxBusyWait {
+						maxBusyWait = wait
+					}
+					continue
+				}
+				// Cold cluster claims and all elastic claims are bounded by maxRate.
+				if t.cfg.Elastic || c.WarmCapacity <= 0 {
+					if t.claimRate.TokensAt(now) < 1 {
+						overRate[c.Provider] = b.timeUntilNextToken(t.claimRate, now)
+						continue
+					}
+				}
 			}
 			candidates = append(candidates, c)
 		}
@@ -1224,16 +1239,21 @@ func (b *Binder) claimLoop(
 				Explanation: lastExplanation,
 			}
 		}
-		if unavailableCount > 0 && unavailableCount+rejectedCount == len(tried) {
+		if unavailableCount > 0 && unavailableCount+busyCount+rejectedCount == len(tried) {
 			msg := "candidate providers were unavailable"
 			if lastErr != nil {
 				msg = lastErr.Error()
+			}
+			var retryAfter time.Duration
+			if maxBusyWait > 0 {
+				retryAfter = b.jitterDelay(maxBusyWait)
 			}
 			return nil, &Error{
 				Status:      503,
 				Reason:      ReasonUnavailable,
 				Message:     msg,
 				Providers:   triedList,
+				RetryAfter:  retryAfter,
 				Explanation: lastExplanation,
 			}
 		}
@@ -1262,6 +1282,20 @@ func (b *Binder) claimLoop(
 	}
 }
 
+func passesHardFilters(
+	ctx context.Context,
+	filters []framework.Filter,
+	req *framework.Request,
+	cand *framework.Candidate,
+) bool {
+	for _, f := range filters {
+		if ok, _ := f.Filter(ctx, req, cand); !ok {
+			return false
+		}
+	}
+	return true
+}
+
 type attemptAction int
 
 const (
@@ -1271,7 +1305,7 @@ const (
 )
 
 // attemptProvider runs a single provider attempt in its own function so defer
-// releases the provider slot at the end of the attempt rather than the end of
+// Releases the provider slot at the end of the attempt rather than the end of
 // the request.
 func (b *Binder) attemptProvider(
 	reqCtx context.Context,
@@ -1510,20 +1544,73 @@ func (b *Binder) retryPinnedKeyBusy(
 				Explanation: decision.Explain(),
 			}, nil, attemptDone
 		}
-		if retryWarm && provider.KindOf(err) != provider.KindNoCapacity && provider.KindOf(err) != provider.KindUnknownOutcome {
-			b.reg.ReleaseReservation(t.id)
-		}
-		lastErr = err
-		if provider.KindOf(err) == provider.KindKeyConflict {
+
+		switch provider.KindOf(err) {
+		case provider.KindKeyBusy:
+			if retryWarm {
+				b.reg.ReleaseReservation(t.id)
+			}
+			lastErr = err
+			continue
+		case provider.KindKeyConflict:
+			if retryWarm {
+				b.reg.ReleaseReservation(t.id)
+			}
 			return nil, &Error{
 				Status:    409,
 				Reason:    ReasonSpecMismatch,
 				Message:   err.Error(),
 				Providers: []string{t.id},
 			}, attemptDone
-		}
-		if provider.KindOf(err) != provider.KindKeyBusy {
-			break
+		case provider.KindNoCapacity:
+			b.recordRefusal(t.id, req.Template, b.now())
+			return nil, &Error{
+				Status:    409,
+				Reason:    ReasonNoCapacity,
+				Message:   err.Error(),
+				Providers: []string{t.id},
+			}, attemptDone
+		case provider.KindBusy:
+			if retryWarm {
+				b.reg.ReleaseReservation(t.id)
+			}
+			bw := provider.RetryAfterOf(err)
+			if bw <= 0 {
+				bw = b.refusalTTL
+			}
+			b.recordCooldown(t.id, b.now().Add(bw))
+			return nil, &Error{
+				Status:     429,
+				Reason:     ReasonBusy,
+				Message:    err.Error(),
+				Providers:  []string{t.id},
+				RetryAfter: b.jitterDelay(bw),
+			}, attemptDone
+		case provider.KindUnavailable:
+			if retryWarm {
+				b.reg.ReleaseReservation(t.id)
+			}
+			t.health.recordUnavailable(b.now(), err)
+			return nil, &Error{
+				Status:    503,
+				Reason:    ReasonUnavailable,
+				Message:   err.Error(),
+				Providers: []string{t.id},
+			}, attemptDone
+		case provider.KindRejected:
+			if retryWarm {
+				b.reg.ReleaseReservation(t.id)
+			}
+			t.health.recordRejected(err)
+			return nil, &Error{
+				Status:    422,
+				Reason:    ReasonRejected,
+				Message:   err.Error(),
+				Providers: []string{t.id},
+			}, attemptDone
+		default:
+			res, berr := b.recoverUnknownOutcome(reqCtx, t, decision, policy, claimReq, retryWarm, reqDeadline, err)
+			return res, berr, attemptDone
 		}
 	}
 	return nil, &Error{

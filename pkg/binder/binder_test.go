@@ -596,3 +596,88 @@ func TestReplayEvaluatesReachablePolicyFilter(t *testing.T) {
 		t.Fatalf("expected 409 ConstraintExcluded when replayed sandbox violates Reachable policy filter, got %+v", berr)
 	}
 }
+
+func TestPinnedKeyBusyRecoversUnknownOutcome(t *testing.T) {
+	b, reg := newTestBinder(t, binder.Options{
+		RandFloat64: func() float64 { return 0.01 },
+	})
+	reg.Report("civo", registry.Report{WarmCapacity: 1})
+
+	var attempts atomic.Int32
+	civoBinder := &scriptBinder{
+		claimFn: func(context.Context, provider.ClaimRequest) (provider.Handle, error) {
+			if attempts.Add(1) == 1 {
+				return provider.Handle{}, provider.KeyBusy(5*time.Millisecond, errors.New("deleting old"))
+			}
+			return provider.Handle{}, errors.New("EOF after write")
+		},
+		lookupFn: func(_ context.Context, req provider.ClaimRequest) (provider.Handle, error) {
+			return provider.Handle{Provider: "civo", ID: "sb-" + req.Key}, nil
+		},
+	}
+	b.SetTarget("civo", civoBinder.asProvider(false), binder.TargetConfig{Enabled: true})
+
+	res, berr := b.Bind(context.Background(), nil, binder.Request{Key: "kb-unknown"})
+	if berr != nil {
+		t.Fatalf("expected unknown outcome after KeyBusy retry to recover via Lookup, got %+v", berr)
+	}
+	if !res.Replay || res.Handle.Provider != "civo" {
+		t.Fatalf("expected Replay=true from civo, got %+v", res)
+	}
+}
+
+func TestMixedBusyAndUnavailableSpillReturns503(t *testing.T) {
+	b, reg := newTestBinder(t, binder.Options{})
+	reg.Report("civo", registry.Report{WarmCapacity: 1})
+	reg.Report("gke", registry.Report{WarmCapacity: 1})
+	reg.SetConfig("civo", registry.ProviderConfig{CostPerHour: 1})
+	reg.SetConfig("gke", registry.ProviderConfig{CostPerHour: 4})
+
+	civoBinder := &scriptBinder{
+		claimFn: func(context.Context, provider.ClaimRequest) (provider.Handle, error) {
+			return provider.Handle{}, provider.Busy(time.Second, errors.New("429 too many requests"))
+		},
+	}
+	gkeBinder := &scriptBinder{
+		claimFn: func(context.Context, provider.ClaimRequest) (provider.Handle, error) {
+			return provider.Handle{}, provider.Unavailable(errors.New("503 upstream down"))
+		},
+	}
+	b.SetTarget("civo", civoBinder.asProvider(false), binder.TargetConfig{Enabled: true})
+	b.SetTarget("gke", gkeBinder.asProvider(false), binder.TargetConfig{Enabled: true})
+
+	_, berr := b.Bind(context.Background(), nil, binder.Request{Key: "mixed-spill"})
+	if berr == nil || berr.Status != 503 || berr.Reason != binder.ReasonUnavailable {
+		t.Fatalf("expected 503 Unavailable for mixed Busy+Unavailable spill, got %+v", berr)
+	}
+}
+
+func TestIneligibleOverRateProviderReturnsNoCapacityNotRateLimited(t *testing.T) {
+	b, reg := newTestBinder(t, binder.Options{})
+	reg.Report("civo", registry.Report{WarmCapacity: 0})
+
+	civoBinder := &scriptBinder{
+		claimFn: func(_ context.Context, req provider.ClaimRequest) (provider.Handle, error) {
+			return provider.Handle{Provider: "civo", ID: "sb-" + req.Key}, nil
+		},
+	}
+	b.SetTarget("civo", civoBinder.asProvider(false), binder.TargetConfig{
+		Enabled: true,
+		MaxRate: 1,
+	})
+
+	// Drain the single cold rate token on civo.
+	if _, berr := b.Bind(context.Background(), nil, binder.Request{Key: "drain-1"}); berr != nil {
+		t.Fatalf("drain claim failed: %+v", berr)
+	}
+
+	// Now civo has 0 tokens and WarmCapacity=0. A WarmOnly request must fail
+	// with 409 NoCapacity (ineligible due to WarmOnly), not 429 RateLimited.
+	_, berr := b.Bind(context.Background(), nil, binder.Request{
+		Key:      "warm-req",
+		WarmOnly: true,
+	})
+	if berr == nil || berr.Status != 409 || berr.Reason != binder.ReasonNoCapacity {
+		t.Fatalf("expected 409 NoCapacity for WarmOnly request on cold over-rate provider, got %+v", berr)
+	}
+}

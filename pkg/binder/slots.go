@@ -391,8 +391,17 @@ func (h *healthTracker) unavailableRatioLocked() float64 {
 
 // isUsable reports whether the provider's claim path is currently healthy.
 // When demoted and due for a half-open probe, it launches an asynchronous
-// Lookup of a random never-used key.
-func (h *healthTracker) isUsable(now time.Time, b provider.Binder, timeout time.Duration, owner string) bool {
+// Lookup of a random never-used key bounded by the provider's slotLimiter and
+// tracked for graceful shutdown.
+func (h *healthTracker) isUsable(
+	now time.Time,
+	b provider.Binder,
+	slots *slotLimiter,
+	startAttempt func() bool,
+	finishAttempt func(),
+	timeout time.Duration,
+	owner string,
+) bool {
 	h.mu.Lock()
 	if !h.demoted {
 		h.mu.Unlock()
@@ -402,14 +411,39 @@ func (h *healthTracker) isUsable(now time.Time, b provider.Binder, timeout time.
 		h.mu.Unlock()
 		return false
 	}
+	if startAttempt != nil && !startAttempt() {
+		h.mu.Unlock()
+		return false
+	}
+	if slots != nil && !slots.tryAcquire() {
+		if finishAttempt != nil {
+			finishAttempt()
+		}
+		h.mu.Unlock()
+		return false
+	}
 	h.probing = true
 	h.mu.Unlock()
 
-	go h.runHalfOpenProbe(now, b, timeout, owner)
+	go h.runHalfOpenProbe(now, b, slots, finishAttempt, timeout, owner)
 	return false
 }
 
-func (h *healthTracker) runHalfOpenProbe(started time.Time, b provider.Binder, timeout time.Duration, owner string) {
+func (h *healthTracker) runHalfOpenProbe(
+	started time.Time,
+	b provider.Binder,
+	slots *slotLimiter,
+	finishAttempt func(),
+	timeout time.Duration,
+	owner string,
+) {
+	if finishAttempt != nil {
+		defer finishAttempt()
+	}
+	if slots != nil {
+		defer slots.release()
+	}
+
 	if timeout <= 0 {
 		timeout = DefaultAttemptTimeout
 	}
@@ -424,7 +458,15 @@ func (h *healthTracker) runHalfOpenProbe(started time.Time, b provider.Binder, t
 		Owner:    owner,
 		TTL:      time.Minute,
 	}
-	_, err := b.Lookup(ctx, req)
+	var err error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = errors.New("panic in adapter Lookup during half-open probe")
+			}
+		}()
+		_, err = b.Lookup(ctx, req)
+	}()
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
