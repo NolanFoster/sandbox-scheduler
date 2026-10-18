@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -156,10 +157,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	var (
+		claimBinder *binder.Binder
+		electOnce   sync.Once
+	)
+	recordElected := func() {
+		if leaderElection && claimBinder != nil {
+			electOnce.Do(claimBinder.NotifyElected)
+		}
+	}
+
 	// True from election onward; always true when leader election is off.
+	// Calls recordElected synchronously before returning true so no request
+	// can observe an active leader before the lease-handover hold-off window
+	// has been armed.
 	elected := func() bool {
 		select {
 		case <-mgr.Elected():
+			recordElected()
 			return true
 		default:
 			return false
@@ -172,7 +187,6 @@ func main() {
 		ColdStartWindow:  coldStartWindow,
 	})
 
-	var claimBinder *binder.Binder
 	if enableClaims {
 		resolvedClusterID, err := resolveClusterID(mgr.GetAPIReader(), clusterID)
 		if err != nil {
@@ -254,7 +268,7 @@ func main() {
 			if err := mgr.Add(everyReplica{manager.RunnableFunc(func(ctx context.Context) error {
 				select {
 				case <-mgr.Elected():
-					claimBinder.NotifyElected()
+					recordElected()
 				case <-ctx.Done():
 				}
 				return nil
