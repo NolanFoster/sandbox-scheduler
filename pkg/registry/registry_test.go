@@ -759,3 +759,174 @@ func TestColdPlacementOnAnUnknownProviderIsANoOp(t *testing.T) {
 		t.Fatalf("recording resurrected a provider: %+v", got)
 	}
 }
+
+// waitFor polls cond until it holds or the deadline passes.
+func waitFor(t *testing.T, within time.Duration, cond func() bool, msg string, args ...any) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf(msg, args...)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func runRegistry(t *testing.T, r *registry.Registry, interval time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx, interval); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+}
+
+func TestEachSourceIsPolledOnItsOwnInterval(t *testing.T) {
+	// One interval for every provider serves none of them: a rate-limited
+	// hosted API wants polling rarely, a fast-churning cluster often.
+	r := registry.New(registry.Options{})
+	fast, slow := &fakeSource{id: "fast"}, &fakeSource{id: "slow"}
+	r.AddSource(fast)
+	r.AddSource(slow)
+	r.SetRefreshInterval("fast", 10*time.Millisecond)
+	r.SetRefreshInterval("slow", time.Hour)
+	runRegistry(t, r, time.Hour)
+
+	waitFor(t, 2*time.Second, func() bool { return fast.callCount() >= 10 },
+		"fast source polled %d times", fast.callCount())
+	if n := slow.callCount(); n > 2 {
+		t.Fatalf("slow source polled %d times; its own hour-long interval should hold", n)
+	}
+}
+
+func TestASlowSourceDelaysOnlyItself(t *testing.T) {
+	// A source whose fetch outlasts its interval is neither polled twice at
+	// once nor allowed to hold up anyone else's schedule.
+	r := registry.New(registry.Options{FetchTimeout: time.Second})
+	slow := &fakeSource{id: "slow", delay: 300 * time.Millisecond}
+	fast := &fakeSource{id: "fast"}
+	r.AddSource(slow)
+	r.AddSource(fast)
+	r.SetRefreshInterval("slow", 5*time.Millisecond)
+	r.SetRefreshInterval("fast", 5*time.Millisecond)
+	start := time.Now()
+	runRegistry(t, r, time.Hour)
+
+	// The initial pass waits for everything, slow included; after it, fast
+	// keeps its own pace while slow is mid-fetch.
+	waitFor(t, 2*time.Second, func() bool { return fast.callCount() >= 10 },
+		"fast source polled %d times", fast.callCount())
+	elapsed := time.Since(start)
+	if n, most := slow.callCount(), int(elapsed/(300*time.Millisecond))+1; n > most {
+		t.Fatalf("slow source fetched %d times in %v; overlapping fetches", n, elapsed)
+	}
+}
+
+func TestANewSourceIsPolledWithoutWaitingAnInterval(t *testing.T) {
+	r := registry.New(registry.Options{})
+	runRegistry(t, r, time.Hour)
+
+	src := &fakeSource{id: "civo"}
+	src.set(registry.Report{WarmCapacity: 2}, nil)
+	r.AddSource(src)
+	waitFor(t, time.Second, func() bool { return r.Snapshot()[0].Reachable },
+		"a source added while running should be polled promptly, not after an hour")
+}
+
+func TestShorteningAnIntervalTakesEffectImmediately(t *testing.T) {
+	r := registry.New(registry.Options{})
+	src := &fakeSource{id: "civo"}
+	r.AddSource(src)
+	r.SetRefreshInterval("civo", time.Hour)
+	runRegistry(t, r, time.Hour)
+	waitFor(t, time.Second, func() bool { return src.callCount() >= 1 }, "never polled")
+
+	r.SetRefreshInterval("civo", 10*time.Millisecond)
+	waitFor(t, time.Second, func() bool { return src.callCount() >= 5 },
+		"polled %d times; the shorter interval should not wait out the hour", src.callCount())
+}
+
+// stubbornSource ignores cancellation: its fetch blocks until released, then
+// reports what it was built with.
+type stubbornSource struct {
+	id      string
+	warm    int
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+// newStubborn builds one released at cleanup at the latest, so a failing
+// test does not leave Run waiting on it forever. Call after runRegistry, so
+// that this cleanup runs first.
+func newStubborn(t *testing.T, id string, warm int) *stubbornSource {
+	s := &stubbornSource{id: id, warm: warm, started: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(s.free)
+	return s
+}
+
+func (s *stubbornSource) free() { s.once.Do(func() { close(s.release) }) }
+
+func (s *stubbornSource) ProviderID() string { return s.id }
+
+func (s *stubbornSource) Fetch(context.Context) (registry.Report, error) {
+	close(s.started)
+	<-s.release
+	return registry.Report{WarmCapacity: s.warm}, nil
+}
+
+func TestAReplacedSourceIsPolledAtOnceAndItsPredecessorIgnored(t *testing.T) {
+	// A new endpoint or credential must not wait for the old source's fetch
+	// to finish, and that fetch's answer, about an endpoint no longer in use,
+	// must never land on top of the new source's.
+	r := registry.New(registry.Options{FetchTimeout: 10 * time.Second})
+	runRegistry(t, r, time.Hour)
+
+	old := newStubborn(t, "civo", 9)
+	r.AddSource(old)
+	select {
+	case <-old.started:
+	case <-time.After(time.Second):
+		t.Fatal("the first source was never polled")
+	}
+
+	replacement := &fakeSource{id: "civo"}
+	replacement.set(registry.Report{WarmCapacity: 2}, nil)
+	r.AddSource(replacement)
+	waitFor(t, time.Second, func() bool { return replacement.callCount() >= 1 },
+		"the replacement waited on its predecessor's fetch")
+	waitFor(t, time.Second, func() bool { return r.Snapshot()[0].WarmCapacity == 2 },
+		"capacity %d, want the replacement's 2", r.Snapshot()[0].WarmCapacity)
+
+	old.free() // the retired fetch finally answers
+	time.Sleep(50 * time.Millisecond)
+	if got := r.Snapshot()[0].WarmCapacity; got != 2 {
+		t.Fatalf("capacity %d; the retired source's answer was recorded", got)
+	}
+}
+
+func TestAFetchByARemovedAndReaddedSourceIsIgnored(t *testing.T) {
+	// Generations are unique across the registry's lifetime, so a source
+	// removed and re-added under the same id is not mistaken for the one
+	// whose fetch is still running.
+	r := registry.New(registry.Options{FetchTimeout: 10 * time.Second})
+	runRegistry(t, r, time.Hour)
+
+	old := newStubborn(t, "civo", 9)
+	r.AddSource(old)
+	select {
+	case <-old.started:
+	case <-time.After(time.Second):
+		t.Fatal("the first source was never polled")
+	}
+	r.RemoveSource("civo")
+	readded := &fakeSource{id: "civo"}
+	readded.set(registry.Report{WarmCapacity: 1}, nil)
+	r.AddSource(readded)
+	waitFor(t, time.Second, func() bool { return r.Snapshot()[0].Reachable }, "re-added source never polled")
+
+	old.free()
+	time.Sleep(50 * time.Millisecond)
+	if got := r.Snapshot()[0].WarmCapacity; got != 1 {
+		t.Fatalf("capacity %d; a fetch from before the removal was recorded", got)
+	}
+}

@@ -115,6 +115,36 @@ func (e *entry) setReport(rep Report, at, cutoff time.Time) {
 	e.ledger.clearBefore(cutoff)
 }
 
+// polled is a source and its place in the polling schedule.
+type polled struct {
+	source Source
+	// interval is this source's own polling interval; zero means the
+	// registry's default.
+	interval time.Duration
+	// nextDue is when Run next polls it.
+	nextDue time.Time
+	// inFlight is set while Run is polling it, so a fetch slower than the
+	// interval is not joined by a second one.
+	inFlight bool
+	// gen identifies this source among every source the registry has held,
+	// so a fetch by one it has since replaced or removed can be told apart
+	// from a fetch by the current one.
+	gen uint64
+	// cancel stops Run's fetch in flight, if any.
+	cancel context.CancelFunc
+}
+
+// retire cancels any fetch in flight by the current source, whose result
+// would no longer be accepted, and frees the slot for the next one. Callers
+// hold the lock.
+func (p *polled) retire() {
+	if p.cancel != nil {
+		p.cancel()
+		p.cancel = nil
+	}
+	p.inFlight = false
+}
+
 // Registry holds current capacity for every known provider.
 //
 // Safe for concurrent use. Snapshot is the read path and is designed to be
@@ -122,7 +152,7 @@ func (e *entry) setReport(rep Report, at, cutoff time.Time) {
 type Registry struct {
 	mu      sync.RWMutex
 	entries map[string]*entry
-	sources map[string]Source
+	sources map[string]*polled
 
 	// ledgers mirrors each entry's ledger in an immutable map, replaced
 	// whenever a provider is added or removed, so that reserving finds one
@@ -142,6 +172,16 @@ type Registry struct {
 
 	// coldStartWindow is how long a cold placement counts as in flight.
 	coldStartWindow time.Duration
+
+	// defaultInterval is how often a source with no interval of its own is
+	// polled. Set by Run.
+	defaultInterval time.Duration
+
+	// wake interrupts Run's wait when the polling schedule changes.
+	wake chan struct{}
+
+	// lastGen is the last generation handed to a source; see polled.gen.
+	lastGen uint64
 
 	now func() time.Time
 }
@@ -174,7 +214,8 @@ type Options struct {
 func New(opts Options) *Registry {
 	r := &Registry{
 		entries:          map[string]*entry{},
-		sources:          map[string]Source{},
+		sources:          map[string]*polled{},
+		wake:             make(chan struct{}, 1),
 		staleAfter:       opts.StaleAfter,
 		fetchTimeout:     opts.FetchTimeout,
 		reservationGrace: opts.ReservationGrace,
@@ -226,14 +267,85 @@ func (r *Registry) publishLedgers() {
 // replaces the source and keeps any capacity already known for it, so
 // re-registering a provider (a CRD update, say) does not blind the scheduler to
 // it in the interim.
+//
+// A new or replaced source is polled as soon as Run next wakes rather than at
+// the end of an interval: new credentials or a new endpoint should be proven
+// or found broken now. Callers should therefore add a source when its
+// configuration changes, not on every reconcile.
 func (r *Registry) AddSource(s Source) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	id := s.ProviderID()
-	r.sources[id] = s
+	p, ok := r.sources[id]
+	if !ok {
+		p = &polled{}
+		r.sources[id] = p
+	}
+	// A fetch by the source being replaced is answering for an endpoint or
+	// credential that no longer applies. Stop it, so the new source need not
+	// wait for it, and so its answer cannot land after the new source's.
+	p.retire()
+	r.lastGen++
+	p.gen = r.lastGen
+	p.source = s
+	p.nextDue = time.Time{}
+	r.wakeRun()
 	// Known but never heard from: appears in snapshots as unreachable with no
 	// capacity, so a misconfigured provider is visible rather than absent.
 	r.entry(id)
+}
+
+// HasSource reports whether a provider has a source registered for polling.
+func (r *Registry) HasSource(providerID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.sources[providerID]
+	return ok
+}
+
+// SetRefreshInterval sets how often one provider is polled, overriding the
+// interval Run was given. Zero restores the default. A provider with nothing
+// registered is ignored.
+//
+// Per provider because providers differ: a hosted API that rate-limits wants
+// polling rarely, a cluster whose warm pool turns over in seconds wants it
+// often, and one global interval serves neither.
+func (r *Registry) SetRefreshInterval(providerID string, d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p, ok := r.sources[providerID]
+	if !ok || p.interval == d {
+		return
+	}
+	p.interval = d
+	// Bring the next poll forward when the interval shrinks, so a provider
+	// moved from 5m to 5s does not wait out the old interval first.
+	if next := r.now().Add(r.intervalOf(p)); next.Before(p.nextDue) {
+		p.nextDue = next
+	}
+	r.wakeRun()
+}
+
+// intervalOf is a source's effective polling interval. Callers hold the lock.
+func (r *Registry) intervalOf(p *polled) time.Duration {
+	if p.interval > 0 {
+		return p.interval
+	}
+	if r.defaultInterval > 0 {
+		return r.defaultInterval
+	}
+	return 10 * time.Second
+}
+
+// wakeRun tells Run the schedule changed. Never blocks.
+func (r *Registry) wakeRun() {
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
 }
 
 // SetConfig records what the operator declared about a provider.
@@ -254,6 +366,9 @@ func (r *Registry) SetConfig(providerID string, cfg ProviderConfig) {
 func (r *Registry) RemoveSource(providerID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if p, ok := r.sources[providerID]; ok {
+		p.retire()
+	}
 	delete(r.sources, providerID)
 	delete(r.entries, providerID)
 	r.publishLedgers()
@@ -324,63 +439,145 @@ func (r *Registry) RecordColdPlacement(providerID string) {
 // must not delay or invalidate the refresh of the others. A source that fails
 // leaves the previous report in place, marked by its age rather than erased.
 func (r *Registry) Refresh(ctx context.Context) {
-	r.mu.RLock()
-	sources := make([]Source, 0, len(r.sources))
-	for _, s := range r.sources {
-		sources = append(sources, s)
+	r.mu.Lock()
+	now := r.now()
+	type job struct {
+		source Source
+		gen    uint64
 	}
-	r.mu.RUnlock()
+	jobs := make([]job, 0, len(r.sources))
+	for _, p := range r.sources {
+		jobs = append(jobs, job{p.source, p.gen})
+		p.nextDue = now.Add(r.intervalOf(p))
+	}
+	r.mu.Unlock()
 
 	var wg sync.WaitGroup
-	for _, s := range sources {
+	for _, j := range jobs {
 		wg.Add(1)
-		go func(s Source) {
+		go func(j job) {
 			defer wg.Done()
-			fetchCtx, cancel := context.WithTimeout(ctx, r.fetchTimeout)
-			defer cancel()
-			started := r.now()
-			rep, err := s.Fetch(fetchCtx)
-
-			r.mu.Lock()
-			defer r.mu.Unlock()
-			e, ok := r.entries[s.ProviderID()]
-			if !ok {
-				// Removed while the fetch was in flight; drop the result rather
-				// than resurrecting a provider the operator deleted.
-				return
-			}
-			if err != nil {
-				// Keep the last good report. Ageing it out is staleness, which
-				// policy can reason about; zeroing it is a lie.
-				e.lastErr = err
-				return
-			}
-			// Only claims made a grace period before the fetch began are
-			// certain to be in its answer; later ones keep their reservation.
-			e.setReport(rep, r.now(), started.Add(-r.reservationGrace))
-		}(s)
+			r.poll(ctx, j.source, j.gen)
+		}(j)
 	}
 	wg.Wait()
 }
 
-// Run refreshes on an interval until ctx is cancelled. It refreshes once
-// immediately so the scheduler is not blind for a whole interval at startup.
+// poll fetches one source and records the result, unless the source has been
+// replaced or removed since: gen is the generation it was polled as.
+func (r *Registry) poll(ctx context.Context, s Source, gen uint64) {
+	fetchCtx, cancel := context.WithTimeout(ctx, r.fetchTimeout)
+	defer cancel()
+	started := r.now()
+	rep, err := s.Fetch(fetchCtx)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if p, ok := r.sources[s.ProviderID()]; !ok || p.gen != gen {
+		// Replaced or removed while the fetch was in flight. Its answer, or
+		// its error, is about a source no longer in use: recording it could
+		// show capacity from an old endpoint against a new one, or resurrect
+		// a provider the operator deleted.
+		return
+	}
+	e, ok := r.entries[s.ProviderID()]
+	if !ok {
+		return
+	}
+	if err != nil {
+		// Keep the last good report. Ageing it out is staleness, which policy
+		// can reason about; zeroing it is a lie.
+		e.lastErr = err
+		return
+	}
+	// Only claims made a grace period before the fetch began are certain to
+	// be in its answer; later ones keep their reservation.
+	e.setReport(rep, r.now(), started.Add(-r.reservationGrace))
+}
+
+// Run polls every source on its own interval until ctx is cancelled: the
+// source's SetRefreshInterval if it has one, otherwise interval. It polls
+// everything once immediately so the scheduler is not blind for a whole
+// interval at startup, and returns once any polls in flight have finished.
+//
+// Sources are polled independently. A slow fetch delays only its own next
+// poll, never another provider's, and a source is never polled twice at once.
 func (r *Registry) Run(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
-	r.Refresh(ctx)
+	// Everything is due now: the first pass goes through the same
+	// scheduling as the rest, so one slow source cannot hold back the others
+	// or a source added meanwhile, as a blocking pass would.
+	r.mu.Lock()
+	r.defaultInterval = interval
+	for _, p := range r.sources {
+		p.nextDue = time.Time{}
+	}
+	r.mu.Unlock()
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	var inFlight sync.WaitGroup
+	defer inFlight.Wait()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	for {
+		wait := r.pollDue(ctx, &inFlight)
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(wait)
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			r.Refresh(ctx)
+		case <-timer.C:
+		case <-r.wake:
 		}
 	}
+}
+
+// pollDue starts a poll of every source that is due and not already being
+// polled, and returns how long until the next one falls due.
+func (r *Registry) pollDue(ctx context.Context, inFlight *sync.WaitGroup) time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.now()
+	// Bounded so that a schedule changed in a way that skipped wakeRun is
+	// still picked up eventually.
+	wait := time.Minute
+	for _, p := range r.sources {
+		if p.inFlight {
+			continue
+		}
+		if !now.Before(p.nextDue) {
+			fetchCtx, cancel := context.WithCancel(ctx)
+			p.inFlight = true
+			p.cancel = cancel
+			p.nextDue = now.Add(r.intervalOf(p))
+			inFlight.Add(1)
+			go func(p *polled, s Source, gen uint64) {
+				defer inFlight.Done()
+				defer cancel()
+				r.poll(fetchCtx, s, gen)
+				r.mu.Lock()
+				if p.gen == gen {
+					// Not retired meanwhile, so the slot is still this
+					// fetch's to free.
+					p.inFlight = false
+					p.cancel = nil
+				}
+				r.mu.Unlock()
+				// Its next poll may already be due if this one ran long.
+				r.wakeRun()
+			}(p, p.source, p.gen)
+		}
+		if d := p.nextDue.Sub(now); d < wait {
+			wait = d
+		}
+	}
+	return wait
 }
 
 // Snapshot returns the current candidates for scheduling.
@@ -428,6 +625,8 @@ type Status struct {
 	Reachable bool
 	Stale     bool
 	Age       time.Duration
+	// UpdatedAt is when the last successful report arrived; zero if none has.
+	UpdatedAt time.Time
 	Report    Report
 	// Reserved is how many placements since the last poll are subtracted
 	// from Report.WarmCapacity in snapshots.
@@ -456,6 +655,7 @@ func (r *Registry) Statuses() []Status {
 			Reachable:    e.everReported && age <= r.staleAfter,
 			Stale:        e.everReported && age > r.staleAfter,
 			Age:          age,
+			UpdatedAt:    e.updatedAt,
 			Report:       e.report,
 			Reserved:     e.ledger.reserved(),
 			InFlightCold: e.ledger.inFlightCold(now),

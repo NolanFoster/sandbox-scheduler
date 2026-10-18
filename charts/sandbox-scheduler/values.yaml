@@ -32,8 +32,9 @@ replicaCount: 2
 leaderElection: true
 
 scheduler:
-  # How often provider capacity is polled. Off the placement path entirely, so
-  # this trades freshness against load on providers, never placement latency.
+  # How often provider capacity is polled, for providers that set no
+  # spec.refreshInterval of their own. Off the placement path entirely, so this
+  # trades freshness against load on providers, never placement latency.
   refreshInterval: 10s
   # How long a capacity report stays trusted. Past this the provider is treated
   # as unreachable, but keeps its last known capacity so policy can still
