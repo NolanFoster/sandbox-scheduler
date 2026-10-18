@@ -126,6 +126,23 @@ type polled struct {
 	// inFlight is set while Run is polling it, so a fetch slower than the
 	// interval is not joined by a second one.
 	inFlight bool
+	// gen identifies this source among every source the registry has held,
+	// so a fetch by one it has since replaced or removed can be told apart
+	// from a fetch by the current one.
+	gen uint64
+	// cancel stops Run's fetch in flight, if any.
+	cancel context.CancelFunc
+}
+
+// retire cancels any fetch in flight by the current source, whose result
+// would no longer be accepted, and frees the slot for the next one. Callers
+// hold the lock.
+func (p *polled) retire() {
+	if p.cancel != nil {
+		p.cancel()
+		p.cancel = nil
+	}
+	p.inFlight = false
 }
 
 // Registry holds current capacity for every known provider.
@@ -162,6 +179,9 @@ type Registry struct {
 
 	// wake interrupts Run's wait when the polling schedule changes.
 	wake chan struct{}
+
+	// lastGen is the last generation handed to a source; see polled.gen.
+	lastGen uint64
 
 	now func() time.Time
 }
@@ -261,6 +281,12 @@ func (r *Registry) AddSource(s Source) {
 		p = &polled{}
 		r.sources[id] = p
 	}
+	// A fetch by the source being replaced is answering for an endpoint or
+	// credential that no longer applies. Stop it, so the new source need not
+	// wait for it, and so its answer cannot land after the new source's.
+	p.retire()
+	r.lastGen++
+	p.gen = r.lastGen
 	p.source = s
 	p.nextDue = time.Time{}
 	r.wakeRun()
@@ -340,6 +366,9 @@ func (r *Registry) SetConfig(providerID string, cfg ProviderConfig) {
 func (r *Registry) RemoveSource(providerID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if p, ok := r.sources[providerID]; ok {
+		p.retire()
+	}
 	delete(r.sources, providerID)
 	delete(r.entries, providerID)
 	r.publishLedgers()
@@ -412,26 +441,31 @@ func (r *Registry) RecordColdPlacement(providerID string) {
 func (r *Registry) Refresh(ctx context.Context) {
 	r.mu.Lock()
 	now := r.now()
-	sources := make([]Source, 0, len(r.sources))
+	type job struct {
+		source Source
+		gen    uint64
+	}
+	jobs := make([]job, 0, len(r.sources))
 	for _, p := range r.sources {
-		sources = append(sources, p.source)
+		jobs = append(jobs, job{p.source, p.gen})
 		p.nextDue = now.Add(r.intervalOf(p))
 	}
 	r.mu.Unlock()
 
 	var wg sync.WaitGroup
-	for _, s := range sources {
+	for _, j := range jobs {
 		wg.Add(1)
-		go func(s Source) {
+		go func(j job) {
 			defer wg.Done()
-			r.poll(ctx, s)
-		}(s)
+			r.poll(ctx, j.source, j.gen)
+		}(j)
 	}
 	wg.Wait()
 }
 
-// poll fetches one source and records the result.
-func (r *Registry) poll(ctx context.Context, s Source) {
+// poll fetches one source and records the result, unless the source has been
+// replaced or removed since: gen is the generation it was polled as.
+func (r *Registry) poll(ctx context.Context, s Source, gen uint64) {
 	fetchCtx, cancel := context.WithTimeout(ctx, r.fetchTimeout)
 	defer cancel()
 	started := r.now()
@@ -439,10 +473,15 @@ func (r *Registry) poll(ctx context.Context, s Source) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if p, ok := r.sources[s.ProviderID()]; !ok || p.gen != gen {
+		// Replaced or removed while the fetch was in flight. Its answer, or
+		// its error, is about a source no longer in use: recording it could
+		// show capacity from an old endpoint against a new one, or resurrect
+		// a provider the operator deleted.
+		return
+	}
 	e, ok := r.entries[s.ProviderID()]
 	if !ok {
-		// Removed while the fetch was in flight; drop the result rather than
-		// resurrecting a provider the operator deleted.
 		return
 	}
 	if err != nil {
@@ -467,10 +506,15 @@ func (r *Registry) Run(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
+	// Everything is due now: the first pass goes through the same
+	// scheduling as the rest, so one slow source cannot hold back the others
+	// or a source added meanwhile, as a blocking pass would.
 	r.mu.Lock()
 	r.defaultInterval = interval
+	for _, p := range r.sources {
+		p.nextDue = time.Time{}
+	}
 	r.mu.Unlock()
-	r.Refresh(ctx)
 
 	var inFlight sync.WaitGroup
 	defer inFlight.Wait()
@@ -508,18 +552,26 @@ func (r *Registry) pollDue(ctx context.Context, inFlight *sync.WaitGroup) time.D
 			continue
 		}
 		if !now.Before(p.nextDue) {
+			fetchCtx, cancel := context.WithCancel(ctx)
 			p.inFlight = true
+			p.cancel = cancel
 			p.nextDue = now.Add(r.intervalOf(p))
 			inFlight.Add(1)
-			go func(p *polled, s Source) {
+			go func(p *polled, s Source, gen uint64) {
 				defer inFlight.Done()
-				r.poll(ctx, s)
+				defer cancel()
+				r.poll(fetchCtx, s, gen)
 				r.mu.Lock()
-				p.inFlight = false
+				if p.gen == gen {
+					// Not retired meanwhile, so the slot is still this
+					// fetch's to free.
+					p.inFlight = false
+					p.cancel = nil
+				}
 				r.mu.Unlock()
 				// Its next poll may already be due if this one ran long.
 				r.wakeRun()
-			}(p, p.source)
+			}(p, p.source, p.gen)
 		}
 		if d := p.nextDue.Sub(now); d < wait {
 			wait = d

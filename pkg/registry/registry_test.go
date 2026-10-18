@@ -844,3 +844,89 @@ func TestShorteningAnIntervalTakesEffectImmediately(t *testing.T) {
 	waitFor(t, time.Second, func() bool { return src.callCount() >= 5 },
 		"polled %d times; the shorter interval should not wait out the hour", src.callCount())
 }
+
+// stubbornSource ignores cancellation: its fetch blocks until released, then
+// reports what it was built with.
+type stubbornSource struct {
+	id      string
+	warm    int
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+// newStubborn builds one released at cleanup at the latest, so a failing
+// test does not leave Run waiting on it forever. Call after runRegistry, so
+// that this cleanup runs first.
+func newStubborn(t *testing.T, id string, warm int) *stubbornSource {
+	s := &stubbornSource{id: id, warm: warm, started: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(s.free)
+	return s
+}
+
+func (s *stubbornSource) free() { s.once.Do(func() { close(s.release) }) }
+
+func (s *stubbornSource) ProviderID() string { return s.id }
+
+func (s *stubbornSource) Fetch(context.Context) (registry.Report, error) {
+	close(s.started)
+	<-s.release
+	return registry.Report{WarmCapacity: s.warm}, nil
+}
+
+func TestAReplacedSourceIsPolledAtOnceAndItsPredecessorIgnored(t *testing.T) {
+	// A new endpoint or credential must not wait for the old source's fetch
+	// to finish, and that fetch's answer, about an endpoint no longer in use,
+	// must never land on top of the new source's.
+	r := registry.New(registry.Options{FetchTimeout: 10 * time.Second})
+	runRegistry(t, r, time.Hour)
+
+	old := newStubborn(t, "civo", 9)
+	r.AddSource(old)
+	select {
+	case <-old.started:
+	case <-time.After(time.Second):
+		t.Fatal("the first source was never polled")
+	}
+
+	replacement := &fakeSource{id: "civo"}
+	replacement.set(registry.Report{WarmCapacity: 2}, nil)
+	r.AddSource(replacement)
+	waitFor(t, time.Second, func() bool { return replacement.callCount() >= 1 },
+		"the replacement waited on its predecessor's fetch")
+	waitFor(t, time.Second, func() bool { return r.Snapshot()[0].WarmCapacity == 2 },
+		"capacity %d, want the replacement's 2", r.Snapshot()[0].WarmCapacity)
+
+	old.free() // the retired fetch finally answers
+	time.Sleep(50 * time.Millisecond)
+	if got := r.Snapshot()[0].WarmCapacity; got != 2 {
+		t.Fatalf("capacity %d; the retired source's answer was recorded", got)
+	}
+}
+
+func TestAFetchByARemovedAndReaddedSourceIsIgnored(t *testing.T) {
+	// Generations are unique across the registry's lifetime, so a source
+	// removed and re-added under the same id is not mistaken for the one
+	// whose fetch is still running.
+	r := registry.New(registry.Options{FetchTimeout: 10 * time.Second})
+	runRegistry(t, r, time.Hour)
+
+	old := newStubborn(t, "civo", 9)
+	r.AddSource(old)
+	select {
+	case <-old.started:
+	case <-time.After(time.Second):
+		t.Fatal("the first source was never polled")
+	}
+	r.RemoveSource("civo")
+	readded := &fakeSource{id: "civo"}
+	readded.set(registry.Report{WarmCapacity: 1}, nil)
+	r.AddSource(readded)
+	waitFor(t, time.Second, func() bool { return r.Snapshot()[0].Reachable }, "re-added source never polled")
+
+	old.free()
+	time.Sleep(50 * time.Millisecond)
+	if got := r.Snapshot()[0].WarmCapacity; got != 1 {
+		t.Fatalf("capacity %d; a fetch from before the removal was recorded", got)
+	}
+}
