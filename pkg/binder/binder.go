@@ -434,10 +434,10 @@ func (b *Binder) holdOffRemaining(now time.Time) time.Duration {
 			maxTimeout = t.cfg.Timeout
 		}
 	}
-	holdOff := maxTimeout + RemoteTimeoutSkewGrace
-	if holdOff > b.claimTimeout {
-		holdOff = b.claimTimeout
+	if maxTimeout > b.claimTimeout {
+		maxTimeout = b.claimTimeout
 	}
+	holdOff := maxTimeout + RemoteTimeoutSkewGrace
 	until := electedAt.Add(holdOff)
 	if !now.Before(until) {
 		return 0
@@ -534,7 +534,8 @@ func (b *Binder) Bind(ctx context.Context, policy *v1alpha1.SandboxPlacementPoli
 		}
 	}
 
-	// De-duplicate concurrent and overlapping requests for the same key on the leader.
+	// De-duplicate concurrent and repeat requests for the same key across the
+	// sandbox's TTL window on the leader.
 	b.flightsMu.Lock()
 	now = b.now()
 	if existing, ok := b.flights[req.Key]; ok {
@@ -549,14 +550,6 @@ func (b *Binder) Bind(ctx context.Context, policy *v1alpha1.SandboxPlacementPoli
 		for k, f := range b.flights {
 			if f.completed && !now.Before(f.completedUntil) {
 				delete(b.flights, k)
-			}
-		}
-	}
-	if len(b.flights) >= b.globalMaxInFlight*2 {
-		for k, f := range b.flights {
-			if f.completed {
-				delete(b.flights, k)
-				break
 			}
 		}
 	}
@@ -581,12 +574,13 @@ func (b *Binder) Bind(ctx context.Context, policy *v1alpha1.SandboxPlacementPoli
 		}
 		b.flightsMu.Lock()
 		if fl.err == nil && fl.res != nil {
-			retention := b.claimTimeout
-			if ttl > 0 && ttl < retention {
-				retention = ttl
+			finishNow := b.now()
+			until := finishNow.Add(ttl)
+			if !fl.res.Handle.ExpiresAt.IsZero() && fl.res.Handle.ExpiresAt.After(finishNow) && fl.res.Handle.ExpiresAt.Before(until) {
+				until = fl.res.Handle.ExpiresAt
 			}
 			fl.completed = true
-			fl.completedUntil = b.now().Add(retention)
+			fl.completedUntil = until
 		} else if b.flights[req.Key] == fl {
 			delete(b.flights, req.Key)
 		}

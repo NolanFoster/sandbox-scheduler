@@ -95,6 +95,8 @@ type ClaimRequest struct {
 	Key            string            `json:"key"`
 	Retry          bool              `json:"retry,omitempty"`
 	Labels         map[string]string `json:"labels,omitempty"`
+	PolicyLabels   map[string]string `json:"policyLabels,omitempty"`
+	SandboxLabels  map[string]string `json:"sandboxLabels,omitempty"`
 	Requires       map[string]string `json:"requires,omitempty"`
 	PreferProvider string            `json:"preferProvider,omitempty"`
 	PinProvider    string            `json:"pinProvider,omitempty"`
@@ -454,11 +456,37 @@ func (s *Service) handleClaim(w http.ResponseWriter, r *http.Request) {
 		timeout = d
 	}
 
+	selectorLabels := make(map[string]string, len(raw.Labels)+len(raw.PolicyLabels))
+	for k, v := range raw.Labels {
+		selectorLabels[k] = v
+	}
+	for k, v := range raw.PolicyLabels {
+		selectorLabels[k] = v
+	}
+
+	var forwardedLabels map[string]string
+	if len(raw.SandboxLabels) > 0 {
+		forwardedLabels = raw.SandboxLabels
+	} else if len(raw.Labels) > 0 {
+		// Unprefixed labels in raw.Labels (such as "team=a") select the
+		// governing SandboxPlacementPolicy just like POST /schedule; domain-
+		// prefixed labels are forwarded to the provider and validated against
+		// the allowlisted label domain.
+		for k, v := range raw.Labels {
+			if strings.Contains(k, "/") {
+				if forwardedLabels == nil {
+					forwardedLabels = make(map[string]string)
+				}
+				forwardedLabels[k] = v
+			}
+		}
+	}
+
 	var policies []v1alpha1.SandboxPlacementPolicy
 	if s.Policies != nil {
 		policies = s.Policies.Policies()
 	}
-	policy, err := v1alpha1.SelectPolicy(policies, raw.Labels)
+	policy, err := v1alpha1.SelectPolicy(policies, selectorLabels)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, ErrorResponse{
 			Error:     err.Error(),
@@ -474,7 +502,7 @@ func (s *Service) handleClaim(w http.ResponseWriter, r *http.Request) {
 		Template:       raw.Template,
 		Key:            raw.Key,
 		Retry:          raw.Retry,
-		Labels:         raw.Labels,
+		Labels:         forwardedLabels,
 		Requires:       raw.Requires,
 		PreferProvider: raw.PreferProvider,
 		PinProvider:    raw.PinProvider,
