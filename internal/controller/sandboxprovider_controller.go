@@ -162,8 +162,16 @@ func (r *SandboxProviderReconciler) sync(ctx context.Context, p *v1alpha1.Sandbo
 	creds, err := r.resolveCredentials(ctx, p)
 	if err != nil {
 		// Keep polling with what we had rather than dropping the provider: a
-		// Secret that is briefly unreadable should not evacuate a cluster.
-		var claiming *readiness
+		// Secret that is briefly unreadable should not evacuate a cluster, but
+		// billable claims must stop immediately when credentials are missing.
+		if r.Binder != nil {
+			r.Binder.RemoveTarget(p.Name)
+		}
+		claiming := &readiness{
+			status:  metav1.ConditionFalse,
+			reason:  ReasonCredentials,
+			message: err.Error(),
+		}
 		if !claimsEnabled {
 			claiming = &readiness{
 				status:  metav1.ConditionFalse,
