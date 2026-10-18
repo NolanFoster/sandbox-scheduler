@@ -890,3 +890,48 @@ func TestHalfOpenProbeUsesConfiguredProviderTemplate(t *testing.T) {
 	hs, _ := b.HealthStatus("civo")
 	t.Fatalf("expected civo to recover after half-open probe with valid template, got %+v", hs)
 }
+
+func TestCompletedFlightCacheEvictionFallsBackToProviderLookup(t *testing.T) {
+	b, reg := newTestBinder(t, binder.Options{
+		MaxCompletedKeys: 2,
+	})
+	reg.Report("civo", registry.Report{WarmCapacity: 5})
+	reg.Report("gke", registry.Report{WarmCapacity: 5})
+	reg.SetConfig("civo", registry.ProviderConfig{CostPerHour: 1})
+	reg.SetConfig("gke", registry.ProviderConfig{CostPerHour: 10})
+
+	civoFake := adaptertest.NewFake("civo", 5, false)
+	gkeFake := adaptertest.NewFake("gke", 5, false)
+	b.SetTarget("civo", civoFake.Provider(false), binder.TargetConfig{Enabled: true})
+	b.SetTarget("gke", gkeFake.Provider(false), binder.TargetConfig{Enabled: true})
+
+	first, berr := b.Bind(context.Background(), nil, binder.Request{Key: "evict-key-1", TTL: 10 * time.Minute})
+	if berr != nil {
+		t.Fatalf("first claim failed: %+v", berr)
+	}
+	if first.Handle.Provider != "civo" {
+		t.Fatalf("expected civo, got %q", first.Handle.Provider)
+	}
+
+	// Claim two more distinct keys so evict-key-1 is evicted from the bounded
+	// completed-flight cache while its TTL is still active.
+	for _, k := range []string{"evict-key-2", "evict-key-3"} {
+		if _, berr := b.Bind(context.Background(), nil, binder.Request{Key: k, TTL: 10 * time.Minute}); berr != nil {
+			t.Fatalf("claim %s failed: %+v", k, berr)
+		}
+	}
+
+	// Now make gke the preferred/cheaper provider so a fresh placement without
+	// Lookup would pick gke. Repeating evict-key-1 with retry=false after cache
+	// eviction must still find the existing sandbox on civo via Lookup rather
+	// than creating a duplicate on gke.
+	reg.SetConfig("civo", registry.ProviderConfig{CostPerHour: 10})
+	reg.SetConfig("gke", registry.ProviderConfig{CostPerHour: 1})
+	repeat, berr := b.Bind(context.Background(), nil, binder.Request{Key: "evict-key-1", PreferProvider: "gke", TTL: 10 * time.Minute})
+	if berr != nil {
+		t.Fatalf("repeat claim after cache eviction failed: %+v", berr)
+	}
+	if !repeat.Replay || repeat.Handle.Provider != "civo" || repeat.Handle.ID != first.Handle.ID {
+		t.Fatalf("expected replay of civo/%s after cache eviction, got %+v", first.Handle.ID, repeat)
+	}
+}

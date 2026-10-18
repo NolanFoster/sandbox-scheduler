@@ -24,7 +24,7 @@ spec:
       serviceAccountName: {{ include "sandbox-scheduler.serviceAccountName" . }}
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- if .Values.scheduler.enableClaims }}
-      terminationGracePeriodSeconds: {{ .Values.scheduler.terminationGracePeriodSeconds | default 30 }}
+      terminationGracePeriodSeconds: {{ include "sandbox-scheduler.terminationGracePeriodSeconds" . }}
       {{- end }}
       containers:
         - name: scheduler

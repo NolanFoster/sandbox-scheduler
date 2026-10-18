@@ -39,6 +39,7 @@ const (
 	DefaultRefusalTTL          = time.Second
 	DefaultQueueTimeout        = time.Second
 	DefaultMaxTTL              = 24 * time.Hour
+	DefaultMaxCompletedKeys    = 16384
 
 	DefaultClusterMaxRate    = 50
 	DefaultElasticMaxRate    = 100
@@ -158,6 +159,7 @@ type Options struct {
 	MaxSpill           int
 	GlobalMaxInFlight  int
 	MaxJoinersPerKey   int
+	MaxCompletedKeys   int
 	CoalesceWindow     time.Duration
 	Now                func() time.Time
 	RandFloat64        func() float64
@@ -188,6 +190,7 @@ type Binder struct {
 	maxSpill           int
 	globalMaxInFlight  int
 	maxJoinersPerKey   int
+	maxCompletedKeys   int
 	coalesceWindow     time.Duration
 	now                func() time.Time
 	randFloat          func() float64
@@ -201,8 +204,10 @@ type Binder struct {
 	inFlight atomic.Int64
 
 	// Singleflight per idempotency key.
-	flightsMu sync.Mutex
-	flights   map[string]*flight
+	flightsMu             sync.Mutex
+	flights               map[string]*flight
+	completedOrder        []string
+	evictedUnexpiredUntil time.Time
 
 	// Global refusal cache keyed by (provider, template) and per-provider
 	// Busy cooldowns.
@@ -236,6 +241,7 @@ func New(opts Options) *Binder {
 		maxSpill:           opts.MaxSpill,
 		globalMaxInFlight:  opts.GlobalMaxInFlight,
 		maxJoinersPerKey:   opts.MaxJoinersPerKey,
+		maxCompletedKeys:   opts.MaxCompletedKeys,
 		coalesceWindow:     opts.CoalesceWindow,
 		now:                opts.Now,
 		randFloat:          opts.RandFloat64,
@@ -270,6 +276,9 @@ func New(opts Options) *Binder {
 	}
 	if b.maxJoinersPerKey <= 0 {
 		b.maxJoinersPerKey = DefaultMaxJoinersPerKey
+	}
+	if b.maxCompletedKeys <= 0 {
+		b.maxCompletedKeys = DefaultMaxCompletedKeys
 	}
 	if b.now == nil {
 		b.now = time.Now
@@ -579,8 +588,13 @@ func (b *Binder) Bind(ctx context.Context, policy *v1alpha1.SandboxPlacementPoli
 			if !fl.res.Handle.ExpiresAt.IsZero() && fl.res.Handle.ExpiresAt.After(finishNow) && fl.res.Handle.ExpiresAt.Before(until) {
 				until = fl.res.Handle.ExpiresAt
 			}
+			cached := *fl.res
+			cached.Explanation = ""
+			fl.res = &cached
 			fl.completed = true
 			fl.completedUntil = until
+			b.completedOrder = append(b.completedOrder, req.Key)
+			b.enforceCompletedFlightCapLocked(finishNow)
 		} else if b.flights[req.Key] == fl {
 			delete(b.flights, req.Key)
 		}
@@ -590,6 +604,56 @@ func (b *Binder) Bind(ctx context.Context, policy *v1alpha1.SandboxPlacementPoli
 
 	fl.res, fl.err = b.executeFlight(ctx, policy, req, claimReq)
 	return fl.res, fl.err
+}
+
+// enforceCompletedFlightCapLocked bounds b.flights to b.maxCompletedKeys
+// entries using FIFO eviction over completed flights. If an unexpired
+// completed flight is evicted under memory pressure, evictedUnexpiredUntil is
+// advanced to that flight's expiry so unpinned fresh claims fall back to
+// cross-provider Lookup rather than risking duplicate sandbox creation.
+func (b *Binder) enforceCompletedFlightCapLocked(now time.Time) {
+	for len(b.completedOrder) > 0 {
+		front := b.completedOrder[0]
+		f, ok := b.flights[front]
+		if !ok || !f.completed {
+			b.completedOrder[0] = ""
+			b.completedOrder = b.completedOrder[1:]
+			continue
+		}
+		if !now.Before(f.completedUntil) {
+			delete(b.flights, front)
+			b.completedOrder[0] = ""
+			b.completedOrder = b.completedOrder[1:]
+			continue
+		}
+		break
+	}
+	for len(b.flights) > b.maxCompletedKeys && len(b.completedOrder) > 0 {
+		oldest := b.completedOrder[0]
+		b.completedOrder[0] = ""
+		b.completedOrder = b.completedOrder[1:]
+		f, ok := b.flights[oldest]
+		if !ok || !f.completed {
+			continue
+		}
+		delete(b.flights, oldest)
+		if now.Before(f.completedUntil) && f.completedUntil.After(b.evictedUnexpiredUntil) {
+			b.evictedUnexpiredUntil = f.completedUntil
+		}
+	}
+	if len(b.completedOrder) == 0 && cap(b.completedOrder) > 64 {
+		b.completedOrder = nil
+	} else if cap(b.completedOrder) > 64 && len(b.completedOrder)*2 < cap(b.completedOrder) {
+		compacted := make([]string, len(b.completedOrder))
+		copy(compacted, b.completedOrder)
+		b.completedOrder = compacted
+	}
+}
+
+func (b *Binder) hasEvictedUnexpired(now time.Time) bool {
+	b.flightsMu.Lock()
+	defer b.flightsMu.Unlock()
+	return now.Before(b.evictedUnexpiredUntil)
 }
 
 func (b *Binder) joinFlight(
@@ -683,13 +747,13 @@ func (b *Binder) executeFlight(
 	targets := *b.targets.Load()
 	pinned := req.PinProvider
 
-	// 1. Lookup rule for pinned or retry requests.
+	// 1. Lookup rule for pinned, retry, or post-eviction requests.
 	if pinned != "" {
 		res, berr, shouldClaim := b.lookupPinned(reqCtx, targets, pinned, policy, req, claimReq, reqDeadline)
 		if !shouldClaim {
 			return res, berr
 		}
-	} else if req.Retry {
+	} else if req.Retry || b.hasEvictedUnexpired(now) {
 		res, berr, pinFromProbe, shouldClaim := b.lookupRetryAll(reqCtx, targets, policy, req, claimReq, reqDeadline)
 		if !shouldClaim {
 			return res, berr

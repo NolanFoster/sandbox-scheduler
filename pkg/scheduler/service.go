@@ -227,7 +227,7 @@ func (s *Service) requireClaimAuth(next http.HandlerFunc) http.HandlerFunc {
 			tok = s.Token
 		}
 		if tok != "" && !authorizedWithToken(r, tok) {
-			writeJSON(w, http.StatusUnauthorized, ErrorResponse{
+			writeClaimError(w, http.StatusUnauthorized, ErrorResponse{
 				Error: "missing or invalid bearer token",
 			})
 			return
@@ -383,7 +383,7 @@ func (s *Service) handleSchedule(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) handleClaim(w http.ResponseWriter, r *http.Request) {
 	if !s.ClaimsEnabled || s.Binder == nil {
-		writeJSON(w, http.StatusNotImplemented, ErrorResponse{
+		writeClaimError(w, http.StatusNotImplemented, ErrorResponse{
 			Error:     "sandbox claims are disabled; start the scheduler with --enable-claims",
 			Reason:    binder.ReasonClaimsDisabled,
 			Providers: []string{},
@@ -399,7 +399,7 @@ func (s *Service) handleClaim(w http.ResponseWriter, r *http.Request) {
 
 	var raw ClaimRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxClaimBodyBytes)).Decode(&raw); err != nil {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+		writeClaimError(w, http.StatusBadRequest, ErrorResponse{
 			Error:     "invalid JSON body: " + err.Error(),
 			Reason:    binder.ReasonInvalidRequest,
 			Providers: []string{},
@@ -411,7 +411,7 @@ func (s *Service) handleClaim(w http.ResponseWriter, r *http.Request) {
 	var ttl time.Duration
 	if raw.TTLSeconds != nil {
 		if *raw.TTLSeconds <= 0 || *raw.TTLSeconds > maxSecondsField {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			writeClaimError(w, http.StatusBadRequest, ErrorResponse{
 				Error:     "invalid ttlSeconds: must be positive",
 				Reason:    binder.ReasonInvalidRequest,
 				Providers: []string{},
@@ -422,7 +422,7 @@ func (s *Service) handleClaim(w http.ResponseWriter, r *http.Request) {
 	} else if raw.TTL != "" {
 		d, err := time.ParseDuration(raw.TTL)
 		if err != nil || d <= 0 {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			writeClaimError(w, http.StatusBadRequest, ErrorResponse{
 				Error:     "invalid ttl duration: " + raw.TTL,
 				Reason:    binder.ReasonInvalidRequest,
 				Providers: []string{},
@@ -435,7 +435,7 @@ func (s *Service) handleClaim(w http.ResponseWriter, r *http.Request) {
 	var timeout time.Duration
 	if raw.TimeoutSeconds != nil {
 		if *raw.TimeoutSeconds <= 0 || *raw.TimeoutSeconds > maxSecondsField {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			writeClaimError(w, http.StatusBadRequest, ErrorResponse{
 				Error:     "invalid timeoutSeconds: must be positive",
 				Reason:    binder.ReasonInvalidRequest,
 				Providers: []string{},
@@ -446,7 +446,7 @@ func (s *Service) handleClaim(w http.ResponseWriter, r *http.Request) {
 	} else if raw.Timeout != "" {
 		d, err := time.ParseDuration(raw.Timeout)
 		if err != nil || d <= 0 {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			writeClaimError(w, http.StatusBadRequest, ErrorResponse{
 				Error:     "invalid timeout duration: " + raw.Timeout,
 				Reason:    binder.ReasonInvalidRequest,
 				Providers: []string{},
@@ -488,7 +488,7 @@ func (s *Service) handleClaim(w http.ResponseWriter, r *http.Request) {
 	}
 	policy, err := v1alpha1.SelectPolicy(policies, selectorLabels)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+		writeClaimError(w, http.StatusInternalServerError, ErrorResponse{
 			Error:     err.Error(),
 			Providers: []string{},
 		})
@@ -544,7 +544,7 @@ func (s *Service) handleClaim(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) handleRelease(w http.ResponseWriter, r *http.Request) {
 	if !s.ClaimsEnabled || s.Binder == nil {
-		writeJSON(w, http.StatusNotImplemented, ErrorResponse{
+		writeClaimError(w, http.StatusNotImplemented, ErrorResponse{
 			Error:     "sandbox claims are disabled; start the scheduler with --enable-claims",
 			Reason:    binder.ReasonClaimsDisabled,
 			Providers: []string{},
@@ -560,7 +560,7 @@ func (s *Service) handleRelease(w http.ResponseWriter, r *http.Request) {
 	providerID := r.PathValue("provider")
 	sandboxID := r.PathValue("id")
 	if providerID == "" || sandboxID == "" {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+		writeClaimError(w, http.StatusBadRequest, ErrorResponse{
 			Error:     "provider and sandbox id are required",
 			Reason:    binder.ReasonInvalidRequest,
 			Providers: []string{},
@@ -575,10 +575,34 @@ func (s *Service) handleRelease(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// claimErrorResponse is the wire encoding for claim-endpoint errors so that
+// "providers" is always serialized as a JSON array (even when empty).
+type claimErrorResponse struct {
+	Error        string   `json:"error"`
+	Reason       string   `json:"reason,omitempty"`
+	Providers    []string `json:"providers"`
+	RetryAfterMs int64    `json:"retryAfterMs,omitempty"`
+	Explanation  string   `json:"explanation,omitempty"`
+}
+
+func writeClaimError(w http.ResponseWriter, status int, resp ErrorResponse) {
+	providers := resp.Providers
+	if providers == nil {
+		providers = []string{}
+	}
+	writeJSON(w, status, claimErrorResponse{
+		Error:        resp.Error,
+		Reason:       resp.Reason,
+		Providers:    providers,
+		RetryAfterMs: resp.RetryAfterMs,
+		Explanation:  resp.Explanation,
+	})
+}
+
 func writeStandby(w http.ResponseWriter) {
 	retryWait := time.Second + time.Duration(rand.Int64N(int64(3*time.Second)))
 	setRetryAfterHeader(w, retryWait)
-	writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+	writeClaimError(w, http.StatusServiceUnavailable, ErrorResponse{
 		Error:        "this replica is a standby; placement is served by the elected leader",
 		Reason:       binder.ReasonStandby,
 		Providers:    []string{},
@@ -587,19 +611,15 @@ func writeStandby(w http.ResponseWriter) {
 }
 
 func writeBinderError(w http.ResponseWriter, berr *binder.Error) {
-	providers := berr.Providers
-	if providers == nil {
-		providers = []string{}
-	}
 	var retryMs int64
 	if berr.RetryAfter > 0 {
 		setRetryAfterHeader(w, berr.RetryAfter)
 		retryMs = berr.RetryAfter.Milliseconds()
 	}
-	writeJSON(w, berr.Status, ErrorResponse{
+	writeClaimError(w, berr.Status, ErrorResponse{
 		Error:        berr.Message,
 		Reason:       berr.Reason,
-		Providers:    providers,
+		Providers:    berr.Providers,
 		RetryAfterMs: retryMs,
 		Explanation:  berr.Explanation,
 	})

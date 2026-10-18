@@ -740,6 +740,9 @@ func TestClaimRejectsNonPositiveNumericTTLAndTimeout(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("expected 400 Bad Request for %s, got %d (%s)", body, w.Code, w.Body.String())
 		}
+		if !strings.Contains(w.Body.String(), `"providers":[]`) {
+			t.Fatalf("expected providers:[] in error body for %s, got %s", body, w.Body.String())
+		}
 	}
 }
 
