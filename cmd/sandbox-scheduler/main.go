@@ -24,10 +24,12 @@ import (
 	"os"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -75,8 +77,9 @@ func main() {
 		"Namespace read for provider credentials. Confining this to the scheduler's own namespace "+
 			"stops a cluster-scoped SandboxProvider referencing a Secret anywhere in the cluster.")
 	flag.DurationVar(&refreshInterval, "refresh-interval", 10*time.Second,
-		"How often provider capacity is polled. Off the placement path, so this trades freshness "+
-			"against load on providers, never placement latency.")
+		"How often provider capacity is polled, for providers that set no spec.refreshInterval of "+
+			"their own. Off the placement path, so this trades freshness against load on providers, "+
+			"never placement latency.")
 	flag.DurationVar(&staleAfter, "stale-after", 30*time.Second,
 		"How long a capacity report stays trusted before its provider is treated as unreachable.")
 	flag.DurationVar(&reservationGrace, "reservation-grace", 5*time.Second,
@@ -98,8 +101,15 @@ func main() {
 	log := ctrl.Log.WithName("setup")
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
+		Scheme:  scheme,
+		Metrics: metricsserver.Options{BindAddress: metricsAddr},
+		// Credentials are only ever read from the secret namespace, so only
+		// that namespace's Secrets are cached. Unscoped, the provider
+		// controller's Secret watch would hold every Secret in the cluster in
+		// this process's memory.
+		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
+			&corev1.Secret{}: {Namespaces: map[string]cache.Config{secretNamespace: {}}},
+		}},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElection,
 		LeaderElectionID:       "sandbox-scheduler.placement.agents.x-k8s.io",
