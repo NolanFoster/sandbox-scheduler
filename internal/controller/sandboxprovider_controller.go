@@ -170,9 +170,6 @@ func (r *SandboxProviderReconciler) sync(ctx context.Context, p *v1alpha1.Sandbo
 		if r.Binder != nil {
 			r.Binder.RemoveTarget(p.Name)
 		}
-		if r.Reaper != nil {
-			r.Reaper.RemoveTarget(p.Name)
-		}
 	}
 
 	creds, err := r.resolveCredentials(ctx, p)
@@ -303,7 +300,7 @@ func (r *SandboxProviderReconciler) syncClaims(
 	}
 	if r.Reaper != nil {
 		r.Reaper.SetTarget(p.Name, prov, reaper.TargetConfig{
-			Enabled: r.Binder != nil && prov.Binder != nil && prov.Lister != nil,
+			Enabled: prov.Binder != nil && prov.Lister != nil,
 			Timeout: tcfg.Timeout,
 		})
 	}

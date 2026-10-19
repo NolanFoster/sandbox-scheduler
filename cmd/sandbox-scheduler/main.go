@@ -210,24 +210,31 @@ func main() {
 		WriteStatus:     elected,
 	}
 
-	if enableClaims {
-		resolvedClusterID, err := resolveClusterID(mgr.GetAPIReader(), clusterID)
-		if err != nil {
-			log.Error(err, "unable to resolve cluster ID for sandbox claims; set --cluster-id or grant get on namespace kube-system")
-			os.Exit(1)
-		}
+	resolvedClusterID, clusterIDErr := resolveClusterID(mgr.GetAPIReader(), clusterID)
+	if enableClaims && clusterIDErr != nil {
+		log.Error(clusterIDErr, "unable to resolve cluster ID for sandbox claims; set --cluster-id or grant get on namespace kube-system")
+		os.Exit(1)
+	}
+	if clusterIDErr != nil {
+		log.Info("skipping background reaper because cluster ID could not be resolved", "error", clusterIDErr.Error())
+	} else {
 		ownerID := provider.OwnerID(releaseName, envOr("POD_NAMESPACE", secretNamespace), resolvedClusterID)
-		claimBinder = binder.New(binder.Options{
-			Registry:          reg,
-			Owner:             ownerID,
-			ClaimTimeout:      claimTimeout,
-			QueueTimeout:      claimQueueTimeout,
-			RefusalTTL:        refusalTTL,
-			MaxTTL:            claimMaxTTL,
-			MaxSpill:          maxSpill,
-			GlobalMaxInFlight: claimMaxInFlight,
-			MaxJoinersPerKey:  maxJoinersPerKey,
-		})
+		var onReleased func(providerID, sandboxID string)
+		if enableClaims {
+			claimBinder = binder.New(binder.Options{
+				Registry:          reg,
+				Owner:             ownerID,
+				ClaimTimeout:      claimTimeout,
+				QueueTimeout:      claimQueueTimeout,
+				RefusalTTL:        refusalTTL,
+				MaxTTL:            claimMaxTTL,
+				MaxSpill:          maxSpill,
+				GlobalMaxInFlight: claimMaxInFlight,
+				MaxJoinersPerKey:  maxJoinersPerKey,
+			})
+			providerReconciler.Binder = claimBinder
+			onReleased = claimBinder.EvictHandle
+		}
 		claimReaper = reaper.New(reaper.Options{
 			Owner:         ownerID,
 			Interval:      reapInterval,
@@ -235,10 +242,9 @@ func main() {
 			RatePerSecond: reapRate,
 			DryRun:        reapDryRun,
 			Log:           ctrl.Log.WithName("reaper"),
-			OnReleased:    claimBinder.EvictHandle,
+			OnReleased:    onReleased,
 			OnDryRun:      providerReconciler.RecordReapDryRunEvent,
 		})
-		providerReconciler.Binder = claimBinder
 		providerReconciler.Reaper = claimReaper
 	}
 
