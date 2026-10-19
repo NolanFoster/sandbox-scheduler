@@ -107,7 +107,6 @@ func init() {
 		}
 		httpClient := &http.Client{
 			Transport: transport,
-			Timeout:   30 * time.Second,
 		}
 
 		c := &Client{
@@ -150,6 +149,11 @@ func (c *Client) ProviderID() string { return c.id }
 // verify reachability and API key validity, reporting Elastic: true so the
 // scheduler scores this provider using ElasticWarmScore.
 func (c *Client) Fetch(ctx context.Context) (provider.Report, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+	}
 	req, err := c.newRequest(ctx, http.MethodGet, c.endpoint+"/v2/sandboxes?state=running&limit=1", nil)
 	if err != nil {
 		return provider.Report{}, err
