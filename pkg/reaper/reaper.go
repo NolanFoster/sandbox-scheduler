@@ -230,12 +230,17 @@ func (r *Reaper) Run(ctx context.Context) {
 }
 
 // RunOnce executes a single reap pass across all registered providers that
-// implement OwnedLister.
+// implement OwnedLister. Each provider pass runs concurrently under a cycle
+// deadline of r.interval so one slow or unhealthy provider never stalls
+// reaping on other providers.
 func (r *Reaper) RunOnce(ctx context.Context) {
 	snapshot := *r.targets.Load()
-	if len(snapshot) == 0 {
+	if len(snapshot) == 0 || ctx.Err() != nil {
 		return
 	}
+
+	passCtx, passCancel := context.WithTimeout(ctx, r.interval)
+	defer passCancel()
 
 	ids := make([]string, 0, len(snapshot))
 	for id := range snapshot {
@@ -243,12 +248,16 @@ func (r *Reaper) RunOnce(ctx context.Context) {
 	}
 	sort.Strings(ids)
 
+	var wg sync.WaitGroup
 	for _, id := range ids {
-		if ctx.Err() != nil {
-			return
-		}
-		r.reapProvider(ctx, snapshot[id])
+		t := snapshot[id]
+		wg.Add(1)
+		go func(t *target) {
+			defer wg.Done()
+			r.reapProvider(passCtx, t)
+		}(t)
 	}
+	wg.Wait()
 }
 
 func (r *Reaper) reapProvider(ctx context.Context, t *target) {

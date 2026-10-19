@@ -303,7 +303,7 @@ func (r *SandboxProviderReconciler) syncClaims(
 	}
 	if r.Reaper != nil {
 		r.Reaper.SetTarget(p.Name, prov, reaper.TargetConfig{
-			Enabled: claimsEnabled && r.Binder != nil && prov.Binder != nil && prov.Lister != nil,
+			Enabled: r.Binder != nil && prov.Binder != nil && prov.Lister != nil,
 			Timeout: tcfg.Timeout,
 		})
 	}
