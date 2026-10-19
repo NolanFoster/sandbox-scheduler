@@ -7,6 +7,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -19,6 +20,10 @@ import (
 	"github.com/NolanFoster/sandbox-scheduler/internal/controller"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/adapter"
 	_ "github.com/NolanFoster/sandbox-scheduler/pkg/adapter/agentsandbox"
+	_ "github.com/NolanFoster/sandbox-scheduler/pkg/adapter/e2b"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/binder"
+	provpkg "github.com/NolanFoster/sandbox-scheduler/pkg/provider"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/reaper"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/registry"
 )
 
@@ -501,3 +506,72 @@ func TestProviderReportsClaimsDisabledWhenSchedulerBinderIsNil(t *testing.T) {
 			claiming.Status, claiming.Reason, claiming.Message)
 	}
 }
+
+func TestE2BProviderClaimsAndEventEmission(t *testing.T) {
+	reg := registry.New(registry.Options{})
+	b := binder.New(binder.Options{Registry: reg, Owner: "sc-test-owner"})
+	rp := reaper.New(reaper.Options{Owner: "sc-test-owner", DryRun: true})
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "e2b-key", Namespace: secretNS},
+		Data:       map[string][]byte{"apiKey": []byte("e2b_live_key")},
+	}
+	sp := &v1alpha1.SandboxProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "e2b-us-east"},
+		Spec: v1alpha1.SandboxProviderSpec{
+			Adapter:        "e2b",
+			Endpoint:       "https://api.e2b.example.com",
+			CredentialsRef: &corev1.LocalObjectReference{Name: "e2b-key"},
+			Templates: []v1alpha1.TemplateMapping{
+				{Name: "python-3.12", Ref: "base-python-312"},
+			},
+			Claims: &v1alpha1.ClaimsSpec{Enabled: true},
+		},
+	}
+
+	c := newClient(t, sp, secret)
+	reconciler := &controller.SandboxProviderReconciler{
+		Client:          c,
+		Registry:        reg,
+		Binder:          b,
+		Reaper:          rp,
+		SecretNamespace: secretNS,
+		StatusInterval:  time.Second,
+	}
+
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "e2b-us-east"},
+	}); err != nil {
+		t.Fatalf("reconcile e2b provider: %v", err)
+	}
+
+	var updated v1alpha1.SandboxProvider
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "e2b-us-east"}, &updated); err != nil {
+		t.Fatalf("getting provider: %v", err)
+	}
+	var claiming *metav1.Condition
+	for i := range updated.Status.Conditions {
+		if updated.Status.Conditions[i].Type == controller.ConditionClaiming {
+			claiming = &updated.Status.Conditions[i]
+			break
+		}
+	}
+	if claiming == nil || claiming.Status != metav1.ConditionTrue || claiming.Reason != controller.ReasonClaimCapable {
+		t.Fatalf("expected Claiming=True/ClaimCapable on e2b provider, got %+v", claiming)
+	}
+
+	// Verify an events.k8s.io/v1 Event was emitted on Claiming transition, and
+	// a ReapDryRun Event is emitted when RecordReapDryRunEvent is invoked.
+	reconciler.RecordReapDryRunEvent(context.Background(), "e2b-us-east", []provpkg.Handle{
+		{Provider: "e2b-us-east", ID: "sbx-1001"},
+	})
+
+	var events eventsv1.EventList
+	if err := c.List(context.Background(), &events, client.InNamespace("default")); err != nil {
+		t.Fatalf("listing events: %v", err)
+	}
+	if len(events.Items) != 2 {
+		t.Fatalf("expected 2 events (ClaimCapable + ReapDryRun), got %d: %+v", len(events.Items), events.Items)
+	}
+}
+

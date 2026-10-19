@@ -12,6 +12,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,6 +30,7 @@ import (
 	"github.com/NolanFoster/sandbox-scheduler/pkg/adapter"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/binder"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/provider"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/reaper"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/registry"
 )
 
@@ -51,6 +53,10 @@ const (
 	ReasonNotClaimCapable  = "AdapterPollOnly"
 	ReasonClaimCircuitOpen = "CircuitOpen"
 	ReasonClaimRejected    = "ClaimRejected"
+	ReasonReapDryRun       = "ReapDryRun"
+
+	reportingController = "sandbox-scheduler.placement.agents.x-k8s.io"
+	defaultEventNS      = "default"
 )
 
 // defaultStatusInterval is how often a healthy provider is re-reconciled to
@@ -69,12 +75,17 @@ type SandboxProviderReconciler struct {
 	client.Client
 	Registry *registry.Registry
 	Binder   *binder.Binder
+	Reaper   *reaper.Reaper
 
 	// SecretNamespace is where credentialsRef Secrets are read from.
 	// Providers are cluster-scoped, so the reference has no namespace of its
 	// own; confining it to the scheduler's own namespace means a provider
 	// cannot be pointed at an arbitrary Secret elsewhere in the cluster.
 	SecretNamespace string
+
+	// EventInstance identifies the reporting pod/replica on emitted
+	// events.k8s.io/v1 Events. Defaults to "sandbox-scheduler" when empty.
+	EventInstance string
 
 	// StatusInterval overrides defaultStatusInterval in tests.
 	StatusInterval time.Duration
@@ -155,8 +166,13 @@ func (r *SandboxProviderReconciler) sync(ctx context.Context, p *v1alpha1.Sandbo
 	}
 
 	claimsEnabled := p.Spec.Claims != nil && p.Spec.Claims.Enabled
-	if !claimsEnabled && r.Binder != nil {
-		r.Binder.RemoveTarget(p.Name)
+	if !claimsEnabled {
+		if r.Binder != nil {
+			r.Binder.RemoveTarget(p.Name)
+		}
+		if r.Reaper != nil {
+			r.Reaper.RemoveTarget(p.Name)
+		}
 	}
 
 	creds, err := r.resolveCredentials(ctx, p)
@@ -166,6 +182,9 @@ func (r *SandboxProviderReconciler) sync(ctx context.Context, p *v1alpha1.Sandbo
 		// billable claims must stop immediately when credentials are missing.
 		if r.Binder != nil {
 			r.Binder.RemoveTarget(p.Name)
+		}
+		if r.Reaper != nil {
+			r.Reaper.RemoveTarget(p.Name)
 		}
 		claiming := &readiness{
 			status:  metav1.ConditionFalse,
@@ -282,6 +301,12 @@ func (r *SandboxProviderReconciler) syncClaims(
 	if r.Binder != nil {
 		r.Binder.SetTarget(p.Name, prov, tcfg)
 	}
+	if r.Reaper != nil {
+		r.Reaper.SetTarget(p.Name, prov, reaper.TargetConfig{
+			Enabled: claimsEnabled && r.Binder != nil && prov.Binder != nil && prov.Lister != nil,
+			Timeout: tcfg.Timeout,
+		})
+	}
 
 	if !claimsEnabled {
 		return &readiness{
@@ -346,6 +371,9 @@ func (r *SandboxProviderReconciler) deregister(name string) {
 	r.Registry.RemoveSource(name)
 	if r.Binder != nil {
 		r.Binder.RemoveTarget(name)
+	}
+	if r.Reaper != nil {
+		r.Reaper.RemoveTarget(name)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -509,6 +537,8 @@ func (r *SandboxProviderReconciler) writeStatus(ctx context.Context, p *v1alpha1
 		return ctrl.Result{RequeueAfter: r.statusInterval()}, nil
 	}
 
+	prevClaiming := findCondition(observed.Conditions, ConditionClaiming)
+
 	setCondition(&p.Status.Conditions, metav1.Condition{
 		Type:               ConditionReady,
 		Status:             ready.status,
@@ -541,7 +571,93 @@ func (r *SandboxProviderReconciler) writeStatus(ctx context.Context, p *v1alpha1
 		}
 		return ctrl.Result{}, err
 	}
+
+	if claiming != nil && claimingTransitioned(prevClaiming, *claiming, p.Spec.Claims != nil && p.Spec.Claims.Enabled) {
+		evType := corev1.EventTypeNormal
+		if claiming.status == metav1.ConditionFalse &&
+			claiming.reason != ReasonClaimsDisabled &&
+			claiming.reason != ReasonDisabled {
+			evType = corev1.EventTypeWarning
+		}
+		r.emitEvent(ctx, p, evType, "ReconcileClaiming", claiming.reason, claiming.message)
+	}
+
 	return ctrl.Result{RequeueAfter: r.statusInterval()}, nil
+}
+
+// RecordReapDryRunEvent emits a Kubernetes events.k8s.io/v1 Event on the
+// SandboxProvider summarizing expired sandboxes observed during a reaper
+// dry-run pass.
+func (r *SandboxProviderReconciler) RecordReapDryRunEvent(ctx context.Context, providerName string, handles []provider.Handle) {
+	if len(handles) == 0 || r.Client == nil {
+		return
+	}
+	if r.WriteStatus != nil && !r.WriteStatus() {
+		return
+	}
+	var sp v1alpha1.SandboxProvider
+	if err := r.Get(ctx, types.NamespacedName{Name: providerName}, &sp); err != nil {
+		return
+	}
+	msg := fmt.Sprintf("dry-run: would reap %d expired sandbox(es) (first: %s)", len(handles), handles[0].ID)
+	r.emitEvent(ctx, &sp, corev1.EventTypeNormal, "ReapDryRun", ReasonReapDryRun, msg)
+}
+
+func (r *SandboxProviderReconciler) emitEvent(
+	ctx context.Context,
+	p *v1alpha1.SandboxProvider,
+	eventType, action, reason, note string,
+) {
+	if r.Client == nil || p == nil {
+		return
+	}
+	instance := r.EventInstance
+	if instance == "" {
+		instance = "sandbox-scheduler"
+	}
+	if len(note) > 1024 {
+		note = note[:1024]
+	}
+	ev := &eventsv1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: p.Name + "-",
+			Namespace:    defaultEventNS,
+		},
+		EventTime:           metav1.NewMicroTime(time.Now()),
+		ReportingController: reportingController,
+		ReportingInstance:   instance,
+		Action:              action,
+		Reason:              reason,
+		Regarding: corev1.ObjectReference{
+			APIVersion: v1alpha1.GroupVersion.String(),
+			Kind:       "SandboxProvider",
+			Name:       p.Name,
+			UID:        p.UID,
+		},
+		Type: eventType,
+		Note: note,
+	}
+	if err := r.Create(ctx, ev); err != nil {
+		log.FromContext(ctx).V(1).Info("unable to emit event for SandboxProvider",
+			"provider", p.Name, "reason", reason, "error", err)
+	}
+}
+
+func findCondition(conditions []metav1.Condition, condType string) *metav1.Condition {
+	for i := range conditions {
+		if conditions[i].Type == condType {
+			c := conditions[i]
+			return &c
+		}
+	}
+	return nil
+}
+
+func claimingTransitioned(prev *metav1.Condition, next readiness, claimsEnabled bool) bool {
+	if prev == nil {
+		return claimsEnabled || next.status == metav1.ConditionTrue
+	}
+	return prev.Status != next.status || prev.Reason != next.reason
 }
 
 func (r *SandboxProviderReconciler) statusInterval() time.Duration {

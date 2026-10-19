@@ -138,6 +138,17 @@ var (
 		},
 		[]string{"provider"},
 	)
+
+	// ReapTotal counts background reaper actions per provider and outcome.
+	ReapTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "reap_total",
+			Help: "Expired sandboxes processed by the background reaper per provider and outcome " +
+				"(deleted, dry_run, error, circuit_breaker).",
+		},
+		[]string{"provider", "outcome"},
+	)
 )
 
 func init() {
@@ -150,6 +161,7 @@ func init() {
 		ClaimDuration,
 		ClaimSpillsTotal,
 		ClaimInflight,
+		ReapTotal,
 	)
 }
 
@@ -163,6 +175,11 @@ func RecordClaimAttempt(providerName, kind string, took time.Duration) {
 // RecordClaimSpill increments the claim spill counter.
 func RecordClaimSpill() {
 	ClaimSpillsTotal.Inc()
+}
+
+// RecordReap records one reaper action for providerName with outcome.
+func RecordReap(providerName, outcome string) {
+	ReapTotal.WithLabelValues(providerName, outcome).Inc()
 }
 
 // RecordDecision records a successful placement.

@@ -1,6 +1,6 @@
 # Pluggable claims: placing *and* provisioning sandboxes beyond Kubernetes
 
-Status: **v7, Phases 0–3 implemented** after six review rounds (OSS
+Status: **v7, Phases 0–7 implemented** after six review rounds (OSS
 compatibility, scalability, Kubernetes practices, Go practices, and automated
 PR review). Section 12 records what changed in each revision and why.
 
@@ -625,9 +625,18 @@ phase 6.
 4. **Dependency bump** to upstream v1.0.7's k8s/controller-runtime versions.
 5. **agent-sandbox binder** (5.11) + envtest with upstream CRDs + a real-cluster
    run.
-6. **First hosted adapter**, out-of-tree module or sidecar. **Interface
-   stability gate.**
-7. **Reaper.**
+6. **First hosted adapter (`pkg/adapter/e2b`)**: elastic `Source`, `Binder`,
+   `BatchLookuper`, and `OwnedLister` over the E2B HTTP API (`apiKey`/`token`
+   Secret credentials, `authMode: x-api-key|bearer` option, server-side metadata
+   filtering on `placement.agents.x-k8s.io/{owner,key,spec-hash,expires-at}`,
+   dedicated HTTP/2 transport sized to 512 connections per host, and
+   `adaptertest.TestBinder` conformance). **Interface stability gate.**
+7. **Reaper (`pkg/reaper`)**: leader-only periodic reaper (`--reap-interval=30s`,
+   `--reap-max-per-cycle=200`, `--reap-rate=10`, `--reap-dry-run=false`) paging
+   `ListOwned` (`500`/page) and releasing expired handles with `Handle.Version`
+   preconditions, `sandbox_scheduler_reap_total{provider,outcome}` metrics, and
+   `events.k8s.io/v1` Events on `Claiming` condition transitions and reaper
+   dry-run cycles.
 8. **gRPC adapter host**, chart sidecar packaging, `-plugins` image variant;
    `fleet` (KEP-1434) capacity adapter as its own module.
 
@@ -688,7 +697,7 @@ phase 6.
 
 ## 12. Changes
 
-### v6 → v7 (round 6: PR #5 review + Phases 0–3 implementation)
+### v6 → v7 (round 6: PR #5 review + Phases 0–7 implementation)
 
 | v6 | v7 | Raised by |
 |---|---|---|
@@ -697,6 +706,7 @@ phase 6.
 | `proto/adapter/v1alpha1` lacked batch lookup RPC and capability bit | Added `rpc LookupMany(LookupManyRequest) returns (LookupManyResponse)` and `bool can_batch_lookup = 3` in `GetInfoResponse` | Codex review (P1) |
 | `NoCapacity` refusal cache was keyed only by `provider`, suppressing all templates when one pool was empty | Refusal cache is keyed by `(provider, template)` (`refusalKey`) so an empty `gpu` pool does not suppress `python` on the same provider | Codex review (P2) |
 | `provider.Handle` and proto `Handle` had no deletion precondition field for reaper safety | Added `Version string` (`string version = 3` in proto `Handle`), populated by `ListOwned` and enforced by `Release` when non-empty | Codex review (P2), Go review |
+| Hosted E2B adapter and reaper flags/metrics specified only in prose | Implemented `pkg/adapter/e2b` (`apiKey`/`token`, `authMode: x-api-key\|bearer`, metadata filter `Lookup`/`LookupMany`/`ListOwned`) and `pkg/reaper` (`--reap-interval=30s`, `--reap-max-per-cycle=200`, `--reap-rate=10`, `--reap-dry-run=false`, `sandbox_scheduler_reap_total{provider,outcome}`) | OSS review |
 
 ### v5 → v6 (round 5)
 

@@ -42,9 +42,11 @@ import (
 	"github.com/NolanFoster/sandbox-scheduler/internal/controller"
 	"github.com/NolanFoster/sandbox-scheduler/internal/leader"
 	_ "github.com/NolanFoster/sandbox-scheduler/pkg/adapter/agentsandbox"
+	_ "github.com/NolanFoster/sandbox-scheduler/pkg/adapter/e2b"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/binder"
 	schedmetrics "github.com/NolanFoster/sandbox-scheduler/pkg/metrics"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/provider"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/reaper"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/registry"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/scheduler"
 )
@@ -81,6 +83,10 @@ func main() {
 		maxSpill          int
 		maxJoinersPerKey  int
 		refusalTTL        time.Duration
+		reapInterval      time.Duration
+		reapMaxPerCycle   int
+		reapRate          float64
+		reapDryRun        bool
 		clusterID         string
 		releaseName       string
 	)
@@ -122,6 +128,14 @@ func main() {
 		"Maximum concurrent requests that may join an in-flight claim for the same key.")
 	flag.DurationVar(&refusalTTL, "refusal-ttl", binder.DefaultRefusalTTL,
 		"How long a provider's NoCapacity refusal for a template suppresses further claims for that template.")
+	flag.DurationVar(&reapInterval, "reap-interval", reaper.DefaultInterval,
+		"How often the leader reaps expired sandboxes on providers that implement OwnedLister without native TTL enforcement.")
+	flag.IntVar(&reapMaxPerCycle, "reap-max-per-cycle", reaper.DefaultMaxPerCycle,
+		"Maximum expired sandboxes deleted per provider in a single reap cycle (circuit breaker).")
+	flag.Float64Var(&reapRate, "reap-rate", reaper.DefaultRatePerSecond,
+		"Maximum reaper deletions per second per provider.")
+	flag.BoolVar(&reapDryRun, "reap-dry-run", false,
+		"Log and emit a Kubernetes Event for expired sandboxes without deleting them.")
 	flag.StringVar(&clusterID, "cluster-id", "",
 		"Cluster identifier used to scope sandbox owner labels; defaults to the kube-system Namespace UID when unset.")
 	flag.StringVar(&releaseName, "release-name", envOr("RELEASE_NAME", "sandbox-scheduler"),
@@ -159,6 +173,7 @@ func main() {
 
 	var (
 		claimBinder *binder.Binder
+		claimReaper *reaper.Reaper
 		electOnce   sync.Once
 	)
 	recordElected := func() {
@@ -187,6 +202,14 @@ func main() {
 		ColdStartWindow:  coldStartWindow,
 	})
 
+	providerReconciler := &controller.SandboxProviderReconciler{
+		Client:          mgr.GetClient(),
+		Registry:        reg,
+		SecretNamespace: secretNamespace,
+		EventInstance:   envOr("POD_NAME", releaseName),
+		WriteStatus:     elected,
+	}
+
 	if enableClaims {
 		resolvedClusterID, err := resolveClusterID(mgr.GetAPIReader(), clusterID)
 		if err != nil {
@@ -205,6 +228,18 @@ func main() {
 			GlobalMaxInFlight: claimMaxInFlight,
 			MaxJoinersPerKey:  maxJoinersPerKey,
 		})
+		claimReaper = reaper.New(reaper.Options{
+			Owner:         ownerID,
+			Interval:      reapInterval,
+			MaxPerCycle:   reapMaxPerCycle,
+			RatePerSecond: reapRate,
+			DryRun:        reapDryRun,
+			Log:           ctrl.Log.WithName("reaper"),
+			OnReleased:    claimBinder.EvictHandle,
+			OnDryRun:      providerReconciler.RecordReapDryRunEvent,
+		})
+		providerReconciler.Binder = claimBinder
+		providerReconciler.Reaper = claimReaper
 	}
 
 	// Provider gauges are collected at scrape time, so they always reflect what
@@ -214,13 +249,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.SandboxProviderReconciler{
-		Client:          mgr.GetClient(),
-		Registry:        reg,
-		Binder:          claimBinder,
-		SecretNamespace: secretNamespace,
-		WriteStatus:     elected,
-	}).SetupWithManager(mgr); err != nil {
+	if err := providerReconciler.SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to create controller", "controller", "SandboxProvider")
 		os.Exit(1)
 	}
@@ -239,6 +268,18 @@ func main() {
 	})}); err != nil {
 		log.Error(err, "unable to add the capacity refresher")
 		os.Exit(1)
+	}
+
+	// Reaper runs only on the leader replica (default NeedLeaderElection=true
+	// for manager.RunnableFunc).
+	if claimReaper != nil {
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			claimReaper.Run(ctx)
+			return nil
+		})); err != nil {
+			log.Error(err, "unable to add the sandbox reaper")
+			os.Exit(1)
+		}
 	}
 
 	// Tokens come from the environment rather than flags: a flag lands in the
