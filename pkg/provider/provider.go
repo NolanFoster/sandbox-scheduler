@@ -112,10 +112,13 @@ type Binder interface {
 	Claim(ctx context.Context, req ClaimRequest) (Handle, error)
 
 	// Lookup returns the sandbox previously claimed with req.Key, applying the
-	// same replay rules as Claim: a different req.SpecHash is KindKeyConflict,
-	// a sandbox still being deleted is KindKeyBusy, and one not yet bound is
-	// waited for within ctx. ErrNotFound (matched with errors.Is) means the
-	// provider definitively has none; anything else means it cannot tell.
+	// same replay rules as Claim: a different non-empty req.SpecHash is
+	// KindKeyConflict, a sandbox still being deleted is KindKeyBusy, and one
+	// not yet bound is waited for within ctx. When req.SpecHash is empty,
+	// Lookup skips the SpecHash equality check so a caller can locate a claim
+	// by (Owner, Key) alone (for example during key-based release). ErrNotFound
+	// (matched with errors.Is) means the provider definitively has none;
+	// anything else means it cannot tell.
 	//
 	// Lookup must be a consistent read: a stale "not found" could cause the
 	// binder to create a second sandbox under the same key elsewhere.

@@ -1978,6 +1978,10 @@ func (b *Binder) Release(ctx context.Context, providerID, sandboxID string) *Err
 		b.evictCompletedFlight(providerID, sandboxID)
 		return nil
 	}
+	return b.classifyReleaseError(providerID, err)
+}
+
+func (b *Binder) classifyReleaseError(providerID string, err error) *Error {
 	switch provider.KindOf(err) {
 	case provider.KindBusy, provider.KindKeyBusy:
 		return &Error{
@@ -1987,7 +1991,7 @@ func (b *Binder) Release(ctx context.Context, providerID, sandboxID string) *Err
 			Providers:  []string{providerID},
 			RetryAfter: b.jitterDelay(provider.RetryAfterOf(err)),
 		}
-	case provider.KindRejected:
+	case provider.KindRejected, provider.KindKeyConflict:
 		return &Error{
 			Status:    422,
 			Reason:    ReasonRejected,
@@ -2015,6 +2019,107 @@ func (b *Binder) evictCompletedFlight(providerID, sandboxID string) {
 			delete(b.flights, k)
 		}
 	}
+}
+
+// ReleaseByKey deletes a sandbox identified by its idempotency key across
+// registered providers and evicts any cached flight entry. Returns nil when the
+// sandbox is already gone.
+func (b *Binder) ReleaseByKey(ctx context.Context, key string) *Error {
+	if rem := b.holdOffRemaining(b.now()); rem > 0 {
+		return &Error{
+			Status:     503,
+			Reason:     ReasonHoldOff,
+			Message:    "newly elected leader is holding off requests while pre-failover attempts settle",
+			Providers:  []string{},
+			RetryAfter: rem + time.Duration(b.randFloat()*float64(3*time.Second)),
+		}
+	}
+
+	vReq := provider.ClaimRequest{Key: key, Owner: b.owner, TTL: time.Second}
+	if err := vReq.ValidateWithDomain(b.maxTTL, b.allowedLabelDomain); err != nil {
+		return &Error{
+			Status:    400,
+			Reason:    ReasonInvalidRequest,
+			Message:   err.Error(),
+			Providers: []string{},
+		}
+	}
+
+	b.flightsMu.Lock()
+	var waitCh chan struct{}
+	if fl, ok := b.flights[key]; ok && !fl.completed {
+		waitCh = fl.done
+	}
+	b.flightsMu.Unlock()
+
+	if waitCh != nil {
+		select {
+		case <-waitCh:
+		case <-ctx.Done():
+			return &Error{
+				Status:    504,
+				Reason:    ReasonUnknownOutcome,
+				Message:   ctx.Err().Error(),
+				Providers: []string{},
+			}
+		}
+	}
+
+	b.flightsMu.Lock()
+	var cachedProvider, cachedID string
+	if fl, ok := b.flights[key]; ok && fl.completed && fl.res != nil {
+		cachedProvider = fl.res.Handle.Provider
+		cachedID = fl.res.Handle.ID
+	}
+	b.flightsMu.Unlock()
+
+	if cachedProvider != "" && cachedID != "" {
+		if berr := b.Release(ctx, cachedProvider, cachedID); berr != nil {
+			return berr
+		}
+		b.flightsMu.Lock()
+		delete(b.flights, key)
+		b.flightsMu.Unlock()
+		return nil
+	}
+
+	targets := *b.targets.Load()
+	for providerID, t := range targets {
+		if !t.cfg.Enabled || t.prov.Binder == nil {
+			continue
+		}
+		if !b.startAttempt() {
+			return &Error{
+				Status:    503,
+				Reason:    ReasonUnavailable,
+				Message:   "scheduler is shutting down",
+				Providers: []string{providerID},
+			}
+		}
+		rCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), t.cfg.Timeout)
+		h, err := t.prov.Binder.Lookup(rCtx, provider.ClaimRequest{Owner: b.owner, Key: key})
+		if err != nil && !errors.Is(err, provider.ErrNotFound) {
+			cancel()
+			b.finishAttempt()
+			return b.classifyReleaseError(providerID, err)
+		}
+		if err == nil && h.ID != "" {
+			relErr := t.prov.Binder.Release(rCtx, provider.Handle{Provider: providerID, ID: h.ID, Version: h.Version})
+			if relErr != nil && !errors.Is(relErr, provider.ErrNotFound) {
+				cancel()
+				b.finishAttempt()
+				return b.classifyReleaseError(providerID, relErr)
+			}
+			b.evictCompletedFlight(providerID, h.ID)
+		}
+		cancel()
+		b.finishAttempt()
+	}
+
+	b.flightsMu.Lock()
+	delete(b.flights, key)
+	b.flightsMu.Unlock()
+	return nil
 }
 
 func probeTemplateForTarget(reqTemplate string, templates map[string]string) string {
