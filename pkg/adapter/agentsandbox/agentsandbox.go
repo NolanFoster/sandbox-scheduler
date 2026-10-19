@@ -206,39 +206,12 @@ type gatewayClaimObject struct {
 	RetryAfterMs int64  `json:"retryAfterMs"`
 }
 
-// SandboxName returns the deterministic DNS-1035 SandboxClaim name for req.
-// When req.Key is already a valid DNS-1035 label (starts with [a-z], ends with
-// [a-z0-9], contains only [a-z0-9-], and is at most 63 chars), it is preserved
-// directly so gateway callers see their requested name; otherwise it hashes
-// (owner, key) to "sc-" + 20 hex chars.
+// SandboxName returns the deterministic DNS-1035 SandboxClaim name for (owner, key).
+// Always includes owner in the digest so two scheduler installations sharing a
+// gateway never collide on the same key.
 func SandboxName(owner, key string) string {
-	if isDNS1035Label(key) {
-		return key
-	}
 	sum := sha256.Sum256([]byte(owner + "/" + key))
 	return "sc-" + hex.EncodeToString(sum[:10])
-}
-
-func isDNS1035Label(s string) bool {
-	if len(s) == 0 || len(s) > 63 {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		isLower := c >= 'a' && c <= 'z'
-		isDigit := c >= '0' && c <= '9'
-		isHyphen := c == '-'
-		if i == 0 && !isLower {
-			return false
-		}
-		if i == len(s)-1 && !(isLower || isDigit) {
-			return false
-		}
-		if !(isLower || isDigit || isHyphen) {
-			return false
-		}
-	}
-	return true
 }
 
 func (b *Binder) resolveTemplate(logical string) string {
@@ -422,6 +395,10 @@ func (b *Binder) inspectClaimObject(obj gatewayClaimObject, fallbackName string,
 	var expiresAt time.Time
 	if rawExp := obj.Metadata.Annotations[AnnotationExpiresAt]; rawExp != "" {
 		if t, err := time.Parse(time.RFC3339, rawExp); err == nil {
+			if !t.After(time.Now()) {
+				return provider.Handle{}, provider.KeyBusy(500*time.Millisecond,
+					fmt.Errorf("%s: sandbox claim %q for key %q expired at %s", b.id, fallbackName, req.Key, rawExp))
+			}
 			expiresAt = t
 		}
 	}
@@ -465,7 +442,10 @@ func (b *Binder) classifyHTTPError(resp *http.Response, body []byte) error {
 		}
 		return provider.Busy(retryAfter, fmt.Errorf("%s: %s", b.id, msg))
 	case http.StatusBadGateway, http.StatusServiceUnavailable:
-		return provider.Unavailable(fmt.Errorf("%s: gateway unavailable (HTTP %d): %s", b.id, resp.StatusCode, msg))
+		if parsed.Reason == "Unavailable" {
+			return provider.Unavailable(fmt.Errorf("%s: gateway unavailable (HTTP %d): %s", b.id, resp.StatusCode, msg))
+		}
+		return fmt.Errorf("%s: ambiguous gateway HTTP %d: %s", b.id, resp.StatusCode, msg)
 	default:
 		return fmt.Errorf("%s: gateway returned HTTP %d: %s", b.id, resp.StatusCode, msg)
 	}

@@ -286,7 +286,7 @@ func TestBinderConformance(t *testing.T) {
 					return
 				case adaptertest.FaultUnavailable:
 					w.WriteHeader(http.StatusServiceUnavailable)
-					_ = json.NewEncoder(w).Encode(map[string]any{"error": "apiserver down"})
+					_ = json.NewEncoder(w).Encode(map[string]any{"error": "apiserver down", "reason": "Unavailable"})
 					return
 				case adaptertest.FaultRejected:
 					w.WriteHeader(http.StatusUnprocessableEntity)
