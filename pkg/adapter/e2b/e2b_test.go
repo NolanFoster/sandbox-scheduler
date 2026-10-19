@@ -44,9 +44,19 @@ func (f *fakeE2BServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	f.calls.Add(1)
 
 	switch {
-	case r.Method == http.MethodGet && r.URL.Path == "/sandboxes":
+	case r.Method == http.MethodGet && (r.URL.Path == "/v2/sandboxes" || r.URL.Path == "/sandboxes"):
 		f.mu.Lock()
 		defer f.mu.Unlock()
+
+		limit := 0
+		if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+			limit, _ = strconv.Atoi(rawLimit)
+			if limit > e2b.MaxPageSize {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "limit exceeds maximum of 100"})
+				return
+			}
+		}
 
 		var filterMeta url.Values
 		if rawMeta := r.URL.Query().Get("metadata"); rawMeta != "" {
@@ -99,12 +109,8 @@ func (f *fakeE2BServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			matched = append(matched, sb)
 		}
 
-		limit := 0
-		if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
-			limit, _ = strconv.Atoi(rawLimit)
-		}
 		offset := 0
-		if rawToken := r.URL.Query().Get("pageToken"); rawToken != "" {
+		if rawToken := r.URL.Query().Get("nextToken"); rawToken != "" {
 			offset, _ = strconv.Atoi(rawToken)
 		}
 		if offset > len(matched) {
@@ -117,7 +123,7 @@ func (f *fakeE2BServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			nextToken = strconv.Itoa(offset + limit)
 		}
 		if nextToken != "" {
-			w.Header().Set("X-Next-Page-Token", nextToken)
+			w.Header().Set("X-Next-Token", nextToken)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(page)
@@ -329,6 +335,16 @@ func TestE2BFetchAndListOwnedPagination(t *testing.T) {
 		if h.ID == "" || h.Version == "" || h.ExpiresAt.IsZero() {
 			t.Fatalf("incomplete handle from ListOwned: %+v", h)
 		}
+	}
+
+	// Verify reaper's default limit=500 is clamped to MaxPageSize (100) so E2B
+	// /v2/sandboxes does not reject the request.
+	clamped, next, err := prov.Lister.ListOwned(ctx, "ss-owner-1", "", 500)
+	if err != nil {
+		t.Fatalf("ListOwned(limit=500): %v", err)
+	}
+	if len(clamped) != 5 || next != "" {
+		t.Fatalf("ListOwned(limit=500) returned len=%d next=%q, want 5/empty", len(clamped), next)
 	}
 }
 

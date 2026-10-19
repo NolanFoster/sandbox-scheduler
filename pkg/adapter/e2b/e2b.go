@@ -137,7 +137,7 @@ func (c *Client) ProviderID() string { return c.id }
 // verify reachability and API key validity, reporting Elastic: true so the
 // scheduler scores this provider using ElasticWarmScore.
 func (c *Client) Fetch(ctx context.Context) (provider.Report, error) {
-	req, err := c.newRequest(ctx, http.MethodGet, c.endpoint+"/sandboxes?state=running&limit=1", nil)
+	req, err := c.newRequest(ctx, http.MethodGet, c.endpoint+"/v2/sandboxes?state=running&limit=1", nil)
 	if err != nil {
 		return provider.Report{}, err
 	}
@@ -296,8 +296,9 @@ func (c *Client) Lookup(ctx context.Context, req provider.ClaimRequest) (provide
 	}
 	metaQuery.Set(MetaKey, req.Key)
 	q.Set("metadata", metaQuery.Encode())
+	q.Set("limit", "1")
 
-	u := c.endpoint + "/sandboxes?" + q.Encode()
+	u := c.endpoint + "/v2/sandboxes?" + q.Encode()
 	httpReq, err := c.newRequest(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return provider.Handle{}, provider.Rejected(err)
@@ -338,7 +339,9 @@ func (c *Client) Lookup(ctx context.Context, req provider.ClaimRequest) (provide
 }
 
 // LookupMany implements provider.BatchLookuper. It resolves a batch of keys for
-// the same owner in a single `GET /sandboxes` call.
+// the same owner via `GET /v2/sandboxes`, following `X-Next-Token` pagination
+// if the owner has more than MaxPageSize sandboxes and some requested keys have
+// not yet been seen.
 func (c *Client) LookupMany(ctx context.Context, reqs []provider.ClaimRequest) []provider.LookupResult {
 	out := make([]provider.LookupResult, len(reqs))
 	if len(reqs) == 0 {
@@ -347,70 +350,60 @@ func (c *Client) LookupMany(ctx context.Context, reqs []provider.ClaimRequest) [
 
 	owner := reqs[0].Owner
 	keys := make([]string, 0, len(reqs))
+	wanted := make(map[string]struct{}, len(reqs))
 	for _, r := range reqs {
 		keys = append(keys, r.Key)
+		wanted[r.Key] = struct{}{}
 	}
 
-	q := url.Values{}
-	if owner != "" {
-		metaQuery := url.Values{}
-		metaQuery.Set(MetaOwner, owner)
-		q.Set("metadata", metaQuery.Encode())
-	}
-	q.Set("keys", strings.Join(keys, ","))
+	byKey := make(map[string]sandboxObject, len(reqs))
+	var nextToken string
+	for page := 0; page < 100; page++ {
+		q := url.Values{}
+		if owner != "" {
+			metaQuery := url.Values{}
+			metaQuery.Set(MetaOwner, owner)
+			q.Set("metadata", metaQuery.Encode())
+		}
+		q.Set("keys", strings.Join(keys, ","))
+		q.Set("limit", strconv.Itoa(MaxPageSize))
+		if nextToken != "" {
+			q.Set("nextToken", nextToken)
+		}
 
-	u := c.endpoint + "/sandboxes?" + q.Encode()
-	httpReq, err := c.newRequest(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		for i := range out {
-			out[i] = provider.LookupResult{Err: provider.Rejected(err)}
+		body, headerNext, err := c.doListOwned(ctx, "/v2/sandboxes?"+q.Encode())
+		if err != nil {
+			for i := range out {
+				out[i] = provider.LookupResult{Err: err}
+			}
+			return out
 		}
-		return out
-	}
 
-	resp, err := c.client.Do(httpReq)
-	if err != nil {
-		for i := range out {
-			out[i] = provider.LookupResult{Err: fmt.Errorf("%s: e2b batch lookup failed: %w", c.id, err)}
+		list, tok, err := decodePagedSandboxList(body, headerNext)
+		if err != nil {
+			for i := range out {
+				out[i] = provider.LookupResult{Err: fmt.Errorf("%s: unparseable e2b batch lookup: %w", c.id, err)}
+			}
+			return out
 		}
-		return out
-	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		for i := range out {
-			out[i] = provider.LookupResult{Err: fmt.Errorf("%s: reading e2b batch lookup: %w", c.id, err)}
+		for _, sb := range list {
+			k := sb.Metadata[MetaKey]
+			if k == "" {
+				continue
+			}
+			if owner != "" && sb.Metadata[MetaOwner] != "" && sb.Metadata[MetaOwner] != owner {
+				continue
+			}
+			if _, ok := wanted[k]; ok {
+				byKey[k] = sb
+			}
 		}
-		return out
-	}
 
-	if resp.StatusCode != http.StatusOK {
-		classified := c.classifyHTTPError(resp, body)
-		for i := range out {
-			out[i] = provider.LookupResult{Err: classified}
+		if len(byKey) >= len(wanted) || tok == "" || tok == nextToken {
+			break
 		}
-		return out
-	}
-
-	list, err := decodeSandboxList(body)
-	if err != nil {
-		for i := range out {
-			out[i] = provider.LookupResult{Err: fmt.Errorf("%s: unparseable e2b batch lookup: %w", c.id, err)}
-		}
-		return out
-	}
-
-	byKey := make(map[string]sandboxObject, len(list))
-	for _, sb := range list {
-		k := sb.Metadata[MetaKey]
-		if k == "" {
-			continue
-		}
-		if owner != "" && sb.Metadata[MetaOwner] != "" && sb.Metadata[MetaOwner] != owner {
-			continue
-		}
-		byKey[k] = sb
+		nextToken = tok
 	}
 
 	for i, req := range reqs {
@@ -425,6 +418,12 @@ func (c *Client) LookupMany(ctx context.Context, reqs []provider.ClaimRequest) [
 	return out
 }
 
+// MaxPageSize is the maximum page size accepted by E2B's GET /v2/sandboxes
+// endpoint. Larger limits requested by callers (such as the reaper's 500-item
+// default) are clamped to MaxPageSize so the upstream API does not reject the
+// query.
+const MaxPageSize = 100
+
 // ListOwned implements provider.OwnedLister for background reaping.
 func (c *Client) ListOwned(ctx context.Context, owner, pageToken string, limit int) ([]provider.Handle, string, error) {
 	q := url.Values{}
@@ -434,33 +433,19 @@ func (c *Client) ListOwned(ctx context.Context, owner, pageToken string, limit i
 		q.Set("metadata", metaQuery.Encode())
 	}
 	if pageToken != "" {
-		q.Set("pageToken", pageToken)
+		q.Set("nextToken", pageToken)
 	}
-	if limit > 0 {
-		q.Set("limit", strconv.Itoa(limit))
+	if limit <= 0 || limit > MaxPageSize {
+		limit = MaxPageSize
 	}
+	q.Set("limit", strconv.Itoa(limit))
 
-	u := c.endpoint + "/sandboxes?" + q.Encode()
-	httpReq, err := c.newRequest(ctx, http.MethodGet, u, nil)
+	body, headerNext, err := c.doListOwned(ctx, "/v2/sandboxes?"+q.Encode())
 	if err != nil {
-		return nil, "", provider.Rejected(err)
+		return nil, "", err
 	}
 
-	resp, err := c.client.Do(httpReq)
-	if err != nil {
-		return nil, "", fmt.Errorf("%s: e2b list owned failed: %w", c.id, err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, "", fmt.Errorf("%s: reading e2b list owned response: %w", c.id, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", c.classifyHTTPError(resp, body)
-	}
-
-	list, nextToken, err := decodePagedSandboxList(body, resp.Header.Get("X-Next-Page-Token"))
+	list, nextToken, err := decodePagedSandboxList(body, headerNext)
 	if err != nil {
 		return nil, "", fmt.Errorf("%s: unparseable e2b list owned response: %w", c.id, err)
 	}
@@ -479,6 +464,30 @@ func (c *Client) ListOwned(ctx context.Context, owner, pageToken string, limit i
 		handles = append(handles, c.toHandle(sb))
 	}
 	return handles, nextToken, nil
+}
+
+func (c *Client) doListOwned(ctx context.Context, pathAndQuery string) ([]byte, string, error) {
+	httpReq, err := c.newRequest(ctx, http.MethodGet, c.endpoint+pathAndQuery, nil)
+	if err != nil {
+		return nil, "", provider.Rejected(err)
+	}
+
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		return nil, "", fmt.Errorf("%s: e2b list owned failed: %w", c.id, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, "", fmt.Errorf("%s: reading e2b list owned response: %w", c.id, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", c.classifyHTTPError(resp, body)
+	}
+
+	headerNext := nonEmpty(resp.Header.Get("X-Next-Token"), resp.Header.Get("X-Next-Page-Token"))
+	return body, headerNext, nil
 }
 
 // Release implements provider.Binder.
@@ -690,15 +699,13 @@ func decodePagedSandboxList(body []byte, headerNext string) ([]sandboxObject, st
 	var wrapper struct {
 		Sandboxes     []sandboxObject `json:"sandboxes"`
 		Items         []sandboxObject `json:"items"`
+		NextToken     string          `json:"nextToken"`
 		NextPageToken string          `json:"nextPageToken"`
 	}
 	if err := json.Unmarshal(trimmed, &wrapper); err != nil {
 		return nil, "", err
 	}
-	next := wrapper.NextPageToken
-	if next == "" {
-		next = headerNext
-	}
+	next := nonEmpty(wrapper.NextToken, wrapper.NextPageToken, headerNext)
 	if len(wrapper.Sandboxes) > 0 {
 		return wrapper.Sandboxes, next, nil
 	}
