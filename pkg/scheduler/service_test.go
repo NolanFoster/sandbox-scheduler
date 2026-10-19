@@ -759,3 +759,48 @@ func TestProvidersIncludesTemplates(t *testing.T) {
 		t.Fatalf("expected templates[python]=py-pool in /providers, got %+v", got.Templates)
 	}
 }
+
+func TestReleaseByKeyEvictsFlightAndDeletes(t *testing.T) {
+	reg := registry.New(registry.Options{})
+	reg.Report("civo", registry.Report{WarmCapacity: 2})
+	b := binder.New(binder.Options{Registry: reg})
+	fake := adaptertest.NewFake("civo", 2, false)
+	b.SetTarget("civo", fake.Provider(false), binder.TargetConfig{Enabled: true})
+
+	svc := &scheduler.Service{
+		Registry:      reg,
+		Policies:      &scheduler.PolicyList{},
+		Binder:        b,
+		ClaimsEnabled: true,
+	}
+	h := svc.Handler()
+
+	r1 := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/sandboxes", strings.NewReader(`{"key":"rel-key-1"}`))
+	w1 := httptest.NewRecorder()
+	h.ServeHTTP(w1, r1)
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("claim status = %d, want 201: %s", w1.Code, w1.Body.String())
+	}
+	var c1 scheduler.ClaimResponse
+	if err := json.Unmarshal(w1.Body.Bytes(), &c1); err != nil {
+		t.Fatalf("unmarshal claim: %v", err)
+	}
+	if c1.SandboxName != c1.ID || c1.Key != "rel-key-1" {
+		t.Fatalf("expected sandboxName=%q and key=rel-key-1, got %+v", c1.ID, c1)
+	}
+
+	rDel := httptest.NewRequest(http.MethodDelete, "/api/v1alpha1/sandboxes/rel-key-1", nil)
+	wDel := httptest.NewRecorder()
+	h.ServeHTTP(wDel, rDel)
+	if wDel.Code != http.StatusNoContent {
+		t.Fatalf("DELETE by key status = %d, want 204: %s", wDel.Code, wDel.Body.String())
+	}
+
+	// Subsequent claim for rel-key-1 must create a fresh binding (201, replay=false).
+	r2 := httptest.NewRequest(http.MethodPost, "/api/v1alpha1/sandboxes", strings.NewReader(`{"key":"rel-key-1"}`))
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, r2)
+	if w2.Code != http.StatusCreated {
+		t.Fatalf("re-claim after DELETE by key status = %d, want 201: %s", w2.Code, w2.Body.String())
+	}
+}

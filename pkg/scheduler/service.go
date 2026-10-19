@@ -110,6 +110,8 @@ type ClaimRequest struct {
 // ClaimResponse is the JSON body of a successful POST /api/v1alpha1/sandboxes.
 type ClaimResponse struct {
 	ID          string            `json:"id"`
+	SandboxName string            `json:"sandboxName,omitempty"`
+	Key         string            `json:"key,omitempty"`
 	Provider    string            `json:"provider"`
 	Endpoint    string            `json:"endpoint,omitempty"`
 	Connect     map[string]string `json:"connect,omitempty"`
@@ -185,6 +187,7 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1alpha1/providers", s.requireReadAuth(s.handleProviders))
 	mux.HandleFunc("POST /api/v1alpha1/sandboxes", s.requireClaimAuth(s.handleClaim))
 	mux.HandleFunc("DELETE /api/v1alpha1/sandboxes/{provider}/{id}", s.requireClaimAuth(s.handleRelease))
+	mux.HandleFunc("DELETE /api/v1alpha1/sandboxes/{key}", s.requireClaimAuth(s.handleReleaseByKey))
 	return s.withHealthz(mux)
 }
 
@@ -530,6 +533,8 @@ func (s *Service) handleClaim(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, status, ClaimResponse{
 		ID:          res.Handle.ID,
+		SandboxName: res.Handle.ID,
+		Key:         raw.Key,
 		Provider:    res.Handle.Provider,
 		Endpoint:    endpoint,
 		Connect:     res.Handle.Connect,
@@ -569,6 +574,38 @@ func (s *Service) handleRelease(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if berr := s.Binder.Release(r.Context(), providerID, sandboxID); berr != nil {
+		writeBinderError(w, berr)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Service) handleReleaseByKey(w http.ResponseWriter, r *http.Request) {
+	if !s.ClaimsEnabled || s.Binder == nil {
+		writeClaimError(w, http.StatusNotImplemented, ErrorResponse{
+			Error:     "sandbox claims are disabled; start the scheduler with --enable-claims",
+			Reason:    binder.ReasonClaimsDisabled,
+			Providers: []string{},
+		})
+		return
+	}
+
+	if s.Active != nil && !s.Active() {
+		writeStandby(w)
+		return
+	}
+
+	key := r.PathValue("key")
+	if key == "" {
+		writeClaimError(w, http.StatusBadRequest, ErrorResponse{
+			Error:     "sandbox key is required",
+			Reason:    binder.ReasonInvalidRequest,
+			Providers: []string{},
+		})
+		return
+	}
+
+	if berr := s.Binder.ReleaseByKey(r.Context(), key); berr != nil {
 		writeBinderError(w, berr)
 		return
 	}
