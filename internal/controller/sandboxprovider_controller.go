@@ -12,6 +12,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,6 +30,7 @@ import (
 	"github.com/NolanFoster/sandbox-scheduler/pkg/adapter"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/binder"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/provider"
+	"github.com/NolanFoster/sandbox-scheduler/pkg/reaper"
 	"github.com/NolanFoster/sandbox-scheduler/pkg/registry"
 )
 
@@ -51,6 +53,10 @@ const (
 	ReasonNotClaimCapable  = "AdapterPollOnly"
 	ReasonClaimCircuitOpen = "CircuitOpen"
 	ReasonClaimRejected    = "ClaimRejected"
+	ReasonReapDryRun       = "ReapDryRun"
+
+	reportingController = "sandbox-scheduler.placement.agents.x-k8s.io"
+	defaultEventNS      = "default"
 )
 
 // defaultStatusInterval is how often a healthy provider is re-reconciled to
@@ -69,12 +75,17 @@ type SandboxProviderReconciler struct {
 	client.Client
 	Registry *registry.Registry
 	Binder   *binder.Binder
+	Reaper   *reaper.Reaper
 
 	// SecretNamespace is where credentialsRef Secrets are read from.
 	// Providers are cluster-scoped, so the reference has no namespace of its
 	// own; confining it to the scheduler's own namespace means a provider
 	// cannot be pointed at an arbitrary Secret elsewhere in the cluster.
 	SecretNamespace string
+
+	// EventInstance identifies the reporting pod/replica on emitted
+	// events.k8s.io/v1 Events. Defaults to "sandbox-scheduler" when empty.
+	EventInstance string
 
 	// StatusInterval overrides defaultStatusInterval in tests.
 	StatusInterval time.Duration
@@ -136,15 +147,6 @@ func (r *SandboxProviderReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 // sync registers the provider as its spec says and returns its Ready and
 // Claiming conditions, filling in the rest of its status along the way.
 func (r *SandboxProviderReconciler) sync(ctx context.Context, p *v1alpha1.SandboxProvider) (readiness, *readiness) {
-	if p.Spec.Disabled {
-		// Drained, not deleted. Configuration is preserved and one field flip
-		// brings it back.
-		r.deregister(p.Name)
-		return readiness{metav1.ConditionFalse, ReasonDisabled,
-				"provider is disabled and will not be considered for placement"},
-			&readiness{metav1.ConditionFalse, ReasonDisabled, "provider is disabled"}
-	}
-
 	if !adapter.Has(p.Spec.Adapter) {
 		// Fail visibly rather than never polling it. An unknown adapter usually
 		// means a typo or a scheduler older than the config.
@@ -154,9 +156,24 @@ func (r *SandboxProviderReconciler) sync(ctx context.Context, p *v1alpha1.Sandbo
 			&readiness{metav1.ConditionFalse, ReasonUnknownAdapter, msg}
 	}
 
+	if p.Spec.Disabled {
+		// Drained, not deleted. Remove from placement registry and claim binder
+		// while keeping lifecycle reaping active for any existing owned sandboxes.
+		r.Registry.RemoveSource(p.Name)
+		if r.Binder != nil {
+			r.Binder.RemoveTarget(p.Name)
+		}
+		r.syncReaperWhenDisabled(ctx, p)
+		return readiness{metav1.ConditionFalse, ReasonDisabled,
+				"provider is disabled and will not be considered for placement"},
+			&readiness{metav1.ConditionFalse, ReasonDisabled, "provider is disabled"}
+	}
+
 	claimsEnabled := p.Spec.Claims != nil && p.Spec.Claims.Enabled
-	if !claimsEnabled && r.Binder != nil {
-		r.Binder.RemoveTarget(p.Name)
+	if !claimsEnabled {
+		if r.Binder != nil {
+			r.Binder.RemoveTarget(p.Name)
+		}
 	}
 
 	creds, err := r.resolveCredentials(ctx, p)
@@ -166,6 +183,9 @@ func (r *SandboxProviderReconciler) sync(ctx context.Context, p *v1alpha1.Sandbo
 		// billable claims must stop immediately when credentials are missing.
 		if r.Binder != nil {
 			r.Binder.RemoveTarget(p.Name)
+		}
+		if r.Reaper != nil {
+			r.Reaper.RemoveTarget(p.Name)
 		}
 		claiming := &readiness{
 			status:  metav1.ConditionFalse,
@@ -282,6 +302,12 @@ func (r *SandboxProviderReconciler) syncClaims(
 	if r.Binder != nil {
 		r.Binder.SetTarget(p.Name, prov, tcfg)
 	}
+	if r.Reaper != nil {
+		r.Reaper.SetTarget(p.Name, prov, reaper.TargetConfig{
+			Enabled: prov.Binder != nil && prov.Lister != nil,
+			Timeout: tcfg.Timeout,
+		})
+	}
 
 	if !claimsEnabled {
 		return &readiness{
@@ -341,11 +367,61 @@ func (r *SandboxProviderReconciler) syncClaims(
 	}
 }
 
+func (r *SandboxProviderReconciler) syncReaperWhenDisabled(ctx context.Context, p *v1alpha1.SandboxProvider) {
+	if r.Reaper == nil {
+		return
+	}
+	creds, err := r.resolveCredentials(ctx, p)
+	if err != nil {
+		r.Reaper.RemoveTarget(p.Name)
+		return
+	}
+	templates := templateMap(p.Spec.Templates)
+	opts := providerOptions(p)
+	if p.Spec.KubeAPI != nil && p.Spec.KubeAPI.Namespace != "" {
+		if _, exists := opts["namespace"]; !exists {
+			opts["namespace"] = p.Spec.KubeAPI.Namespace
+		}
+	}
+	cfg := adapter.Config{
+		ProviderID:  p.Name,
+		Endpoint:    p.Spec.Endpoint,
+		Credentials: creds,
+		Options:     opts,
+		Templates:   templates,
+	}
+	digest := configDigest(p.Spec.Adapter, cfg)
+	r.mu.Lock()
+	d, ok := r.built[p.Name]
+	prov := r.providers[p.Name]
+	r.mu.Unlock()
+	if !ok || d != digest {
+		built, err := adapter.New(p.Spec.Adapter, cfg)
+		if err != nil {
+			r.deregister(p.Name)
+			return
+		}
+		prov = built
+		r.setBuilt(p.Name, digest, prov)
+	}
+	var timeout time.Duration
+	if p.Spec.Claims != nil && p.Spec.Claims.Timeout != nil && p.Spec.Claims.Timeout.Duration > 0 {
+		timeout = p.Spec.Claims.Timeout.Duration
+	}
+	r.Reaper.SetTarget(p.Name, prov, reaper.TargetConfig{
+		Enabled: prov.Binder != nil && prov.Lister != nil,
+		Timeout: timeout,
+	})
+}
+
 // deregister stops polling a provider and forgets the source built for it.
 func (r *SandboxProviderReconciler) deregister(name string) {
 	r.Registry.RemoveSource(name)
 	if r.Binder != nil {
 		r.Binder.RemoveTarget(name)
+	}
+	if r.Reaper != nil {
+		r.Reaper.RemoveTarget(name)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -509,6 +585,8 @@ func (r *SandboxProviderReconciler) writeStatus(ctx context.Context, p *v1alpha1
 		return ctrl.Result{RequeueAfter: r.statusInterval()}, nil
 	}
 
+	prevClaiming := findCondition(observed.Conditions, ConditionClaiming)
+
 	setCondition(&p.Status.Conditions, metav1.Condition{
 		Type:               ConditionReady,
 		Status:             ready.status,
@@ -541,7 +619,93 @@ func (r *SandboxProviderReconciler) writeStatus(ctx context.Context, p *v1alpha1
 		}
 		return ctrl.Result{}, err
 	}
+
+	if claiming != nil && claimingTransitioned(prevClaiming, *claiming, p.Spec.Claims != nil && p.Spec.Claims.Enabled) {
+		evType := corev1.EventTypeNormal
+		if claiming.status == metav1.ConditionFalse &&
+			claiming.reason != ReasonClaimsDisabled &&
+			claiming.reason != ReasonDisabled {
+			evType = corev1.EventTypeWarning
+		}
+		r.emitEvent(ctx, p, evType, "ReconcileClaiming", claiming.reason, claiming.message)
+	}
+
 	return ctrl.Result{RequeueAfter: r.statusInterval()}, nil
+}
+
+// RecordReapDryRunEvent emits a Kubernetes events.k8s.io/v1 Event on the
+// SandboxProvider summarizing expired sandboxes observed during a reaper
+// dry-run pass.
+func (r *SandboxProviderReconciler) RecordReapDryRunEvent(ctx context.Context, providerName string, handles []provider.Handle) {
+	if len(handles) == 0 || r.Client == nil {
+		return
+	}
+	if r.WriteStatus != nil && !r.WriteStatus() {
+		return
+	}
+	var sp v1alpha1.SandboxProvider
+	if err := r.Get(ctx, types.NamespacedName{Name: providerName}, &sp); err != nil {
+		return
+	}
+	msg := fmt.Sprintf("dry-run: would reap %d expired sandbox(es) (first: %s)", len(handles), handles[0].ID)
+	r.emitEvent(ctx, &sp, corev1.EventTypeNormal, "ReapDryRun", ReasonReapDryRun, msg)
+}
+
+func (r *SandboxProviderReconciler) emitEvent(
+	ctx context.Context,
+	p *v1alpha1.SandboxProvider,
+	eventType, action, reason, note string,
+) {
+	if r.Client == nil || p == nil {
+		return
+	}
+	instance := r.EventInstance
+	if instance == "" {
+		instance = "sandbox-scheduler"
+	}
+	if len(note) > 1024 {
+		note = note[:1024]
+	}
+	ev := &eventsv1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: p.Name + "-",
+			Namespace:    defaultEventNS,
+		},
+		EventTime:           metav1.NewMicroTime(time.Now()),
+		ReportingController: reportingController,
+		ReportingInstance:   instance,
+		Action:              action,
+		Reason:              reason,
+		Regarding: corev1.ObjectReference{
+			APIVersion: v1alpha1.GroupVersion.String(),
+			Kind:       "SandboxProvider",
+			Name:       p.Name,
+			UID:        p.UID,
+		},
+		Type: eventType,
+		Note: note,
+	}
+	if err := r.Create(ctx, ev); err != nil {
+		log.FromContext(ctx).V(1).Info("unable to emit event for SandboxProvider",
+			"provider", p.Name, "reason", reason, "error", err)
+	}
+}
+
+func findCondition(conditions []metav1.Condition, condType string) *metav1.Condition {
+	for i := range conditions {
+		if conditions[i].Type == condType {
+			c := conditions[i]
+			return &c
+		}
+	}
+	return nil
+}
+
+func claimingTransitioned(prev *metav1.Condition, next readiness, claimsEnabled bool) bool {
+	if prev == nil {
+		return claimsEnabled || next.status == metav1.ConditionTrue
+	}
+	return prev.Status != next.status || prev.Reason != next.reason
 }
 
 func (r *SandboxProviderReconciler) statusInterval() time.Duration {

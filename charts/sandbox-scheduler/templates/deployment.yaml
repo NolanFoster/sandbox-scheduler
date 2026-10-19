@@ -48,6 +48,10 @@ spec:
             - --max-spill={{ .Values.scheduler.maxSpill | default 3 }}
             - --max-joiners-per-key={{ .Values.scheduler.maxJoinersPerKey | default 8 }}
             - --refusal-ttl={{ .Values.scheduler.refusalTTL | default "1s" }}
+            - --reap-interval={{ .Values.scheduler.reapInterval | default "30s" }}
+            - --reap-max-per-cycle={{ .Values.scheduler.reapMaxPerCycle | default 200 }}
+            - --reap-rate={{ .Values.scheduler.reapRate | default 10 }}
+            - --reap-dry-run={{ .Values.scheduler.reapDryRun | default false }}
             - --release-name={{ include "sandbox-scheduler.fullname" . }}
             {{- if .Values.scheduler.clusterId }}
             - --cluster-id={{ .Values.scheduler.clusterId }}

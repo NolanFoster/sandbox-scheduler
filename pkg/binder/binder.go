@@ -2008,6 +2008,18 @@ func (b *Binder) classifyReleaseError(providerID string, err error) *Error {
 	}
 }
 
+// Owner returns the stable owner identifier stamped by this Binder.
+func (b *Binder) Owner() string {
+	return b.owner
+}
+
+// EvictHandle removes any completed flight cache entry for (providerID, sandboxID)
+// so a subsequent claim for the same idempotency key creates a fresh sandbox
+// instead of replaying a handle that was reaped or deleted out-of-band.
+func (b *Binder) EvictHandle(providerID, sandboxID string) {
+	b.evictCompletedFlight(providerID, sandboxID)
+}
+
 func (b *Binder) evictCompletedFlight(providerID, sandboxID string) {
 	b.flightsMu.Lock()
 	defer b.flightsMu.Unlock()

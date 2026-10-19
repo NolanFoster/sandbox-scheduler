@@ -28,6 +28,7 @@ type Fake struct {
 	records  map[string]*fakeRecord
 	byID     map[string]string
 	nextVers uint64
+	now      func() time.Time
 
 	// Hook, when set, runs at the start of Claim and Lookup so tests can
 	// inject custom delays, panics, or context-cancellation checks.
@@ -49,9 +50,21 @@ func NewFake(providerID string, warm int, elastic bool) *Fake {
 		elastic: elastic,
 		records: map[string]*fakeRecord{},
 		byID:    map[string]string{},
+		now:     time.Now,
 	}
 	f.warm.Store(int64(warm))
 	return f
+}
+
+// SetNow overrides the clock used by Fake when stamping Handle.ExpiresAt.
+func (f *Fake) SetNow(now func() time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if now == nil {
+		f.now = time.Now
+		return
+	}
+	f.now = now
 }
 
 // Provider returns the provider.Provider bundle for f.
@@ -150,7 +163,7 @@ func (f *Fake) Claim(ctx context.Context, req provider.ClaimRequest) (provider.H
 		Version:   fmt.Sprintf("v%d", f.nextVers),
 		Endpoint:  "https://" + f.id + ".example.com/sandboxes/" + id,
 		Connect:   map[string]string{"X-Sandbox-ID": id},
-		ExpiresAt: time.Now().Add(req.TTL),
+		ExpiresAt: f.now().Add(req.TTL),
 	}
 	f.records[req.Key] = &fakeRecord{
 		key:      req.Key,

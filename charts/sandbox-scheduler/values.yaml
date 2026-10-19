@@ -61,6 +61,10 @@ scheduler:
   maxSpill: 3
   maxJoinersPerKey: 8
   refusalTTL: 1s
+  reapInterval: 30s
+  reapMaxPerCycle: 200
+  reapRate: 10
+  reapDryRun: false
   clusterId: ""
   terminationGracePeriodSeconds: 30
 
