@@ -48,6 +48,16 @@ func (f *fakeE2BServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 
+		for param := range r.URL.Query() {
+			switch param {
+			case "metadata", "state", "order", "startedAfter", "template", "nextToken", "limit":
+			default:
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "unsupported query parameter: " + param})
+				return
+			}
+		}
+
 		limit := 0
 		if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
 			limit, _ = strconv.Atoi(rawLimit)
@@ -62,18 +72,9 @@ func (f *fakeE2BServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if rawMeta := r.URL.Query().Get("metadata"); rawMeta != "" {
 			filterMeta, _ = url.ParseQuery(rawMeta)
 		}
-		var filterKeys map[string]bool
-		if rawKeys := r.URL.Query().Get("keys"); rawKeys != "" {
-			filterKeys = make(map[string]bool)
-			for _, k := range strings.Split(rawKeys, ",") {
-				if k != "" {
-					filterKeys[k] = true
-				}
-			}
-		}
 
 		// When querying a single key by metadata, do a direct O(1) lookup by key.
-		if singleKey := filterMeta.Get(e2b.MetaKey); singleKey != "" && filterKeys == nil {
+		if singleKey := filterMeta.Get(e2b.MetaKey); singleKey != "" {
 			var out []map[string]any
 			if id, ok := f.byKey[singleKey]; ok {
 				if sb, exists := f.sandboxes[id]; exists {
@@ -97,12 +98,6 @@ func (f *fakeE2BServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			if wantOwner != "" {
 				gotOwner, _ := meta[e2b.MetaOwner].(string)
 				if gotOwner != wantOwner {
-					continue
-				}
-			}
-			if filterKeys != nil {
-				gotKey, _ := meta[e2b.MetaKey].(string)
-				if !filterKeys[gotKey] {
 					continue
 				}
 			}
@@ -208,12 +203,12 @@ func (f *fakeE2BServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(sb)
 
-	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/sandboxes/"):
-		id := strings.TrimPrefix(r.URL.Path, "/sandboxes/")
-		wantVersion := r.URL.Query().Get("version")
-		if wantVersion == "" {
-			wantVersion = r.Header.Get("If-Match")
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/sandboxes/") && strings.HasSuffix(r.URL.Path, "/timeout"):
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/sandboxes/"), "/timeout")
+		var body struct {
+			Timeout int64 `json:"timeout"`
 		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.mu.Lock()
 		sb, ok := f.sandboxes[id]
 		if !ok {
@@ -221,10 +216,17 @@ func (f *fakeE2BServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		if wantVersion != "" && sb["version"] != wantVersion {
+		sb["endAt"] = time.Now().UTC().Add(time.Duration(body.Timeout) * time.Second).Format(time.RFC3339)
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/sandboxes/"):
+		id := strings.TrimPrefix(r.URL.Path, "/sandboxes/")
+		f.mu.Lock()
+		sb, ok := f.sandboxes[id]
+		if !ok {
 			f.mu.Unlock()
-			w.WriteHeader(http.StatusPreconditionFailed)
-			_ = json.NewEncoder(w).Encode(map[string]any{"error": "version precondition failed"})
+			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		if meta, ok := sb["metadata"].(map[string]any); ok {
@@ -282,7 +284,11 @@ func TestE2BBinderConformance(t *testing.T) {
 	})
 }
 
-func TestE2BFetchBatchPaginationAndErrorCodeClassification(t *testing.T) {
+func TestE2BServerSideCreateTimeoutAndErrorCodeClassification(t *testing.T) {
+	if e2b.DefaultEndpoint != "https://api.e2b.app" {
+		t.Fatalf("DefaultEndpoint = %q, want https://api.e2b.app", e2b.DefaultEndpoint)
+	}
+
 	f, srv := newFakeE2BServer(t)
 	prov, err := adapter.New(e2b.AdapterName, adapter.Config{
 		ProviderID:  "e2b",
@@ -295,6 +301,9 @@ func TestE2BFetchBatchPaginationAndErrorCodeClassification(t *testing.T) {
 	if prov.Lister != nil {
 		t.Fatalf("expected Provider.Lister == nil because E2B enforces TTL natively via timeout/endAt")
 	}
+	if prov.BatchLookup != nil {
+		t.Fatalf("expected Provider.BatchLookup == nil because E2B /v2/sandboxes does not support multi-key IN queries")
+	}
 
 	ctx := context.Background()
 	rep, err := prov.Source.Fetch(ctx)
@@ -305,50 +314,63 @@ func TestE2BFetchBatchPaginationAndErrorCodeClassification(t *testing.T) {
 		t.Fatalf("expected Elastic=true on E2B report, got %+v", rep)
 	}
 
-	// Seed 105 sandboxes so LookupMany exercises multi-page X-Next-Token pagination (> MaxPageSize=100).
-	f.mu.Lock()
-	for i := 0; i < 105; i++ {
-		id := fmt.Sprintf("e2b-seeded-%d", i)
-		key := fmt.Sprintf("batch-key-%d", i)
-		sb := map[string]any{
-			"sandboxID":  id,
-			"templateID": "base",
-			"startedAt":  time.Now().UTC().Format(time.RFC3339),
-			"endAt":      time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339),
-			"state":      "running",
-			"metadata": map[string]any{
-				e2b.MetaOwner:    "ss-owner-1",
-				e2b.MetaKey:      key,
-				e2b.MetaSpecHash: "h1",
-			},
-		}
-		f.sandboxes[id] = sb
-		f.byKey[key] = id
+	// Claim with a 3s context deadline and 10m TTL: initial create uses a 3s
+	// server-side timeout, then extends to 10m via POST /sandboxes/{id}/timeout.
+	claimCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	h, err := prov.Binder.Claim(claimCtx, provider.ClaimRequest{
+		Owner:    "ss-owner-1",
+		Key:      "deadline-key",
+		SpecHash: "h1",
+		Template: "base",
+		TTL:      10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Claim with deadline: %v", err)
 	}
+	if time.Until(h.ExpiresAt) < 9*time.Minute {
+		t.Fatalf("expected promoted ExpiresAt ~10m in future, got %v", h.ExpiresAt)
+	}
+
+	// Seed an orphaned late-started sandbox (startedAt > MetaCreateDeadline,
+	// never promoted to MetaExpiresAt): Lookup must delete it and return ErrNotFound.
+	now := time.Now().UTC()
+	f.mu.Lock()
+	f.sandboxes["e2b-orphan-1"] = map[string]any{
+		"sandboxID":  "e2b-orphan-1",
+		"templateID": "base",
+		"startedAt":  now.Add(5 * time.Second).Format(time.RFC3339),
+		"endAt":      now.Add(8 * time.Second).Format(time.RFC3339),
+		"state":      "running",
+		"metadata": map[string]any{
+			e2b.MetaOwner:          "ss-owner-1",
+			e2b.MetaKey:            "orphan-key",
+			e2b.MetaSpecHash:       "h1",
+			e2b.MetaExpiresAt:      now.Add(10 * time.Minute).Format(time.RFC3339),
+			e2b.MetaCreateDeadline: now.Format(time.RFC3339Nano),
+		},
+	}
+	f.byKey["orphan-key"] = "e2b-orphan-1"
 	f.mu.Unlock()
 
-	reqs := []provider.ClaimRequest{
-		{Owner: "ss-owner-1", Key: "batch-key-0", SpecHash: "h1"},
-		{Owner: "ss-owner-1", Key: "batch-key-104", SpecHash: "h1"},
-		{Owner: "ss-owner-1", Key: "batch-key-missing", SpecHash: "h1"},
+	_, lookErr := prov.Binder.Lookup(ctx, provider.ClaimRequest{
+		Owner:    "ss-owner-1",
+		Key:      "orphan-key",
+		SpecHash: "h1",
+	})
+	if lookErr != provider.ErrNotFound {
+		t.Fatalf("Lookup on late-started orphan = %v, want ErrNotFound", lookErr)
 	}
-	res := prov.BatchLookup.LookupMany(ctx, reqs)
-	if len(res) != 3 {
-		t.Fatalf("LookupMany returned %d results, want 3", len(res))
-	}
-	if res[0].Err != nil || res[0].Handle.ID != "e2b-seeded-0" || res[0].Handle.Version != "" {
-		t.Fatalf("LookupMany[0] = %+v, want ID=e2b-seeded-0 Version=\"\"", res[0])
-	}
-	if res[1].Err != nil || res[1].Handle.ID != "e2b-seeded-104" || res[1].Handle.Version != "" {
-		t.Fatalf("LookupMany[1] = %+v, want ID=e2b-seeded-104 Version=\"\"", res[1])
-	}
-	if res[2].Err != provider.ErrNotFound {
-		t.Fatalf("LookupMany[2] = %+v, want ErrNotFound", res[2])
+	f.mu.Lock()
+	_, stillExists := f.sandboxes["e2b-orphan-1"]
+	f.mu.Unlock()
+	if stillExists {
+		t.Fatalf("expected late-started orphan sandbox to be deleted by Lookup")
 	}
 
 	// Passing a non-empty Version to Release must be rejected because E2B's
 	// DELETE /sandboxes/{id} endpoint has no server-side version precondition.
-	relErr := prov.Binder.Release(ctx, provider.Handle{ID: "e2b-seeded-0", Version: "v-1"})
+	relErr := prov.Binder.Release(ctx, provider.Handle{ID: h.ID, Version: "v-1"})
 	if provider.KindOf(relErr) != provider.KindRejected {
 		t.Fatalf("expected KindRejected when passing non-empty Version to E2B Release, got %v (%v)", provider.KindOf(relErr), relErr)
 	}

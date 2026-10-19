@@ -2,11 +2,9 @@
 // sandbox-scheduler provider contract.
 //
 // E2B is an elastic, non-Kubernetes provider: sandboxes are created on demand
-// via `POST /sandboxes`, queried by metadata via `GET /sandboxes?metadata=...`,
-// and terminated via `DELETE /sandboxes/{sandboxID}`. Because E2B's create
-// endpoint is not natively idempotent on a caller key, Claim queries
-// `GET /sandboxes` by `(owner, key)` metadata before creating a new sandbox so
-// replays and spec mismatches never allocate duplicate sandboxes.
+// via `POST /sandboxes`, queried by metadata via `GET /v2/sandboxes?metadata=...`,
+// extended via `POST /sandboxes/{sandboxID}/timeout`, and terminated via
+// `DELETE /sandboxes/{sandboxID}`.
 package e2b
 
 import (
@@ -16,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -29,8 +28,9 @@ import (
 // AdapterName is the value used in SandboxProvider.spec.adapter.
 const AdapterName = "e2b"
 
-// DefaultEndpoint is the public E2B control-plane API base URL.
-const DefaultEndpoint = "https://api.e2b.dev"
+// DefaultEndpoint is the public E2B control-plane API base URL from E2B's
+// OpenAPI specification (https://github.com/e2b-dev/E2B/blob/main/spec/openapi.yml).
+const DefaultEndpoint = "https://api.e2b.app"
 
 // DefaultTemplate is the default E2B sandbox template when none is mapped.
 const DefaultTemplate = "base"
@@ -46,10 +46,11 @@ const (
 
 // Metadata keys stamped on E2B sandboxes.
 const (
-	MetaOwner     = "placement.agents.x-k8s.io/owner"
-	MetaKey       = "placement.agents.x-k8s.io/key"
-	MetaSpecHash  = "placement.agents.x-k8s.io/spec-hash"
-	MetaExpiresAt = "placement.agents.x-k8s.io/expires-at"
+	MetaOwner          = "placement.agents.x-k8s.io/owner"
+	MetaKey            = "placement.agents.x-k8s.io/key"
+	MetaSpecHash       = "placement.agents.x-k8s.io/spec-hash"
+	MetaExpiresAt      = "placement.agents.x-k8s.io/expires-at"
+	MetaCreateDeadline = "placement.agents.x-k8s.io/create-deadline"
 )
 
 func init() {
@@ -110,17 +111,17 @@ func init() {
 			client:          httpClient,
 		}
 		return provider.Provider{
-			Source:      c,
-			Binder:      c,
-			BatchLookup: c,
+			Source: c,
+			Binder: c,
 		}, nil
 	})
 }
 
-// Client implements provider.Source, provider.Binder, and
-// provider.BatchLookuper against an E2B-compatible HTTP API. E2B enforces
-// sandbox TTL natively via the create request's `timeout` field (`endAt`), so
-// Provider.Lister is left nil.
+// Client implements provider.Source and provider.Binder against an
+// E2B-compatible HTTP API. E2B enforces sandbox TTL natively via `timeout` /
+// `endAt`, so Provider.Lister is left nil; E2B's `/v2/sandboxes` endpoint
+// filters metadata by exact key/value equality rather than multi-key `IN` sets,
+// so Provider.BatchLookup is also left nil.
 type Client struct {
 	id              string
 	endpoint        string
@@ -166,6 +167,10 @@ type createSandboxRequest struct {
 	Metadata   map[string]string `json:"metadata"`
 }
 
+type sandboxTimeoutRequest struct {
+	Timeout int64 `json:"timeout"`
+}
+
 type sandboxObject struct {
 	SandboxID  string            `json:"sandboxID"`
 	TemplateID string            `json:"templateID,omitempty"`
@@ -204,6 +209,17 @@ func (c *Client) resolveTemplate(logical string) (string, error) {
 }
 
 // Claim implements provider.Binder.
+//
+// Because E2B's `POST /sandboxes` endpoint has no server-side HTTP request
+// timeout header, Claim bounds unconfirmed creates using E2B's server-side
+// sandbox `timeout` field: when `ctx` carries a deadline, the sandbox is
+// initially created with `timeout` equal to the remaining attempt budget (and
+// `MetaCreateDeadline` stamped in metadata), then immediately extended to the
+// full requested `req.TTL` via `POST /sandboxes/{sandboxID}/timeout` once the
+// create response arrives before the deadline. If the leader loses its lease
+// mid-create, any unconfirmed sandbox either expires on E2B within the attempt
+// timeout window or (if E2B booted it after `MetaCreateDeadline`) is rejected
+// and deleted by Lookup.
 func (c *Client) Claim(ctx context.Context, req provider.ClaimRequest) (provider.Handle, error) {
 	templateID, err := c.resolveTemplate(req.Template)
 	if err != nil {
@@ -224,20 +240,41 @@ func (c *Client) Claim(ctx context.Context, req provider.ClaimRequest) (provider
 	if ttlSec <= 0 {
 		ttlSec = int64((24 * time.Hour) / time.Second)
 	}
-	expiresAt := time.Now().UTC().Add(time.Duration(ttlSec) * time.Second).Format(time.RFC3339)
+	now := time.Now().UTC()
+	expiresAt := now.Add(time.Duration(ttlSec) * time.Second)
 
-	meta := make(map[string]string, len(req.Labels)+4)
+	initialTimeoutSec := ttlSec
+	var createDeadline time.Time
+	if deadline, ok := ctx.Deadline(); ok {
+		rem := deadline.Sub(now)
+		if rem <= 0 {
+			return provider.Handle{}, context.DeadlineExceeded
+		}
+		sec := int64(math.Ceil(rem.Seconds()))
+		if sec < 1 {
+			sec = 1
+		}
+		if sec < initialTimeoutSec {
+			initialTimeoutSec = sec
+		}
+		createDeadline = deadline.UTC()
+	}
+
+	meta := make(map[string]string, len(req.Labels)+5)
 	for k, v := range req.Labels {
 		meta[k] = v
 	}
 	meta[MetaOwner] = req.Owner
 	meta[MetaKey] = req.Key
 	meta[MetaSpecHash] = req.SpecHash
-	meta[MetaExpiresAt] = expiresAt
+	meta[MetaExpiresAt] = expiresAt.Format(time.RFC3339)
+	if !createDeadline.IsZero() {
+		meta[MetaCreateDeadline] = createDeadline.Format(time.RFC3339Nano)
+	}
 
 	payload := createSandboxRequest{
 		TemplateID: templateID,
-		Timeout:    ttlSec,
+		Timeout:    initialTimeoutSec,
 		Metadata:   meta,
 	}
 	rawBody, err := json.Marshal(payload)
@@ -250,9 +287,6 @@ func (c *Client) Claim(ctx context.Context, req provider.ClaimRequest) (provider
 		return provider.Handle{}, provider.Rejected(err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if req.Owner != "" || req.Key != "" {
-		httpReq.Header.Set("Idempotency-Key", req.Owner+"/"+req.Key)
-	}
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
@@ -270,7 +304,21 @@ func (c *Client) Claim(ctx context.Context, req provider.ClaimRequest) (provider
 		if err := json.Unmarshal(body, &sb); err != nil {
 			return provider.Handle{}, fmt.Errorf("%s: unparseable e2b claim response: %w", c.id, err)
 		}
-		return c.inspectSandbox(sb, req)
+		if len(sb.Metadata) == 0 {
+			sb.Metadata = meta
+		}
+		if !createDeadline.IsZero() && time.Now().UTC().After(createDeadline) {
+			c.deleteSandboxBestEffort(sb.SandboxID)
+			return provider.Handle{}, context.DeadlineExceeded
+		}
+		if initialTimeoutSec < ttlSec && sb.SandboxID != "" {
+			if err := c.setSandboxTimeout(ctx, sb.SandboxID, ttlSec); err != nil {
+				c.deleteSandboxBestEffort(sb.SandboxID)
+				return provider.Handle{}, err
+			}
+			sb.EndAt = expiresAt.Format(time.RFC3339)
+		}
+		return c.inspectSandbox(ctx, sb, req)
 	}
 
 	if resp.StatusCode == http.StatusConflict {
@@ -289,6 +337,50 @@ func (c *Client) Claim(ctx context.Context, req provider.ClaimRequest) (provider
 	return provider.Handle{}, c.classifyHTTPError(resp, body)
 }
 
+func (c *Client) setSandboxTimeout(ctx context.Context, sandboxID string, timeoutSec int64) error {
+	if timeoutSec < 1 {
+		timeoutSec = 1
+	}
+	rawBody, err := json.Marshal(sandboxTimeoutRequest{Timeout: timeoutSec})
+	if err != nil {
+		return provider.Rejected(err)
+	}
+	u := c.endpoint + "/sandboxes/" + url.PathEscape(sandboxID) + "/timeout"
+	httpReq, err := c.newRequest(ctx, http.MethodPost, u, bytes.NewReader(rawBody))
+	if err != nil {
+		return provider.Rejected(err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("%s: setting e2b sandbox timeout: %w", c.id, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("%s: reading e2b sandbox timeout response: %w", c.id, err)
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	return c.classifyHTTPError(resp, body)
+}
+
+func (c *Client) deleteSandboxBestEffort(sandboxID string) {
+	if sandboxID == "" {
+		return
+	}
+	cleanCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = c.Release(cleanCtx, provider.Handle{Provider: c.id, ID: sandboxID})
+}
+
+// MaxPageSize is the maximum page size accepted by E2B's GET /v2/sandboxes
+// endpoint.
+const MaxPageSize = 100
+
 // Lookup implements provider.Binder. It queries E2B by `(owner, key)` metadata
 // in a single HTTP request so lookup cost never scales with total sandbox count.
 func (c *Client) Lookup(ctx context.Context, req provider.ClaimRequest) (provider.Handle, error) {
@@ -299,7 +391,7 @@ func (c *Client) Lookup(ctx context.Context, req provider.ClaimRequest) (provide
 	}
 	metaQuery.Set(MetaKey, req.Key)
 	q.Set("metadata", metaQuery.Encode())
-	q.Set("limit", "1")
+	q.Set("limit", "10")
 
 	u := c.endpoint + "/v2/sandboxes?" + q.Encode()
 	httpReq, err := c.newRequest(ctx, http.MethodGet, u, nil)
@@ -336,117 +428,13 @@ func (c *Client) Lookup(ctx context.Context, req provider.ClaimRequest) (provide
 		if req.Owner != "" && sb.Metadata[MetaOwner] != "" && sb.Metadata[MetaOwner] != req.Owner {
 			continue
 		}
-		return c.inspectSandbox(sb, req)
-	}
-	return provider.Handle{}, provider.ErrNotFound
-}
-
-// LookupMany implements provider.BatchLookuper. It resolves a batch of keys for
-// the same owner via `GET /v2/sandboxes`, following `X-Next-Token` pagination
-// if the owner has more than MaxPageSize sandboxes and some requested keys have
-// not yet been seen.
-func (c *Client) LookupMany(ctx context.Context, reqs []provider.ClaimRequest) []provider.LookupResult {
-	out := make([]provider.LookupResult, len(reqs))
-	if len(reqs) == 0 {
-		return out
-	}
-
-	owner := reqs[0].Owner
-	keys := make([]string, 0, len(reqs))
-	wanted := make(map[string]struct{}, len(reqs))
-	for _, r := range reqs {
-		keys = append(keys, r.Key)
-		wanted[r.Key] = struct{}{}
-	}
-
-	byKey := make(map[string]sandboxObject, len(reqs))
-	var nextToken string
-	for page := 0; page < 100; page++ {
-		q := url.Values{}
-		if owner != "" {
-			metaQuery := url.Values{}
-			metaQuery.Set(MetaOwner, owner)
-			q.Set("metadata", metaQuery.Encode())
-		}
-		q.Set("keys", strings.Join(keys, ","))
-		q.Set("limit", strconv.Itoa(MaxPageSize))
-		if nextToken != "" {
-			q.Set("nextToken", nextToken)
-		}
-
-		body, headerNext, err := c.doGetSandboxes(ctx, "/v2/sandboxes?"+q.Encode())
-		if err != nil {
-			for i := range out {
-				out[i] = provider.LookupResult{Err: err}
-			}
-			return out
-		}
-
-		list, tok, err := decodePagedSandboxList(body, headerNext)
-		if err != nil {
-			for i := range out {
-				out[i] = provider.LookupResult{Err: fmt.Errorf("%s: unparseable e2b batch lookup: %w", c.id, err)}
-			}
-			return out
-		}
-
-		for _, sb := range list {
-			k := sb.Metadata[MetaKey]
-			if k == "" {
-				continue
-			}
-			if owner != "" && sb.Metadata[MetaOwner] != "" && sb.Metadata[MetaOwner] != owner {
-				continue
-			}
-			if _, ok := wanted[k]; ok {
-				byKey[k] = sb
-			}
-		}
-
-		if len(byKey) >= len(wanted) || tok == "" || tok == nextToken {
-			break
-		}
-		nextToken = tok
-	}
-
-	for i, req := range reqs {
-		sb, ok := byKey[req.Key]
-		if !ok {
-			out[i] = provider.LookupResult{Err: provider.ErrNotFound}
+		h, err := c.inspectSandbox(ctx, sb, req)
+		if errors.Is(err, provider.ErrNotFound) {
 			continue
 		}
-		h, err := c.inspectSandbox(sb, req)
-		out[i] = provider.LookupResult{Handle: h, Err: err}
+		return h, err
 	}
-	return out
-}
-
-// MaxPageSize is the maximum page size accepted by E2B's GET /v2/sandboxes
-// endpoint.
-const MaxPageSize = 100
-
-func (c *Client) doGetSandboxes(ctx context.Context, pathAndQuery string) ([]byte, string, error) {
-	httpReq, err := c.newRequest(ctx, http.MethodGet, c.endpoint+pathAndQuery, nil)
-	if err != nil {
-		return nil, "", provider.Rejected(err)
-	}
-
-	resp, err := c.client.Do(httpReq)
-	if err != nil {
-		return nil, "", fmt.Errorf("%s: e2b list sandboxes failed: %w", c.id, err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, "", fmt.Errorf("%s: reading e2b list sandboxes response: %w", c.id, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", c.classifyHTTPError(resp, body)
-	}
-
-	headerNext := nonEmpty(resp.Header.Get("X-Next-Token"), resp.Header.Get("X-Next-Page-Token"))
-	return body, headerNext, nil
+	return provider.Handle{}, provider.ErrNotFound
 }
 
 // Release implements provider.Binder. Because E2B's `DELETE /sandboxes/{id}`
@@ -499,19 +487,10 @@ func (c *Client) newRequest(ctx context.Context, method, u string, body io.Reade
 			req.Header.Set("X-API-Key", c.token)
 		}
 	}
-	if deadline, ok := ctx.Deadline(); ok {
-		if rem := time.Until(deadline); rem > 0 {
-			ms := rem.Milliseconds()
-			if ms < 1 {
-				ms = 1
-			}
-			req.Header.Set("X-Request-Timeout-Ms", strconv.FormatInt(ms, 10))
-		}
-	}
 	return req, nil
 }
 
-func (c *Client) inspectSandbox(sb sandboxObject, req provider.ClaimRequest) (provider.Handle, error) {
+func (c *Client) inspectSandbox(ctx context.Context, sb sandboxObject, req provider.ClaimRequest) (provider.Handle, error) {
 	if sb.Deleting || strings.EqualFold(sb.State, "killing") {
 		return provider.Handle{}, provider.KeyBusy(500*time.Millisecond,
 			fmt.Errorf("%s: e2b sandbox %q for key %q is terminating", c.id, sb.SandboxID, req.Key))
@@ -527,6 +506,40 @@ func (c *Client) inspectSandbox(sb sandboxObject, req provider.ClaimRequest) (pr
 	if existingHash := sb.Metadata[MetaSpecHash]; existingHash != "" && req.SpecHash != "" && existingHash != req.SpecHash {
 		return provider.Handle{}, provider.KeyConflict(
 			fmt.Errorf("%s: key %q already exists with spec hash %s (want %s)", c.id, req.Key, existingHash, req.SpecHash))
+	}
+
+	// If this sandbox was created with a short initial create timeout (before
+	// POST /sandboxes/{id}/timeout promoted its TTL to MetaExpiresAt), verify
+	// that E2B started the sandbox within MetaCreateDeadline. If E2B finished
+	// starting it after MetaCreateDeadline (an orphaned slow create after
+	// attempt timeout / lease loss), delete it and treat as not found;
+	// otherwise promote its timeout to the remaining TTL.
+	if rawDeadline := sb.Metadata[MetaCreateDeadline]; rawDeadline != "" {
+		createDeadline, dErr := time.Parse(time.RFC3339Nano, rawDeadline)
+		targetExpires, eErr := time.Parse(time.RFC3339, sb.Metadata[MetaExpiresAt])
+		currentEnd, cErr := time.Parse(time.RFC3339, sb.EndAt)
+		if dErr == nil && eErr == nil && cErr == nil && targetExpires.Sub(currentEnd) > 2*time.Second {
+			if startedAt, sErr := time.Parse(time.RFC3339Nano, sb.StartedAt); sErr == nil {
+				// Truncate createDeadline to seconds if startedAt has second resolution.
+				cmpDeadline := createDeadline
+				if startedAt.Nanosecond() == 0 {
+					cmpDeadline = createDeadline.Truncate(time.Second)
+				}
+				if startedAt.After(cmpDeadline) {
+					c.deleteSandboxBestEffort(sb.SandboxID)
+					return provider.Handle{}, provider.ErrNotFound
+				}
+			}
+			remSec := int64(math.Ceil(time.Until(targetExpires).Seconds()))
+			if remSec <= 0 {
+				return provider.Handle{}, provider.KeyBusy(500*time.Millisecond,
+					fmt.Errorf("%s: e2b sandbox %q for key %q has expired and is awaiting cleanup", c.id, sb.SandboxID, req.Key))
+			}
+			if err := c.setSandboxTimeout(ctx, sb.SandboxID, remSec); err != nil {
+				return provider.Handle{}, err
+			}
+			sb.EndAt = targetExpires.Format(time.RFC3339)
+		}
 	}
 
 	h := c.toHandle(sb)
@@ -657,34 +670,6 @@ func decodeSandboxList(body []byte) ([]sandboxObject, error) {
 		return wrapper.Sandboxes, nil
 	}
 	return wrapper.Items, nil
-}
-
-func decodePagedSandboxList(body []byte, headerNext string) ([]sandboxObject, string, error) {
-	trimmed := bytes.TrimSpace(body)
-	if len(trimmed) == 0 {
-		return nil, headerNext, nil
-	}
-	if trimmed[0] == '[' {
-		var list []sandboxObject
-		if err := json.Unmarshal(trimmed, &list); err != nil {
-			return nil, "", err
-		}
-		return list, headerNext, nil
-	}
-	var wrapper struct {
-		Sandboxes     []sandboxObject `json:"sandboxes"`
-		Items         []sandboxObject `json:"items"`
-		NextToken     string          `json:"nextToken"`
-		NextPageToken string          `json:"nextPageToken"`
-	}
-	if err := json.Unmarshal(trimmed, &wrapper); err != nil {
-		return nil, "", err
-	}
-	next := nonEmpty(wrapper.NextToken, wrapper.NextPageToken, headerNext)
-	if len(wrapper.Sandboxes) > 0 {
-		return wrapper.Sandboxes, next, nil
-	}
-	return wrapper.Items, next, nil
 }
 
 func parseRetryAfter(raw string) time.Duration {
