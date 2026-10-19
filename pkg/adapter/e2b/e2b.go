@@ -236,9 +236,12 @@ func (c *Client) Claim(ctx context.Context, req provider.ClaimRequest) (provider
 		return provider.Handle{}, err
 	}
 
-	ttlSec := int64(req.TTL / time.Second)
-	if ttlSec <= 0 {
-		ttlSec = int64((24 * time.Hour) / time.Second)
+	ttlSec := int64((24 * time.Hour) / time.Second)
+	if req.TTL > 0 {
+		ttlSec = int64(math.Ceil(req.TTL.Seconds()))
+		if ttlSec < 1 {
+			ttlSec = 1
+		}
 	}
 	now := time.Now().UTC()
 	expiresAt := now.Add(time.Duration(ttlSec) * time.Second)
@@ -633,7 +636,7 @@ func isNoCapacityError(sb sandboxObject) bool {
 		return true
 	}
 	switch strings.ToLower(strings.TrimSpace(sb.ErrorCode)) {
-	case "sandbox_capacity_unavailable", "insufficient_capacity", "no_capacity", "quota_exceeded":
+	case "sandbox_capacity_unavailable", "sandbox_no_compatible_node", "insufficient_capacity", "no_capacity", "quota_exceeded":
 		return true
 	default:
 		return false

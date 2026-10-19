@@ -375,41 +375,59 @@ func TestE2BServerSideCreateTimeoutAndErrorCodeClassification(t *testing.T) {
 		t.Fatalf("expected KindRejected when passing non-empty Version to E2B Release, got %v (%v)", provider.KindOf(relErr), relErr)
 	}
 
-	// Verify real E2B error_code payload {"error_code": "sandbox_capacity_unavailable"}
-	// on HTTP 503 classifies as KindNoCapacity even without a scheduler-specific "reason" field.
-	errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`[]`))
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"code":       503,
-			"error_code": "sandbox_capacity_unavailable",
-			"message":    "no capacity in region",
-		})
-	}))
-	defer errSrv.Close()
-
-	errProv, err := adapter.New(e2b.AdapterName, adapter.Config{
-		ProviderID:  "e2b-cap",
-		Endpoint:    errSrv.URL,
-		Credentials: map[string][]byte{"apiKey": []byte("k")},
-	})
-	if err != nil {
-		t.Fatalf("adapter.New(e2b-cap): %v", err)
-	}
-	_, capErr := errProv.Binder.Claim(ctx, provider.ClaimRequest{
+	// Sub-second positive TTL rounds up to 1s rather than defaulting to 24h.
+	subSecHandle, err := prov.Binder.Claim(ctx, provider.ClaimRequest{
 		Owner:    "ss-owner-1",
-		Key:      "cap-key",
+		Key:      "subsec-key",
 		SpecHash: "h1",
 		Template: "base",
-		TTL:      time.Minute,
+		TTL:      500 * time.Millisecond,
 	})
-	if provider.KindOf(capErr) != provider.KindNoCapacity {
-		t.Fatalf("expected KindNoCapacity for E2B error_code=sandbox_capacity_unavailable, got %v (%v)", provider.KindOf(capErr), capErr)
+	if err != nil {
+		t.Fatalf("Claim with 500ms TTL: %v", err)
+	}
+	if rem := time.Until(subSecHandle.ExpiresAt); rem <= 0 || rem > 5*time.Second {
+		t.Fatalf("expected 500ms TTL to round up to ~1s, got remaining %v (ExpiresAt=%v)", rem, subSecHandle.ExpiresAt)
+	}
+
+	// Verify real E2B error_code payloads ("sandbox_capacity_unavailable" and
+	// "sandbox_no_compatible_node") on HTTP 503 classify as KindNoCapacity.
+	for _, errCode := range []string{"sandbox_capacity_unavailable", "sandbox_no_compatible_node"} {
+		errCode := errCode
+		errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`[]`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":       503,
+				"error_code": errCode,
+				"message":    "no capacity in region",
+			})
+		}))
+		defer errSrv.Close()
+
+		errProv, err := adapter.New(e2b.AdapterName, adapter.Config{
+			ProviderID:  "e2b-cap",
+			Endpoint:    errSrv.URL,
+			Credentials: map[string][]byte{"apiKey": []byte("k")},
+		})
+		if err != nil {
+			t.Fatalf("adapter.New(e2b-cap): %v", err)
+		}
+		_, capErr := errProv.Binder.Claim(ctx, provider.ClaimRequest{
+			Owner:    "ss-owner-1",
+			Key:      "cap-key-" + errCode,
+			SpecHash: "h1",
+			Template: "base",
+			TTL:      time.Minute,
+		})
+		if provider.KindOf(capErr) != provider.KindNoCapacity {
+			t.Fatalf("expected KindNoCapacity for E2B error_code=%s, got %v (%v)", errCode, provider.KindOf(capErr), capErr)
+		}
 	}
 }
 
