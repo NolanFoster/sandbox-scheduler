@@ -13,6 +13,7 @@ package reaper
 import (
 	"context"
 	"errors"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -31,7 +32,7 @@ const (
 	DefaultMaxPages       = 100
 	DefaultMaxPerCycle    = 200
 	DefaultRatePerSecond  = 10
-	DefaultBurstPerSecond = 20
+	DefaultBurstPerSecond = 10
 	DefaultAttemptTimeout = 5 * time.Second
 )
 
@@ -143,9 +144,9 @@ func New(opts Options) *Reaper {
 		r.ratePerSec = DefaultRatePerSecond
 	}
 	if r.burst <= 0 {
-		r.burst = int(r.ratePerSec * 2)
-		if r.burst < DefaultBurstPerSecond {
-			r.burst = DefaultBurstPerSecond
+		r.burst = int(math.Ceil(r.ratePerSec))
+		if r.burst < 1 {
+			r.burst = 1
 		}
 	}
 	if r.now == nil {

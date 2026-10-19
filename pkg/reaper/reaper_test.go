@@ -201,3 +201,14 @@ func TestReaperCircuitBreakerCapsDeletionsPerCycle(t *testing.T) {
 		t.Fatalf("expected 3 remaining sandboxes after maxPerCycle=2, got %d", len(remaining))
 	}
 }
+
+func TestReaperHonorsConfiguredLowRateBurst(t *testing.T) {
+	r := New(Options{RatePerSecond: 1})
+	if r.burst != 1 {
+		t.Fatalf("expected burst=1 for RatePerSecond=1, got %d", r.burst)
+	}
+	rFrac := New(Options{RatePerSecond: 0.25})
+	if rFrac.burst != 1 {
+		t.Fatalf("expected burst=1 for RatePerSecond=0.25, got %d", rFrac.burst)
+	}
+}
