@@ -113,13 +113,14 @@ func init() {
 			Source:      c,
 			Binder:      c,
 			BatchLookup: c,
-			Lister:      c,
 		}, nil
 	})
 }
 
-// Client implements provider.Source, provider.Binder, provider.BatchLookuper,
-// and provider.OwnedLister against an E2B-compatible HTTP API.
+// Client implements provider.Source, provider.Binder, and
+// provider.BatchLookuper against an E2B-compatible HTTP API. E2B enforces
+// sandbox TTL natively via the create request's `timeout` field (`endAt`), so
+// Provider.Lister is left nil.
 type Client struct {
 	id              string
 	endpoint        string
@@ -178,6 +179,7 @@ type sandboxObject struct {
 	EnvdToken  string            `json:"envdAccessToken,omitempty"`
 	Metadata   map[string]string `json:"metadata,omitempty"`
 	Error      string            `json:"error,omitempty"`
+	ErrorCode  string            `json:"error_code,omitempty"`
 	Message    string            `json:"message,omitempty"`
 	Reason     string            `json:"reason,omitempty"`
 }
@@ -274,9 +276,10 @@ func (c *Client) Claim(ctx context.Context, req provider.ClaimRequest) (provider
 	if resp.StatusCode == http.StatusConflict {
 		var sb sandboxObject
 		_ = json.Unmarshal(body, &sb)
-		switch sb.Reason {
-		case "NoCapacity":
+		if isNoCapacityError(sb) {
 			return provider.Handle{}, provider.NoCapacity(fmt.Errorf("%s: %s", c.id, nonEmpty(sb.Error, sb.Message, "no capacity")))
+		}
+		switch sb.Reason {
 		case "KeyConflict", "SpecMismatch":
 			return provider.Handle{}, provider.KeyConflict(fmt.Errorf("%s: %s", c.id, nonEmpty(sb.Error, sb.Message, "spec mismatch for key "+req.Key)))
 		}
@@ -371,7 +374,7 @@ func (c *Client) LookupMany(ctx context.Context, reqs []provider.ClaimRequest) [
 			q.Set("nextToken", nextToken)
 		}
 
-		body, headerNext, err := c.doListOwned(ctx, "/v2/sandboxes?"+q.Encode())
+		body, headerNext, err := c.doGetSandboxes(ctx, "/v2/sandboxes?"+q.Encode())
 		if err != nil {
 			for i := range out {
 				out[i] = provider.LookupResult{Err: err}
@@ -419,54 +422,10 @@ func (c *Client) LookupMany(ctx context.Context, reqs []provider.ClaimRequest) [
 }
 
 // MaxPageSize is the maximum page size accepted by E2B's GET /v2/sandboxes
-// endpoint. Larger limits requested by callers (such as the reaper's 500-item
-// default) are clamped to MaxPageSize so the upstream API does not reject the
-// query.
+// endpoint.
 const MaxPageSize = 100
 
-// ListOwned implements provider.OwnedLister for background reaping.
-func (c *Client) ListOwned(ctx context.Context, owner, pageToken string, limit int) ([]provider.Handle, string, error) {
-	q := url.Values{}
-	if owner != "" {
-		metaQuery := url.Values{}
-		metaQuery.Set(MetaOwner, owner)
-		q.Set("metadata", metaQuery.Encode())
-	}
-	if pageToken != "" {
-		q.Set("nextToken", pageToken)
-	}
-	if limit <= 0 || limit > MaxPageSize {
-		limit = MaxPageSize
-	}
-	q.Set("limit", strconv.Itoa(limit))
-
-	body, headerNext, err := c.doListOwned(ctx, "/v2/sandboxes?"+q.Encode())
-	if err != nil {
-		return nil, "", err
-	}
-
-	list, nextToken, err := decodePagedSandboxList(body, headerNext)
-	if err != nil {
-		return nil, "", fmt.Errorf("%s: unparseable e2b list owned response: %w", c.id, err)
-	}
-
-	handles := make([]provider.Handle, 0, len(list))
-	for _, sb := range list {
-		if sb.SandboxID == "" {
-			continue
-		}
-		if owner != "" && sb.Metadata[MetaOwner] != owner {
-			continue
-		}
-		if sb.Deleting || strings.EqualFold(sb.State, "killing") {
-			continue
-		}
-		handles = append(handles, c.toHandle(sb))
-	}
-	return handles, nextToken, nil
-}
-
-func (c *Client) doListOwned(ctx context.Context, pathAndQuery string) ([]byte, string, error) {
+func (c *Client) doGetSandboxes(ctx context.Context, pathAndQuery string) ([]byte, string, error) {
 	httpReq, err := c.newRequest(ctx, http.MethodGet, c.endpoint+pathAndQuery, nil)
 	if err != nil {
 		return nil, "", provider.Rejected(err)
@@ -474,13 +433,13 @@ func (c *Client) doListOwned(ctx context.Context, pathAndQuery string) ([]byte, 
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
-		return nil, "", fmt.Errorf("%s: e2b list owned failed: %w", c.id, err)
+		return nil, "", fmt.Errorf("%s: e2b list sandboxes failed: %w", c.id, err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, "", fmt.Errorf("%s: reading e2b list owned response: %w", c.id, err)
+		return nil, "", fmt.Errorf("%s: reading e2b list sandboxes response: %w", c.id, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", c.classifyHTTPError(resp, body)
@@ -490,21 +449,21 @@ func (c *Client) doListOwned(ctx context.Context, pathAndQuery string) ([]byte, 
 	return body, headerNext, nil
 }
 
-// Release implements provider.Binder.
+// Release implements provider.Binder. Because E2B's `DELETE /sandboxes/{id}`
+// endpoint does not accept a server-side version precondition (`If-Match` or
+// `?version=`), `toHandle` leaves `Handle.Version` empty and `Release` rejects
+// non-empty `h.Version` rather than performing an unguarded delete.
 func (c *Client) Release(ctx context.Context, h provider.Handle) error {
 	if h.ID == "" {
 		return provider.Rejected(errors.New("sandbox ID is required"))
 	}
-	u := c.endpoint + "/sandboxes/" + url.PathEscape(h.ID)
 	if h.Version != "" {
-		u += "?version=" + url.QueryEscape(h.Version)
+		return provider.Rejected(fmt.Errorf("%s: e2b delete does not support version preconditions", c.id))
 	}
+	u := c.endpoint + "/sandboxes/" + url.PathEscape(h.ID)
 	httpReq, err := c.newRequest(ctx, http.MethodDelete, u, nil)
 	if err != nil {
 		return provider.Rejected(err)
-	}
-	if h.Version != "" {
-		httpReq.Header.Set("If-Match", h.Version)
 	}
 
 	resp, err := c.client.Do(httpReq)
@@ -522,9 +481,6 @@ func (c *Client) Release(ctx context.Context, h provider.Handle) error {
 	case resp.StatusCode == http.StatusNotFound:
 		return nil
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		return nil
-	case resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusPreconditionFailed:
-		// Version precondition failed: the original sandbox was already replaced.
 		return nil
 	default:
 		return c.classifyHTTPError(resp, body)
@@ -582,10 +538,6 @@ func (c *Client) inspectSandbox(sb sandboxObject, req provider.ClaimRequest) (pr
 }
 
 func (c *Client) toHandle(sb sandboxObject) provider.Handle {
-	version := sb.Version
-	if version == "" {
-		version = sb.StartedAt
-	}
 	var expiresAt time.Time
 	if raw := sb.EndAt; raw != "" {
 		if t, err := time.Parse(time.RFC3339, raw); err == nil {
@@ -615,7 +567,6 @@ func (c *Client) toHandle(sb sandboxObject) provider.Handle {
 	return provider.Handle{
 		Provider:  c.id,
 		ID:        sb.SandboxID,
-		Version:   version,
 		Endpoint:  endpoint,
 		Connect:   connect,
 		ExpiresAt: expiresAt,
@@ -634,7 +585,7 @@ func (c *Client) classifyHTTPError(resp *http.Response, body []byte) error {
 	case http.StatusUnauthorized, http.StatusForbidden, http.StatusBadRequest, http.StatusUnprocessableEntity:
 		return provider.Rejected(baseErr)
 	case http.StatusConflict:
-		if parsed.Reason == "NoCapacity" {
+		if isNoCapacityError(parsed) {
 			return provider.NoCapacity(baseErr)
 		}
 		if parsed.Reason == "KeyConflict" || parsed.Reason == "SpecMismatch" {
@@ -647,15 +598,39 @@ func (c *Client) classifyHTTPError(resp *http.Response, body []byte) error {
 		}
 		return provider.Busy(retryAfter, baseErr)
 	case http.StatusServiceUnavailable, http.StatusBadGateway:
-		if parsed.Reason == "NoCapacity" {
+		if isNoCapacityError(parsed) {
 			return provider.NoCapacity(baseErr)
 		}
-		if parsed.Reason == "Unavailable" {
+		if isUnavailableError(parsed) {
 			return provider.Unavailable(baseErr)
 		}
 		return baseErr
 	default:
 		return baseErr
+	}
+}
+
+func isNoCapacityError(sb sandboxObject) bool {
+	if sb.Reason == "NoCapacity" {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(sb.ErrorCode)) {
+	case "sandbox_capacity_unavailable", "insufficient_capacity", "no_capacity", "quota_exceeded":
+		return true
+	default:
+		return false
+	}
+}
+
+func isUnavailableError(sb sandboxObject) bool {
+	if sb.Reason == "Unavailable" {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(sb.ErrorCode)) {
+	case "service_unavailable", "unavailable":
+		return true
+	default:
+		return false
 	}
 }
 

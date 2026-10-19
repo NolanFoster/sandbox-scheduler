@@ -282,8 +282,8 @@ func TestE2BBinderConformance(t *testing.T) {
 	})
 }
 
-func TestE2BFetchAndListOwnedPagination(t *testing.T) {
-	_, srv := newFakeE2BServer(t)
+func TestE2BFetchBatchPaginationAndErrorCodeClassification(t *testing.T) {
+	f, srv := newFakeE2BServer(t)
 	prov, err := adapter.New(e2b.AdapterName, adapter.Config{
 		ProviderID:  "e2b",
 		Endpoint:    srv.URL,
@@ -291,6 +291,9 @@ func TestE2BFetchAndListOwnedPagination(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("adapter.New: %v", err)
+	}
+	if prov.Lister != nil {
+		t.Fatalf("expected Provider.Lister == nil because E2B enforces TTL natively via timeout/endAt")
 	}
 
 	ctx := context.Background()
@@ -302,49 +305,89 @@ func TestE2BFetchAndListOwnedPagination(t *testing.T) {
 		t.Fatalf("expected Elastic=true on E2B report, got %+v", rep)
 	}
 
-	for i := 0; i < 5; i++ {
-		_, err := prov.Binder.Claim(ctx, provider.ClaimRequest{
-			Owner:    "ss-owner-1",
-			Key:      fmt.Sprintf("list-key-%d", i),
-			SpecHash: "h1",
-			Template: "base",
-			TTL:      10 * time.Minute,
+	// Seed 105 sandboxes so LookupMany exercises multi-page X-Next-Token pagination (> MaxPageSize=100).
+	f.mu.Lock()
+	for i := 0; i < 105; i++ {
+		id := fmt.Sprintf("e2b-seeded-%d", i)
+		key := fmt.Sprintf("batch-key-%d", i)
+		sb := map[string]any{
+			"sandboxID":  id,
+			"templateID": "base",
+			"startedAt":  time.Now().UTC().Format(time.RFC3339),
+			"endAt":      time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339),
+			"state":      "running",
+			"metadata": map[string]any{
+				e2b.MetaOwner:    "ss-owner-1",
+				e2b.MetaKey:      key,
+				e2b.MetaSpecHash: "h1",
+			},
+		}
+		f.sandboxes[id] = sb
+		f.byKey[key] = id
+	}
+	f.mu.Unlock()
+
+	reqs := []provider.ClaimRequest{
+		{Owner: "ss-owner-1", Key: "batch-key-0", SpecHash: "h1"},
+		{Owner: "ss-owner-1", Key: "batch-key-104", SpecHash: "h1"},
+		{Owner: "ss-owner-1", Key: "batch-key-missing", SpecHash: "h1"},
+	}
+	res := prov.BatchLookup.LookupMany(ctx, reqs)
+	if len(res) != 3 {
+		t.Fatalf("LookupMany returned %d results, want 3", len(res))
+	}
+	if res[0].Err != nil || res[0].Handle.ID != "e2b-seeded-0" || res[0].Handle.Version != "" {
+		t.Fatalf("LookupMany[0] = %+v, want ID=e2b-seeded-0 Version=\"\"", res[0])
+	}
+	if res[1].Err != nil || res[1].Handle.ID != "e2b-seeded-104" || res[1].Handle.Version != "" {
+		t.Fatalf("LookupMany[1] = %+v, want ID=e2b-seeded-104 Version=\"\"", res[1])
+	}
+	if res[2].Err != provider.ErrNotFound {
+		t.Fatalf("LookupMany[2] = %+v, want ErrNotFound", res[2])
+	}
+
+	// Passing a non-empty Version to Release must be rejected because E2B's
+	// DELETE /sandboxes/{id} endpoint has no server-side version precondition.
+	relErr := prov.Binder.Release(ctx, provider.Handle{ID: "e2b-seeded-0", Version: "v-1"})
+	if provider.KindOf(relErr) != provider.KindRejected {
+		t.Fatalf("expected KindRejected when passing non-empty Version to E2B Release, got %v (%v)", provider.KindOf(relErr), relErr)
+	}
+
+	// Verify real E2B error_code payload {"error_code": "sandbox_capacity_unavailable"}
+	// on HTTP 503 classifies as KindNoCapacity even without a scheduler-specific "reason" field.
+	errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code":       503,
+			"error_code": "sandbox_capacity_unavailable",
+			"message":    "no capacity in region",
 		})
-		if err != nil {
-			t.Fatalf("Claim %d: %v", i, err)
-		}
-	}
+	}))
+	defer errSrv.Close()
 
-	var all []provider.Handle
-	pageToken := ""
-	for {
-		hs, next, err := prov.Lister.ListOwned(ctx, "ss-owner-1", pageToken, 2)
-		if err != nil {
-			t.Fatalf("ListOwned: %v", err)
-		}
-		all = append(all, hs...)
-		if next == "" {
-			break
-		}
-		pageToken = next
-	}
-	if len(all) != 5 {
-		t.Fatalf("ListOwned returned %d handles across pages, want 5", len(all))
-	}
-	for _, h := range all {
-		if h.ID == "" || h.Version == "" || h.ExpiresAt.IsZero() {
-			t.Fatalf("incomplete handle from ListOwned: %+v", h)
-		}
-	}
-
-	// Verify reaper's default limit=500 is clamped to MaxPageSize (100) so E2B
-	// /v2/sandboxes does not reject the request.
-	clamped, next, err := prov.Lister.ListOwned(ctx, "ss-owner-1", "", 500)
+	errProv, err := adapter.New(e2b.AdapterName, adapter.Config{
+		ProviderID:  "e2b-cap",
+		Endpoint:    errSrv.URL,
+		Credentials: map[string][]byte{"apiKey": []byte("k")},
+	})
 	if err != nil {
-		t.Fatalf("ListOwned(limit=500): %v", err)
+		t.Fatalf("adapter.New(e2b-cap): %v", err)
 	}
-	if len(clamped) != 5 || next != "" {
-		t.Fatalf("ListOwned(limit=500) returned len=%d next=%q, want 5/empty", len(clamped), next)
+	_, capErr := errProv.Binder.Claim(ctx, provider.ClaimRequest{
+		Owner:    "ss-owner-1",
+		Key:      "cap-key",
+		SpecHash: "h1",
+		Template: "base",
+		TTL:      time.Minute,
+	})
+	if provider.KindOf(capErr) != provider.KindNoCapacity {
+		t.Fatalf("expected KindNoCapacity for E2B error_code=sandbox_capacity_unavailable, got %v (%v)", provider.KindOf(capErr), capErr)
 	}
 }
 
