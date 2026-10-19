@@ -39,6 +39,7 @@ const DefaultTemplate = "base"
 const (
 	CredentialKeyToken  = "token"
 	CredentialKeyAPIKey = "apiKey"
+	CredentialKeyTeamID = "teamID"
 
 	AuthModeAPIKey = "x-api-key"
 	AuthModeBearer = "bearer"
@@ -63,11 +64,19 @@ func init() {
 		if token == "" {
 			token = cfg.Credential(CredentialKeyAPIKey)
 		}
+		teamID := strings.TrimSpace(cfg.Options[CredentialKeyTeamID])
+		if teamID == "" {
+			teamID = strings.TrimSpace(cfg.Credential(CredentialKeyTeamID))
+		}
 		authMode := strings.ToLower(strings.TrimSpace(cfg.Options["authMode"]))
 		switch authMode {
 		case "", AuthModeAPIKey:
 			authMode = AuthModeAPIKey
 		case AuthModeBearer:
+			if teamID == "" {
+				return provider.Provider{}, fmt.Errorf("%s: e2b bearer authMode requires %q in options or credentials",
+					cfg.ProviderID, CredentialKeyTeamID)
+			}
 		default:
 			return provider.Provider{}, fmt.Errorf("%s: invalid e2b authMode %q (want %q or %q)",
 				cfg.ProviderID, cfg.Options["authMode"], AuthModeAPIKey, AuthModeBearer)
@@ -105,6 +114,7 @@ func init() {
 			id:              cfg.ProviderID,
 			endpoint:        endpoint,
 			token:           token,
+			teamID:          teamID,
 			authMode:        authMode,
 			templates:       templates,
 			defaultTemplate: defaultTpl,
@@ -126,6 +136,7 @@ type Client struct {
 	id              string
 	endpoint        string
 	token           string
+	teamID          string
 	authMode        string
 	templates       map[string]string
 	defaultTemplate string
@@ -495,7 +506,39 @@ func (c *Client) newRequest(ctx context.Context, method, u string, body io.Reade
 			req.Header.Set("X-API-Key", c.token)
 		}
 	}
+	if c.teamID != "" {
+		req.Header.Set("X-Team-ID", c.teamID)
+	}
 	return req, nil
+}
+
+func (c *Client) getSandboxDetail(ctx context.Context, sandboxID string) (sandboxObject, error) {
+	u := c.endpoint + "/sandboxes/" + url.PathEscape(sandboxID)
+	httpReq, err := c.newRequest(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return sandboxObject{}, provider.Rejected(err)
+	}
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		return sandboxObject{}, fmt.Errorf("%s: e2b get sandbox detail failed: %w", c.id, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return sandboxObject{}, fmt.Errorf("%s: reading e2b sandbox detail response: %w", c.id, err)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return sandboxObject{}, provider.ErrNotFound
+	}
+	if resp.StatusCode != http.StatusOK {
+		return sandboxObject{}, c.classifyHTTPError(resp, body)
+	}
+	var detail sandboxObject
+	if err := json.Unmarshal(body, &detail); err != nil {
+		return sandboxObject{}, fmt.Errorf("%s: unparseable e2b sandbox detail response: %w", c.id, err)
+	}
+	return detail, nil
 }
 
 func (c *Client) inspectSandbox(ctx context.Context, sb sandboxObject, req provider.ClaimRequest) (provider.Handle, error) {
@@ -547,6 +590,38 @@ func (c *Client) inspectSandbox(ctx context.Context, sb sandboxObject, req provi
 				return provider.Handle{}, err
 			}
 			sb.EndAt = targetExpires.Format(time.RFC3339)
+		}
+	}
+
+	// E2B's GET /v2/sandboxes list items (ListedSandbox) omit `domain` and
+	// `envdAccessToken`; fetch GET /sandboxes/{sandboxID} (SandboxDetail) to
+	// hydrate connection credentials when recovering via Lookup.
+	if (sb.Domain == "" || sb.EnvdToken == "") && sb.SandboxID != "" {
+		detail, err := c.getSandboxDetail(ctx, sb.SandboxID)
+		if err != nil {
+			return provider.Handle{}, err
+		}
+		if detail.Domain != "" {
+			sb.Domain = detail.Domain
+		}
+		if detail.EnvdToken != "" {
+			sb.EnvdToken = detail.EnvdToken
+		}
+		if detail.ClientID != "" {
+			sb.ClientID = detail.ClientID
+		}
+		if detail.State != "" {
+			sb.State = detail.State
+		}
+		if detail.Deleting {
+			sb.Deleting = true
+		}
+		if detail.EndAt != "" {
+			sb.EndAt = detail.EndAt
+		}
+		if sb.Deleting || strings.EqualFold(sb.State, "killing") {
+			return provider.Handle{}, provider.KeyBusy(500*time.Millisecond,
+				fmt.Errorf("%s: e2b sandbox %q for key %q is terminating", c.id, sb.SandboxID, req.Key))
 		}
 	}
 

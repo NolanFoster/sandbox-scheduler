@@ -40,6 +40,17 @@ func newFakeE2BServer(t *testing.T) (*fakeE2BServer, *httptest.Server) {
 	return f, srv
 }
 
+func toListedSandbox(sb map[string]any) map[string]any {
+	listed := make(map[string]any, len(sb))
+	for k, v := range sb {
+		if k == "domain" || k == "envdAccessToken" {
+			continue
+		}
+		listed[k] = v
+	}
+	return listed
+}
+
 func (f *fakeE2BServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	f.calls.Add(1)
 
@@ -82,7 +93,7 @@ func (f *fakeE2BServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 					wantOwner := filterMeta.Get(e2b.MetaOwner)
 					gotOwner, _ := meta[e2b.MetaOwner].(string)
 					if wantOwner == "" || gotOwner == "" || wantOwner == gotOwner {
-						out = append(out, sb)
+						out = append(out, toListedSandbox(sb))
 					}
 				}
 			}
@@ -101,7 +112,7 @@ func (f *fakeE2BServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 			}
-			matched = append(matched, sb)
+			matched = append(matched, toListedSandbox(sb))
 		}
 
 		offset := 0
@@ -122,6 +133,23 @@ func (f *fakeE2BServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(page)
+
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/sandboxes/") && !strings.HasSuffix(r.URL.Path, "/timeout"):
+		id := strings.TrimPrefix(r.URL.Path, "/sandboxes/")
+		f.mu.Lock()
+		sb, ok := f.sandboxes[id]
+		if !ok {
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		copySB := make(map[string]any, len(sb))
+		for k, v := range sb {
+			copySB[k] = v
+		}
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(copySB)
 
 	case r.Method == http.MethodPost && r.URL.Path == "/v2/sandboxes":
 		var body struct {
@@ -331,6 +359,23 @@ func TestE2BServerSideCreateTimeoutAndErrorCodeClassification(t *testing.T) {
 	if time.Until(h.ExpiresAt) < 9*time.Minute {
 		t.Fatalf("expected promoted ExpiresAt ~10m in future, got %v", h.ExpiresAt)
 	}
+	if h.Connect["domain"] != "e2b.app" || h.Connect["envdAccessToken"] != "envd-tok" {
+		t.Fatalf("expected Claim handle to include domain and envdAccessToken, got %+v", h.Connect)
+	}
+
+	// Lookup must hydrate domain and envdAccessToken via GET /sandboxes/{id}
+	// even though GET /v2/sandboxes (ListedSandbox) omits both fields.
+	lookedUp, err := prov.Binder.Lookup(ctx, provider.ClaimRequest{
+		Owner:    "ss-owner-1",
+		Key:      "deadline-key",
+		SpecHash: "h1",
+	})
+	if err != nil {
+		t.Fatalf("Lookup(deadline-key): %v", err)
+	}
+	if lookedUp.Connect["domain"] != "e2b.app" || lookedUp.Connect["envdAccessToken"] != "envd-tok" {
+		t.Fatalf("expected Lookup handle to hydrate domain and envdAccessToken via GET /sandboxes/{id}, got %+v", lookedUp.Connect)
+	}
 
 	// Seed an orphaned late-started sandbox (startedAt > MetaCreateDeadline,
 	// never promoted to MetaExpiresAt): Lookup must delete it and return ErrNotFound.
@@ -440,6 +485,14 @@ func TestE2BAuthModeAndTemplateValidation(t *testing.T) {
 		t.Fatal("expected error for invalid authMode")
 	}
 
+	// Bearer authMode without teamID is rejected at construction time.
+	if _, err := adapter.New(e2b.AdapterName, adapter.Config{
+		ProviderID: "e2b",
+		Options:    map[string]string{"authMode": "bearer"},
+	}); err == nil {
+		t.Fatal("expected error for bearer authMode without teamID")
+	}
+
 	// Empty template mapping ref is rejected at construction time.
 	if _, err := adapter.New(e2b.AdapterName, adapter.Config{
 		ProviderID: "e2b",
@@ -448,10 +501,11 @@ func TestE2BAuthModeAndTemplateValidation(t *testing.T) {
 		t.Fatal("expected error for empty template mapping reference")
 	}
 
-	var gotAPIKey, gotAuthHeader string
+	var gotAPIKey, gotAuthHeader, gotTeamID string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAPIKey = r.Header.Get("X-API-Key")
 		gotAuthHeader = r.Header.Get("Authorization")
+		gotTeamID = r.Header.Get("X-Team-ID")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[]`))
 	}))
@@ -470,8 +524,8 @@ func TestE2BAuthModeAndTemplateValidation(t *testing.T) {
 	if _, err := provAPIKey.Source.Fetch(context.Background()); err != nil {
 		t.Fatalf("Fetch(x-api-key): %v", err)
 	}
-	if gotAPIKey != "k-123" || gotAuthHeader != "" {
-		t.Fatalf("x-api-key mode sent X-API-Key=%q Authorization=%q", gotAPIKey, gotAuthHeader)
+	if gotAPIKey != "k-123" || gotAuthHeader != "" || gotTeamID != "" {
+		t.Fatalf("x-api-key mode sent X-API-Key=%q Authorization=%q X-Team-ID=%q", gotAPIKey, gotAuthHeader, gotTeamID)
 	}
 
 	// Unmapped template when Templates is non-empty returns KindRejected without hitting the server.
@@ -486,12 +540,12 @@ func TestE2BAuthModeAndTemplateValidation(t *testing.T) {
 		t.Fatalf("expected KindRejected for unmapped template, got %v (%v)", provider.KindOf(claimErr), claimErr)
 	}
 
-	// Bearer authMode sets Authorization: Bearer and omits X-API-Key.
+	// Bearer authMode sets Authorization: Bearer and X-Team-ID, and omits X-API-Key.
 	provBearer, err := adapter.New(e2b.AdapterName, adapter.Config{
 		ProviderID:  "e2b-bearer",
 		Endpoint:    srv.URL,
 		Credentials: map[string][]byte{"token": []byte("tok-456")},
-		Options:     map[string]string{"authMode": "bearer"},
+		Options:     map[string]string{"authMode": "bearer", "teamID": "team-789"},
 	})
 	if err != nil {
 		t.Fatalf("adapter.New(bearer): %v", err)
@@ -499,7 +553,7 @@ func TestE2BAuthModeAndTemplateValidation(t *testing.T) {
 	if _, err := provBearer.Source.Fetch(context.Background()); err != nil {
 		t.Fatalf("Fetch(bearer): %v", err)
 	}
-	if gotAuthHeader != "Bearer tok-456" || gotAPIKey != "" {
-		t.Fatalf("bearer mode sent Authorization=%q X-API-Key=%q", gotAuthHeader, gotAPIKey)
+	if gotAuthHeader != "Bearer tok-456" || gotTeamID != "team-789" || gotAPIKey != "" {
+		t.Fatalf("bearer mode sent Authorization=%q X-Team-ID=%q X-API-Key=%q", gotAuthHeader, gotTeamID, gotAPIKey)
 	}
 }
