@@ -2,7 +2,7 @@
 // sandbox-scheduler provider contract.
 //
 // E2B is an elastic, non-Kubernetes provider: sandboxes are created on demand
-// via `POST /sandboxes`, queried by metadata via `GET /v2/sandboxes?metadata=...`,
+// via `POST /v2/sandboxes`, queried by metadata via `GET /v2/sandboxes?metadata=...`,
 // extended via `POST /sandboxes/{sandboxID}/timeout`, and terminated via
 // `DELETE /sandboxes/{sandboxID}`.
 package e2b
@@ -210,16 +210,16 @@ func (c *Client) resolveTemplate(logical string) (string, error) {
 
 // Claim implements provider.Binder.
 //
-// Because E2B's `POST /sandboxes` endpoint has no server-side HTTP request
+// Because E2B's `POST /v2/sandboxes` endpoint has no server-side HTTP request
 // timeout header, Claim bounds unconfirmed creates using E2B's server-side
 // sandbox `timeout` field: when `ctx` carries a deadline, the sandbox is
 // initially created with `timeout` equal to the remaining attempt budget (and
 // `MetaCreateDeadline` stamped in metadata), then immediately extended to the
-// full requested `req.TTL` via `POST /sandboxes/{sandboxID}/timeout` once the
-// create response arrives before the deadline. If the leader loses its lease
-// mid-create, any unconfirmed sandbox either expires on E2B within the attempt
-// timeout window or (if E2B booted it after `MetaCreateDeadline`) is rejected
-// and deleted by Lookup.
+// remaining duration until `expiresAt` via `POST /sandboxes/{sandboxID}/timeout`
+// once the create response arrives before the deadline. If the leader loses its
+// lease mid-create, any unconfirmed sandbox either expires on E2B within the
+// attempt timeout window or (if E2B booted it after `MetaCreateDeadline`) is
+// rejected and deleted by Lookup.
 func (c *Client) Claim(ctx context.Context, req provider.ClaimRequest) (provider.Handle, error) {
 	templateID, err := c.resolveTemplate(req.Template)
 	if err != nil {
@@ -282,7 +282,7 @@ func (c *Client) Claim(ctx context.Context, req provider.ClaimRequest) (provider
 		return provider.Handle{}, provider.Rejected(err)
 	}
 
-	httpReq, err := c.newRequest(ctx, http.MethodPost, c.endpoint+"/sandboxes", bytes.NewReader(rawBody))
+	httpReq, err := c.newRequest(ctx, http.MethodPost, c.endpoint+"/v2/sandboxes", bytes.NewReader(rawBody))
 	if err != nil {
 		return provider.Handle{}, provider.Rejected(err)
 	}
@@ -312,7 +312,12 @@ func (c *Client) Claim(ctx context.Context, req provider.ClaimRequest) (provider
 			return provider.Handle{}, context.DeadlineExceeded
 		}
 		if initialTimeoutSec < ttlSec && sb.SandboxID != "" {
-			if err := c.setSandboxTimeout(ctx, sb.SandboxID, ttlSec); err != nil {
+			remSec := int64(math.Ceil(time.Until(expiresAt).Seconds()))
+			if remSec <= 0 {
+				c.deleteSandboxBestEffort(sb.SandboxID)
+				return provider.Handle{}, context.DeadlineExceeded
+			}
+			if err := c.setSandboxTimeout(ctx, sb.SandboxID, remSec); err != nil {
 				c.deleteSandboxBestEffort(sb.SandboxID)
 				return provider.Handle{}, err
 			}

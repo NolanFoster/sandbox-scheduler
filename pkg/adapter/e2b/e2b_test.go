@@ -44,7 +44,7 @@ func (f *fakeE2BServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	f.calls.Add(1)
 
 	switch {
-	case r.Method == http.MethodGet && (r.URL.Path == "/v2/sandboxes" || r.URL.Path == "/sandboxes"):
+	case r.Method == http.MethodGet && r.URL.Path == "/v2/sandboxes":
 		f.mu.Lock()
 		defer f.mu.Unlock()
 
@@ -123,7 +123,7 @@ func (f *fakeE2BServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(page)
 
-	case r.Method == http.MethodPost && r.URL.Path == "/sandboxes":
+	case r.Method == http.MethodPost && r.URL.Path == "/v2/sandboxes":
 		var body struct {
 			TemplateID string            `json:"templateID"`
 			Timeout    int64             `json:"timeout"`
