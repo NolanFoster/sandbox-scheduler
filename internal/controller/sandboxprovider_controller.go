@@ -147,15 +147,6 @@ func (r *SandboxProviderReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 // sync registers the provider as its spec says and returns its Ready and
 // Claiming conditions, filling in the rest of its status along the way.
 func (r *SandboxProviderReconciler) sync(ctx context.Context, p *v1alpha1.SandboxProvider) (readiness, *readiness) {
-	if p.Spec.Disabled {
-		// Drained, not deleted. Configuration is preserved and one field flip
-		// brings it back.
-		r.deregister(p.Name)
-		return readiness{metav1.ConditionFalse, ReasonDisabled,
-				"provider is disabled and will not be considered for placement"},
-			&readiness{metav1.ConditionFalse, ReasonDisabled, "provider is disabled"}
-	}
-
 	if !adapter.Has(p.Spec.Adapter) {
 		// Fail visibly rather than never polling it. An unknown adapter usually
 		// means a typo or a scheduler older than the config.
@@ -163,6 +154,19 @@ func (r *SandboxProviderReconciler) sync(ctx context.Context, p *v1alpha1.Sandbo
 		msg := fmt.Sprintf("unknown adapter %q (available: %v)", p.Spec.Adapter, adapter.Names())
 		return readiness{metav1.ConditionFalse, ReasonUnknownAdapter, msg},
 			&readiness{metav1.ConditionFalse, ReasonUnknownAdapter, msg}
+	}
+
+	if p.Spec.Disabled {
+		// Drained, not deleted. Remove from placement registry and claim binder
+		// while keeping lifecycle reaping active for any existing owned sandboxes.
+		r.Registry.RemoveSource(p.Name)
+		if r.Binder != nil {
+			r.Binder.RemoveTarget(p.Name)
+		}
+		r.syncReaperWhenDisabled(ctx, p)
+		return readiness{metav1.ConditionFalse, ReasonDisabled,
+				"provider is disabled and will not be considered for placement"},
+			&readiness{metav1.ConditionFalse, ReasonDisabled, "provider is disabled"}
 	}
 
 	claimsEnabled := p.Spec.Claims != nil && p.Spec.Claims.Enabled
@@ -361,6 +365,53 @@ func (r *SandboxProviderReconciler) syncClaims(
 		reason:  ReasonClaimCapable,
 		message: "provider is ready to serve sandbox claims",
 	}
+}
+
+func (r *SandboxProviderReconciler) syncReaperWhenDisabled(ctx context.Context, p *v1alpha1.SandboxProvider) {
+	if r.Reaper == nil {
+		return
+	}
+	creds, err := r.resolveCredentials(ctx, p)
+	if err != nil {
+		r.Reaper.RemoveTarget(p.Name)
+		return
+	}
+	templates := templateMap(p.Spec.Templates)
+	opts := providerOptions(p)
+	if p.Spec.KubeAPI != nil && p.Spec.KubeAPI.Namespace != "" {
+		if _, exists := opts["namespace"]; !exists {
+			opts["namespace"] = p.Spec.KubeAPI.Namespace
+		}
+	}
+	cfg := adapter.Config{
+		ProviderID:  p.Name,
+		Endpoint:    p.Spec.Endpoint,
+		Credentials: creds,
+		Options:     opts,
+		Templates:   templates,
+	}
+	digest := configDigest(p.Spec.Adapter, cfg)
+	r.mu.Lock()
+	d, ok := r.built[p.Name]
+	prov := r.providers[p.Name]
+	r.mu.Unlock()
+	if !ok || d != digest {
+		built, err := adapter.New(p.Spec.Adapter, cfg)
+		if err != nil {
+			r.deregister(p.Name)
+			return
+		}
+		prov = built
+		r.setBuilt(p.Name, digest, prov)
+	}
+	var timeout time.Duration
+	if p.Spec.Claims != nil && p.Spec.Claims.Timeout != nil && p.Spec.Claims.Timeout.Duration > 0 {
+		timeout = p.Spec.Claims.Timeout.Duration
+	}
+	r.Reaper.SetTarget(p.Name, prov, reaper.TargetConfig{
+		Enabled: prov.Binder != nil && prov.Lister != nil,
+		Timeout: timeout,
+	})
 }
 
 // deregister stops polling a provider and forgets the source built for it.

@@ -322,17 +322,17 @@ func (c *Client) Claim(ctx context.Context, req provider.ClaimRequest) (provider
 			sb.Metadata = meta
 		}
 		if !createDeadline.IsZero() && time.Now().UTC().After(createDeadline) {
-			c.deleteSandboxBestEffort(sb.SandboxID)
+			c.deleteSandboxAsync(sb.SandboxID)
 			return provider.Handle{}, context.DeadlineExceeded
 		}
 		if initialTimeoutSec < ttlSec && sb.SandboxID != "" {
 			remSec := int64(math.Ceil(time.Until(expiresAt).Seconds()))
 			if remSec <= 0 {
-				c.deleteSandboxBestEffort(sb.SandboxID)
+				c.deleteSandboxAsync(sb.SandboxID)
 				return provider.Handle{}, context.DeadlineExceeded
 			}
 			if err := c.setSandboxTimeout(ctx, sb.SandboxID, remSec); err != nil {
-				c.deleteSandboxBestEffort(sb.SandboxID)
+				c.deleteSandboxAsync(sb.SandboxID)
 				return provider.Handle{}, err
 			}
 			sb.EndAt = expiresAt.Format(time.RFC3339)
@@ -387,13 +387,15 @@ func (c *Client) setSandboxTimeout(ctx context.Context, sandboxID string, timeou
 	return c.classifyHTTPError(resp, body)
 }
 
-func (c *Client) deleteSandboxBestEffort(sandboxID string) {
+func (c *Client) deleteSandboxAsync(sandboxID string) {
 	if sandboxID == "" {
 		return
 	}
-	cleanCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = c.Release(cleanCtx, provider.Handle{Provider: c.id, ID: sandboxID})
+	go func() {
+		cleanCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = c.Release(cleanCtx, provider.Handle{Provider: c.id, ID: sandboxID})
+	}()
 }
 
 // MaxPageSize is the maximum page size accepted by E2B's GET /v2/sandboxes
@@ -577,7 +579,7 @@ func (c *Client) inspectSandbox(ctx context.Context, sb sandboxObject, req provi
 					cmpDeadline = createDeadline.Truncate(time.Second)
 				}
 				if startedAt.After(cmpDeadline) {
-					c.deleteSandboxBestEffort(sb.SandboxID)
+					_ = c.Release(ctx, provider.Handle{Provider: c.id, ID: sb.SandboxID})
 					return provider.Handle{}, provider.ErrNotFound
 				}
 			}
