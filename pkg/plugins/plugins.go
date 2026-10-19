@@ -68,11 +68,6 @@ func (TemplateAvailable) Filter(_ context.Context, req *framework.Request, c *fr
 	if c.HasTemplate(req.Template) {
 		return true, ""
 	}
-	if len(c.Templates) == 0 {
-		if obs := c.Attr("template"); obs != "" && (req.Template == obs || req.Template == "default") {
-			return true, ""
-		}
-	}
 	return false, fmt.Sprintf("template %q is not offered by this provider", req.Template)
 }
 

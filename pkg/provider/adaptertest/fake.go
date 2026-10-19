@@ -215,7 +215,7 @@ func (f *Fake) replayLocked(rec *fakeRecord, req provider.ClaimRequest) (provide
 	if rec.deleting {
 		return provider.Handle{}, provider.KeyBusy(50*time.Millisecond, errors.New("sandbox is being deleted"))
 	}
-	if rec.specHash != req.SpecHash {
+	if req.SpecHash != "" && rec.specHash != req.SpecHash {
 		return provider.Handle{}, provider.KeyConflict(errors.New("key already exists with a different spec"))
 	}
 	return cloneHandle(rec.handle), nil
