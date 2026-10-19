@@ -32,22 +32,22 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --secret-namespace={{ .Release.Namespace }}
-            - --refresh-interval={{ .Values.scheduler.refreshInterval }}
-            - --stale-after={{ .Values.scheduler.staleAfter }}
-            - --reservation-grace={{ .Values.scheduler.reservationGrace }}
-            - --cold-start-window={{ .Values.scheduler.coldStartWindow }}
-            - --scheduler-bind-address=:{{ .Values.service.port }}
-            - --metrics-bind-address=:{{ .Values.metrics.port }}
+            - --refresh-interval={{ .Values.scheduler.refreshInterval | default "10s" }}
+            - --stale-after={{ .Values.scheduler.staleAfter | default "30s" }}
+            - --reservation-grace={{ .Values.scheduler.reservationGrace | default "5s" }}
+            - --cold-start-window={{ .Values.scheduler.coldStartWindow | default "30s" }}
+            - --scheduler-bind-address=:{{ .Values.service.port | default 8082 }}
+            - --metrics-bind-address=:{{ .Values.metrics.port | default 8080 }}
             - --health-probe-bind-address=:8081
-            - --leader-elect={{ .Values.leaderElection }}
-            - --enable-claims={{ .Values.scheduler.enableClaims }}
-            - --claim-timeout={{ .Values.scheduler.claimTimeout }}
-            - --claim-max-inflight={{ .Values.scheduler.claimMaxInFlight }}
-            - --claim-queue-timeout={{ .Values.scheduler.claimQueueTimeout }}
-            - --claim-max-ttl={{ .Values.scheduler.claimMaxTTL }}
-            - --max-spill={{ .Values.scheduler.maxSpill }}
-            - --max-joiners-per-key={{ .Values.scheduler.maxJoinersPerKey }}
-            - --refusal-ttl={{ .Values.scheduler.refusalTTL }}
+            - --leader-elect={{ .Values.leaderElection | default false }}
+            - --enable-claims={{ .Values.scheduler.enableClaims | default false }}
+            - --claim-timeout={{ .Values.scheduler.claimTimeout | default "15s" }}
+            - --claim-max-inflight={{ .Values.scheduler.claimMaxInFlight | default 4096 }}
+            - --claim-queue-timeout={{ .Values.scheduler.claimQueueTimeout | default "1s" }}
+            - --claim-max-ttl={{ .Values.scheduler.claimMaxTTL | default "24h" }}
+            - --max-spill={{ .Values.scheduler.maxSpill | default 3 }}
+            - --max-joiners-per-key={{ .Values.scheduler.maxJoinersPerKey | default 8 }}
+            - --refusal-ttl={{ .Values.scheduler.refusalTTL | default "1s" }}
             - --release-name={{ include "sandbox-scheduler.fullname" . }}
             {{- if .Values.scheduler.clusterId }}
             - --cluster-id={{ .Values.scheduler.clusterId }}
