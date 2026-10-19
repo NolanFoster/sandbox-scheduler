@@ -51,7 +51,7 @@ type Logger interface {
 
 type noopLogger struct{}
 
-func (noopLogger) Info(string, ...any)        {}
+func (noopLogger) Info(string, ...any)         {}
 func (noopLogger) Error(error, string, ...any) {}
 
 // TargetConfig configures reaping for a single provider.
@@ -257,9 +257,9 @@ func (r *Reaper) reapProvider(ctx context.Context, t *target) {
 	}
 
 	var (
-		pageToken          string
-		expired            []provider.Handle
-		hitCircuitBreaker  bool
+		pageToken         string
+		expired           []provider.Handle
+		hitCircuitBreaker bool
 	)
 
 	// Collect up to maxPerCycle+1 expired handles before issuing Release calls

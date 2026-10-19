@@ -574,4 +574,3 @@ func TestE2BProviderClaimsAndEventEmission(t *testing.T) {
 		t.Fatalf("expected 2 events (ClaimCapable + ReapDryRun), got %d: %+v", len(events.Items), events.Items)
 	}
 }
-

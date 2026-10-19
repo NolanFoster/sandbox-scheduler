@@ -404,4 +404,3 @@ func TestE2BAuthModeAndTemplateValidation(t *testing.T) {
 		t.Fatalf("bearer mode sent Authorization=%q X-API-Key=%q", gotAuthHeader, gotAPIKey)
 	}
 }
-
