@@ -32,6 +32,10 @@ const AdapterName = "e2b"
 // OpenAPI specification (https://github.com/e2b-dev/E2B/blob/main/spec/openapi.yml).
 const DefaultEndpoint = "https://api.e2b.app"
 
+// DefaultDomain is the public E2B sandbox envd domain when E2B omits `domain`
+// in the sandbox response.
+const DefaultDomain = "e2b.app"
+
 // DefaultTemplate is the default E2B sandbox template when none is mapped.
 const DefaultTemplate = "base"
 
@@ -93,6 +97,10 @@ func init() {
 		if defaultTpl == "" {
 			defaultTpl = DefaultTemplate
 		}
+		domain := strings.TrimSpace(cfg.Options["domain"])
+		if domain == "" {
+			domain = DefaultDomain
+		}
 
 		// Dedicated HTTP/2-capable transport sized for concurrent claims (5.7).
 		transport := &http.Transport{
@@ -112,6 +120,7 @@ func init() {
 		c := &Client{
 			id:              cfg.ProviderID,
 			endpoint:        endpoint,
+			domain:          domain,
 			token:           token,
 			teamID:          teamID,
 			authMode:        authMode,
@@ -134,6 +143,7 @@ func init() {
 type Client struct {
 	id              string
 	endpoint        string
+	domain          string
 	token           string
 	teamID          string
 	authMode        string
@@ -602,7 +612,7 @@ func (c *Client) inspectSandbox(ctx context.Context, sb sandboxObject, req provi
 	// E2B's GET /v2/sandboxes list items (ListedSandbox) omit `domain` and
 	// `envdAccessToken`; fetch GET /sandboxes/{sandboxID} (SandboxDetail) to
 	// hydrate connection credentials when recovering via Lookup.
-	if (sb.Domain == "" || sb.EnvdToken == "") && sb.SandboxID != "" {
+	if sb.EnvdToken == "" && sb.SandboxID != "" {
 		detail, err := c.getSandboxDetail(ctx, sb.SandboxID)
 		if err != nil {
 			return provider.Handle{}, err
@@ -654,14 +664,22 @@ func (c *Client) toHandle(sb sandboxObject) provider.Handle {
 		}
 	}
 	endpoint := c.endpoint
+	domain := sb.Domain
+	if domain == "" {
+		domain = c.domain
+	}
+	if domain == "" {
+		domain = DefaultDomain
+	}
 	connect := map[string]string{
 		"sandboxID": sb.SandboxID,
+		"domain":    domain,
+	}
+	if sb.SandboxID != "" {
+		connect["envdUrl"] = fmt.Sprintf("https://49983-%s.%s", sb.SandboxID, domain)
 	}
 	if sb.ClientID != "" {
 		connect["clientID"] = sb.ClientID
-	}
-	if sb.Domain != "" {
-		connect["domain"] = sb.Domain
 	}
 	if sb.EnvdToken != "" {
 		connect["envdAccessToken"] = sb.EnvdToken
