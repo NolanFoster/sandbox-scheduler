@@ -359,8 +359,9 @@ func TestE2BServerSideCreateTimeoutAndErrorCodeClassification(t *testing.T) {
 	if time.Until(h.ExpiresAt) < 9*time.Minute {
 		t.Fatalf("expected promoted ExpiresAt ~10m in future, got %v", h.ExpiresAt)
 	}
-	if h.Connect["domain"] != "e2b.app" || h.Connect["envdAccessToken"] != "envd-tok" {
-		t.Fatalf("expected Claim handle to include domain and envdAccessToken, got %+v", h.Connect)
+	wantEnvdURL := "https://49983-" + h.ID + ".e2b.app"
+	if h.Connect["domain"] != "e2b.app" || h.Connect["envdUrl"] != wantEnvdURL || h.Connect["envdAccessToken"] != "envd-tok" {
+		t.Fatalf("expected Claim handle to include domain, envdUrl, and envdAccessToken, got %+v", h.Connect)
 	}
 
 	// Lookup must hydrate domain and envdAccessToken via GET /sandboxes/{id}
@@ -373,8 +374,8 @@ func TestE2BServerSideCreateTimeoutAndErrorCodeClassification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Lookup(deadline-key): %v", err)
 	}
-	if lookedUp.Connect["domain"] != "e2b.app" || lookedUp.Connect["envdAccessToken"] != "envd-tok" {
-		t.Fatalf("expected Lookup handle to hydrate domain and envdAccessToken via GET /sandboxes/{id}, got %+v", lookedUp.Connect)
+	if lookedUp.Connect["domain"] != "e2b.app" || lookedUp.Connect["envdUrl"] != wantEnvdURL || lookedUp.Connect["envdAccessToken"] != "envd-tok" {
+		t.Fatalf("expected Lookup handle to hydrate domain, envdUrl, and envdAccessToken via GET /sandboxes/{id}, got %+v", lookedUp.Connect)
 	}
 
 	// Seed an orphaned late-started sandbox (startedAt > MetaCreateDeadline,
